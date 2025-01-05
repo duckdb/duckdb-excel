@@ -66,9 +66,6 @@ int32_t mz_stream_duckdb_open(void *stream, const char *path, int32_t mode) {
 	if (mode & MZ_OPEN_MODE_WRITE) {
 		flags |= FileFlags::FILE_FLAGS_WRITE;
 	}
-	if (mode & MZ_OPEN_MODE_READWRITE) {
-		flags |= FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ;
-	}
 	if (mode & MZ_OPEN_MODE_APPEND) {
 		flags |= FileFlags::FILE_FLAGS_APPEND;
 	}
