@@ -66,9 +66,6 @@ int32_t mz_stream_duckdb_open(void *stream, const char *path, int32_t mode) {
 	if (mode & MZ_OPEN_MODE_WRITE) {
 		flags |= FileFlags::FILE_FLAGS_WRITE;
 	}
-	if (mode & MZ_OPEN_MODE_READWRITE) {
-		flags |= FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_READ;
-	}
 	if (mode & MZ_OPEN_MODE_APPEND) {
 		flags |= FileFlags::FILE_FLAGS_APPEND;
 	}
@@ -136,8 +133,10 @@ int32_t mz_stream_duckdb_seek(void *stream, int64_t offset, int32_t origin) {
 
 int32_t mz_stream_duckdb_close(void *stream) {
 	auto &self = *reinterpret_cast<mz_stream_duckdb *>(stream);
-	self.handle->Sync();
 	self.handle->Close();
+	self.handle->~FileHandle();
+	self.handle = nullptr;
+	self.last_error.clear();
 	return MZ_OK;
 }
 
@@ -159,10 +158,10 @@ void mz_stream_duckdb_delete(void **stream) {
 	}
 	auto &self = *reinterpret_cast<mz_stream_duckdb *>(*stream);
 	if (self.handle) {
-		self.handle->Sync();
 		self.handle->Close();
 		self.handle->~FileHandle();
 		self.handle = nullptr;
+		self.last_error.clear();
 	}
 	delete reinterpret_cast<mz_stream_duckdb *>(*stream);
 	*stream = nullptr;
