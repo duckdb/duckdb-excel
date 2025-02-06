@@ -1,0 +1,21 @@
+require excel
+
+statement ok
+CREATE TABLE t1 AS SELECT * FROM read_xlsx('./test/data/xlsx/normalize_names_1.xlsx', normalize_names := false, header := true);
+
+query I
+SELECT column_name FROM (describe t1) ORDER BY All;
+----
+A
+B
+C
+
+statement ok
+CREATE TABLE t2 AS SELECT * FROM read_xlsx('./test/data/xlsx/normalize_names_1.xlsx', normalize_names := true, header := true);
+
+query I
+SELECT column_name FROM (describe t2) ORDER BY All;
+----
+a
+b
+c

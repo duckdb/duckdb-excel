@@ -22,6 +22,7 @@ public:
 	bool ignore_errors = false;
 	bool stop_at_empty = true;
 	bool has_explicit_range = false;
+	bool normalize_names = false;
 	XLSXCellType default_cell_type = XLSXCellType::NUMBER;
 	XLSXCellRange range;
 };
