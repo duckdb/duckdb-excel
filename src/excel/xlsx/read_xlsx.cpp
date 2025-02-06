@@ -1,29 +1,126 @@
 #include "xlsx/read_xlsx.hpp"
-#include "xlsx/xml_util.hpp"
-#include "xlsx/xml_parser.hpp"
-#include "xlsx/zip_file.hpp"
-#include "xlsx/xlsx_parts.hpp"
-#include "xlsx/string_table.hpp"
 
-#include "xlsx/parsers/relationship_parser.hpp"
-#include "xlsx/parsers/content_types_parser.hpp"
-#include "xlsx/parsers/stylesheet_parser.hpp"
-#include "xlsx/parsers/shared_strings_parser.hpp"
-#include "xlsx/parsers/workbook_parser.hpp"
-#include "xlsx/parsers/worksheet_parser.hpp"
-
+#include "duckdb/common/helper.hpp"
 #include "duckdb/common/types/time.hpp"
+#include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
-#include "duckdb/main/query_result.hpp"
-#include "duckdb/common/helper.hpp"
-#include "duckdb/function/replacement_scan.hpp"
+#include "xlsx/parsers/content_types_parser.hpp"
+#include "xlsx/parsers/relationship_parser.hpp"
+#include "xlsx/parsers/shared_strings_parser.hpp"
+#include "xlsx/parsers/stylesheet_parser.hpp"
+#include "xlsx/parsers/workbook_parser.hpp"
+#include "xlsx/parsers/worksheet_parser.hpp"
+#include "xlsx/string_table.hpp"
+#include "xlsx/xlsx_parts.hpp"
+#include "xlsx/xml_parser.hpp"
+#include "xlsx/xml_util.hpp"
+#include "xlsx/zip_file.hpp"
+
+#include <utf8proc.hpp>
 
 namespace duckdb {
+
+//-------------------------------------------------------------------
+// Util
+//-------------------------------------------------------------------
+// Helper function for UTF-8 aware space trimming
+static string TrimWhitespace(const string &col_name) {
+	utf8proc_int32_t codepoint;
+	auto str = reinterpret_cast<const utf8proc_uint8_t *>(col_name.c_str());
+	idx_t size = col_name.size();
+	// Find the first character that is not left trimmed
+	idx_t begin = 0;
+	while (begin < size) {
+		auto bytes = utf8proc_iterate(str + begin, NumericCast<utf8proc_ssize_t>(size - begin), &codepoint);
+		D_ASSERT(bytes > 0);
+		if (utf8proc_category(codepoint) != UTF8PROC_CATEGORY_ZS) {
+			break;
+		}
+		begin += NumericCast<idx_t>(bytes);
+	}
+
+	// Find the last character that is not right trimmed
+	idx_t end = begin;
+	for (auto next = begin; next < col_name.size();) {
+		auto bytes = utf8proc_iterate(str + next, NumericCast<utf8proc_ssize_t>(size - next), &codepoint);
+		D_ASSERT(bytes > 0);
+		next += NumericCast<idx_t>(bytes);
+		if (utf8proc_category(codepoint) != UTF8PROC_CATEGORY_ZS) {
+			end = next;
+		}
+	}
+
+	// return the trimmed string
+	return col_name.substr(begin, end - begin);
+}
+
+static string NormalizeColumnName(const string &col_name) {
+	// normalize UTF8 characters to NFKD
+	auto nfkd = utf8proc_NFKD(reinterpret_cast<const utf8proc_uint8_t *>(col_name.c_str()),
+							  NumericCast<utf8proc_ssize_t>(col_name.size()));
+	const string col_name_nfkd = string(const_char_ptr_cast(nfkd), strlen(const_char_ptr_cast(nfkd)));
+	free(nfkd);
+
+	// only keep ASCII characters 0-9 a-z A-Z and replace spaces with regular whitespace
+	string col_name_ascii = "";
+	for (idx_t i = 0; i < col_name_nfkd.size(); i++) {
+		if (col_name_nfkd[i] == '_' || (col_name_nfkd[i] >= '0' && col_name_nfkd[i] <= '9') ||
+			(col_name_nfkd[i] >= 'A' && col_name_nfkd[i] <= 'Z') ||
+			(col_name_nfkd[i] >= 'a' && col_name_nfkd[i] <= 'z')) {
+			col_name_ascii += col_name_nfkd[i];
+			} else if (StringUtil::CharacterIsSpace(col_name_nfkd[i])) {
+				col_name_ascii += " ";
+			}
+	}
+
+	// trim whitespace and replace remaining whitespace by _
+	string col_name_trimmed = TrimWhitespace(col_name_ascii);
+	string col_name_cleaned = "";
+	bool in_whitespace = false;
+	for (idx_t i = 0; i < col_name_trimmed.size(); i++) {
+		if (col_name_trimmed[i] == ' ') {
+			if (!in_whitespace) {
+				col_name_cleaned += "_";
+				in_whitespace = true;
+			}
+		} else {
+			col_name_cleaned += col_name_trimmed[i];
+			in_whitespace = false;
+		}
+	}
+
+	// don't leave string empty; if not empty, make lowercase
+	if (col_name_cleaned.empty()) {
+		col_name_cleaned = "_";
+	} else {
+		col_name_cleaned = StringUtil::Lower(col_name_cleaned);
+	}
+
+	// prepend _ if name starts with a digit or is a reserved keyword
+	auto keyword = KeywordHelper::KeywordCategoryType(col_name_cleaned);
+	if (keyword == KeywordCategory::KEYWORD_TYPE_FUNC || keyword == KeywordCategory::KEYWORD_RESERVED ||
+		(col_name_cleaned[0] >= '0' && col_name_cleaned[0] <= '9')) {
+		col_name_cleaned = "_" + col_name_cleaned;
+		}
+	return col_name_cleaned;
+}
+
+static void CleanColumnNames(vector<string> &names, bool normalize) {
+	for(auto &name : names) {
+		// normalize names or at least trim whitespace
+		if (normalize) {
+			name = NormalizeColumnName(name);
+		} else {
+			name = TrimWhitespace(name);
+		}
+	}
+}
 
 //-------------------------------------------------------------------
 // Meta
@@ -166,6 +263,11 @@ void ReadXLSX::ParseOptions(XLSXReadOptions &options, const named_parameter_map_
 		options.ignore_errors = BooleanValue::Get(ignore_errors_opt->second);
 	}
 
+	const auto normalize_names_opt = input.find("normalize_names");
+	if (normalize_names_opt != input.end()) {
+		options.normalize_names = BooleanValue::Get(normalize_names_opt->second);
+	}
+
 	const auto range_opt = input.find("range");
 	if (range_opt != input.end()) {
 		const auto range_str = StringValue::Get(range_opt->second);
@@ -291,7 +393,6 @@ void ReadXLSX::ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReade
 //-------------------------------------------------------------------
 // Bind
 //-------------------------------------------------------------------
-
 static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<XLSXReadData>();
@@ -310,6 +411,9 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 
 	return_types = result->return_types;
 	names = result->column_names;
+
+	// Clean and normalize names if requested
+	CleanColumnNames(names, result->options.normalize_names);
 
 	// Deduplicate column names
 	QueryResult::DeduplicateColumns(names);
@@ -595,6 +699,7 @@ TableFunction ReadXLSX::GetFunction() {
 	read_xlsx.named_parameters["sheet"] = LogicalType::VARCHAR;
 	read_xlsx.named_parameters["stop_at_empty"] = LogicalType::BOOLEAN;
 	read_xlsx.named_parameters["empty_as_varchar"] = LogicalType::BOOLEAN;
+	read_xlsx.named_parameters["normalize_names"] = LogicalType::BOOLEAN;
 
 	return read_xlsx;
 }
