@@ -31,6 +31,8 @@ inline idx_t StringTable::Add(const string_t &str) {
 	// Check if the string is already in the map
 	const auto found = table.find(str);
 	if (found != table.end()) {
+		// We still need to update the index vector
+		index.push_back(found->first);
 		return found->second;
 	}
 
