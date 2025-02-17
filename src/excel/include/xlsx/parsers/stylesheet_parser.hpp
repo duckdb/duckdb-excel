@@ -95,6 +95,9 @@ inline void XLSXStyleParser::OnStartElement(const char *name, const char **atts)
 				cell_styles.push_back(LogicalType::TIME);
 			} else if (id == 22) {
 				cell_styles.push_back(LogicalType::TIMESTAMP);
+			} else {
+				// Else, just push a double
+				cell_styles.push_back(LogicalType::DOUBLE);
 			}
 		} else {
 			// Look up the ID in the format map
