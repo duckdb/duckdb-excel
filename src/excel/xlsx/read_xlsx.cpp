@@ -506,7 +506,7 @@ int64_t ExcelToEpochUS(const double serial) {
 	return static_cast<int64_t>(epoch_micros);
 }
 
-static void TryCast(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
+static void TryCastFromString(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
                     Vector &target_col) {
 
 	auto &chunk = state.parser.GetChunk();
@@ -520,8 +520,11 @@ static void TryCast(XLSXGlobalState &state, bool ignore_errors, const idx_t col_
 		const auto &target_validity = FlatVector::Validity(target_col);
 		for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
 			if (source_validity.RowIsValid(row_idx) != target_validity.RowIsValid(row_idx)) {
-				const auto cell_name = state.parser.GetCellName(row_idx, col_idx);
-				throw InvalidInputException("read_xlsx: Failed to parse cell '%s': %s", cell_name, state.cast_err);
+				// If the string is empty, allow it to be cast to NULL
+				if(!FlatVector::GetData<string_t>(source_col)[row_idx].Empty()) {
+					const auto cell_name = state.parser.GetCellName(row_idx, col_idx);
+					throw InvalidInputException("read_xlsx: Failed to parse cell '%s': %s", cell_name, state.cast_err);
+				}
 			}
 		}
 	}
@@ -530,7 +533,7 @@ static void TryCast(XLSXGlobalState &state, bool ignore_errors, const idx_t col_
 static void TryCastTime(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
                         Vector &target_col) {
 	// First cast it to a double
-	TryCast(state, ignore_errors, col_idx, context, state.cast_vec);
+	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec);
 
 	// Then convert the double to a time
 	const auto row_count = state.parser.GetChunk().size();
@@ -544,7 +547,7 @@ static void TryCastTime(XLSXGlobalState &state, bool ignore_errors, const idx_t 
 static void TryCastDate(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
                         Vector &target_col) {
 	// First cast it to a double
-	TryCast(state, ignore_errors, col_idx, context, state.cast_vec);
+	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec);
 
 	// Then convert the double to a date
 	const auto row_count = state.parser.GetChunk().size();
@@ -558,7 +561,7 @@ static void TryCastDate(XLSXGlobalState &state, bool ignore_errors, const idx_t 
 static void TryCastTimestamp(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
                              Vector &target_col) {
 	// First cast it to a double
-	TryCast(state, ignore_errors, col_idx, context, state.cast_vec);
+	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec);
 
 	// Then convert the double to a timestamp
 	const auto row_count = state.parser.GetChunk().size();
@@ -640,7 +643,7 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 			TryCastTimestamp(gstate, options.ignore_errors, col_idx, context, target_col);
 		} else {
 			// Cast the from string to the target type
-			TryCast(gstate, options.ignore_errors, col_idx, context, target_col);
+			TryCastFromString(gstate, options.ignore_errors, col_idx, context, target_col);
 		}
 	}
 	output.SetCapacity(row_count);
