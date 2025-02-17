@@ -1,0 +1,9 @@
+require excel
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE FROM read_xlsx('test/data/xlsx/duckdb_excel_rep1.xlsx')) ORDER BY ALL;
+----
+Capacity	DOUBLE
+EU27	DOUBLE
+Region	VARCHAR
+StartDate	DATE
