@@ -453,6 +453,11 @@ inline void SheetParser::SkipRows() {
 }
 
 inline void SheetParser::FillRows() {
+	if(chunk.size() == STANDARD_VECTOR_SIZE) {
+		// Chunk is full, no more to fill
+		return;
+	}
+
 	const auto total_remaining = range.end.row - 1 - last_row;
 	const auto local_remaining = STANDARD_VECTOR_SIZE - out_index;
 
