@@ -627,7 +627,7 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 	}
 
 	// Pad with empty rows if wanted (and needed)
-	if (options.has_explicit_range) {
+	if (options.has_explicit_range && !options.stop_at_empty) {
 		parser.FillRows();
 	}
 
