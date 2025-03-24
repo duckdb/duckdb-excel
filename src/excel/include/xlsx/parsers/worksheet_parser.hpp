@@ -453,7 +453,7 @@ inline void SheetParser::SkipRows() {
 }
 
 inline void SheetParser::FillRows() {
-	if(chunk.size() == STANDARD_VECTOR_SIZE) {
+	if (chunk.size() == STANDARD_VECTOR_SIZE) {
 		// Chunk is full, no more to fill
 		return;
 	}

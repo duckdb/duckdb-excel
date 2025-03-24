@@ -1,0 +1,23 @@
+require excel
+
+statement ok
+create table t1 as select * from range(0, 100) r(i);
+
+statement ok
+update t1 set i = null where i = 50;
+
+statement ok
+copy t1 to '__TEST_DIR__/range.xlsx' (FORMAT XLSX);
+
+query I
+SELECT count(*) from read_xlsx('__TEST_DIR__/range.xlsx', range='1:A100', stop_at_empty := true);
+----
+50
+
+# These should be equivalent
+query I rowsort half
+SELECT * from read_xlsx('__TEST_DIR__/range.xlsx', range='1:A100', stop_at_empty := true);
+----
+
+query I rowsort half
+SELECT * from read_xlsx('__TEST_DIR__/range.xlsx');

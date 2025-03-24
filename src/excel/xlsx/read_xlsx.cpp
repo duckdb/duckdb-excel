@@ -63,7 +63,7 @@ static string TrimWhitespace(const string &col_name) {
 static string NormalizeColumnName(const string &col_name) {
 	// normalize UTF8 characters to NFKD
 	auto nfkd = utf8proc_NFKD(reinterpret_cast<const utf8proc_uint8_t *>(col_name.c_str()),
-							  NumericCast<utf8proc_ssize_t>(col_name.size()));
+	                          NumericCast<utf8proc_ssize_t>(col_name.size()));
 	const string col_name_nfkd = string(const_char_ptr_cast(nfkd), strlen(const_char_ptr_cast(nfkd)));
 	free(nfkd);
 
@@ -71,12 +71,12 @@ static string NormalizeColumnName(const string &col_name) {
 	string col_name_ascii = "";
 	for (idx_t i = 0; i < col_name_nfkd.size(); i++) {
 		if (col_name_nfkd[i] == '_' || (col_name_nfkd[i] >= '0' && col_name_nfkd[i] <= '9') ||
-			(col_name_nfkd[i] >= 'A' && col_name_nfkd[i] <= 'Z') ||
-			(col_name_nfkd[i] >= 'a' && col_name_nfkd[i] <= 'z')) {
+		    (col_name_nfkd[i] >= 'A' && col_name_nfkd[i] <= 'Z') ||
+		    (col_name_nfkd[i] >= 'a' && col_name_nfkd[i] <= 'z')) {
 			col_name_ascii += col_name_nfkd[i];
-			} else if (StringUtil::CharacterIsSpace(col_name_nfkd[i])) {
-				col_name_ascii += " ";
-			}
+		} else if (StringUtil::CharacterIsSpace(col_name_nfkd[i])) {
+			col_name_ascii += " ";
+		}
 	}
 
 	// trim whitespace and replace remaining whitespace by _
@@ -105,14 +105,14 @@ static string NormalizeColumnName(const string &col_name) {
 	// prepend _ if name starts with a digit or is a reserved keyword
 	auto keyword = KeywordHelper::KeywordCategoryType(col_name_cleaned);
 	if (keyword == KeywordCategory::KEYWORD_TYPE_FUNC || keyword == KeywordCategory::KEYWORD_RESERVED ||
-		(col_name_cleaned[0] >= '0' && col_name_cleaned[0] <= '9')) {
+	    (col_name_cleaned[0] >= '0' && col_name_cleaned[0] <= '9')) {
 		col_name_cleaned = "_" + col_name_cleaned;
-		}
+	}
 	return col_name_cleaned;
 }
 
 static void CleanColumnNames(vector<string> &names, bool normalize) {
-	for(auto &name : names) {
+	for (auto &name : names) {
 		// normalize names or at least trim whitespace
 		if (normalize) {
 			name = NormalizeColumnName(name);
@@ -197,7 +197,7 @@ static void ParseXLSXFileMeta(const unique_ptr<XLSXReadData> &result, ZipFileRea
 			all_sheets.push_back(sheet.first);
 		}
 		auto suggestions = StringUtil::CandidatesErrorMessage(all_sheets, options.sheet, "Did you mean");
-		throw BinderException("Sheet \"%s\" not found in xlsx file \"%s\"%s", result->file_path, options.sheet,
+		throw BinderException("Sheet \"%s\" not found in xlsx file \"%s\"%s", options.sheet, result->file_path,
 		                      suggestions);
 	}
 	result->sheet_path = found->second;
@@ -398,10 +398,20 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 	auto result = make_uniq<XLSXReadData>();
 	// Get the file name
 	const auto file_path = StringValue::Get(input.inputs[0]);
-	result->file_path = file_path;
+
+	// Glob here so that we auto load any required extension filesystems
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto files = fs.GlobFiles(file_path, context, FileGlobOptions::ALLOW_EMPTY);
+	if (files.empty()) {
+		// Use our own error message to be less confusing
+		throw IOException("Cannot open file \"%s\": No such file or directory", file_path);
+	}
+
+	// We dont support multi-file-reading, so just take the first file for now
+	result->file_path = files.front();
 
 	// Open the archive
-	ZipFileReader archive(context, file_path);
+	ZipFileReader archive(context, result->file_path);
 
 	// Parse the options
 	ReadXLSX::ParseOptions(result->options, input.named_parameters);
@@ -507,7 +517,7 @@ int64_t ExcelToEpochUS(const double serial) {
 }
 
 static void TryCastFromString(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
-                    Vector &target_col) {
+                              Vector &target_col) {
 
 	auto &chunk = state.parser.GetChunk();
 	auto &source_col = chunk.data[col_idx];
@@ -521,7 +531,7 @@ static void TryCastFromString(XLSXGlobalState &state, bool ignore_errors, const 
 		for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
 			if (source_validity.RowIsValid(row_idx) != target_validity.RowIsValid(row_idx)) {
 				// If the string is empty, allow it to be cast to NULL
-				if(!FlatVector::GetData<string_t>(source_col)[row_idx].Empty()) {
+				if (!FlatVector::GetData<string_t>(source_col)[row_idx].Empty()) {
 					const auto cell_name = state.parser.GetCellName(row_idx, col_idx);
 					throw InvalidInputException("read_xlsx: Failed to parse cell '%s': %s", cell_name, state.cast_err);
 				}
@@ -617,7 +627,7 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 	}
 
 	// Pad with empty rows if wanted (and needed)
-	if (options.has_explicit_range) {
+	if (options.has_explicit_range && !options.stop_at_empty) {
 		parser.FillRows();
 	}
 

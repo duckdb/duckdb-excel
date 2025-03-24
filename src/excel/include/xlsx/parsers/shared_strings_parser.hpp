@@ -45,6 +45,9 @@ private:
 				state = State::T;
 				// Enable text handling
 				EnableTextHandler(true);
+			} else if (MatchTag("rPh", name)) {
+				// We dont include phonetic text in the strings
+				state = State::RPH;
 			}
 			break;
 		case State::T:
@@ -80,6 +83,11 @@ private:
 				Stop(false);
 			}
 			break;
+		case State::RPH:
+			if (MatchTag("rPh", name)) {
+				state = State::SI;
+			}
+			break;
 		default:
 			break;
 		}
@@ -89,7 +97,7 @@ private:
 	}
 
 private:
-	enum class State : uint8_t { START, SST, SI, T };
+	enum class State : uint8_t { START, SST, SI, T, RPH };
 	State state = State::START;
 	vector<char> data;
 };
@@ -103,7 +111,10 @@ private:
 class SharedStringSearcher final : public SharedStringParserBase {
 public:
 	explicit SharedStringSearcher(const vector<idx_t> &ids_p) : ids(ids_p) {
+
+		// Sort and remove duplicates
 		std::sort(ids.begin(), ids.end());
+		ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 	}
 
 	const unordered_map<idx_t, string> &GetResult() const {
@@ -112,6 +123,7 @@ public:
 
 protected:
 	void OnString(const vector<char> &str) override {
+
 		if (current_idx >= ids.size()) {
 			// We're done, no more strings to find
 			Stop(false);
