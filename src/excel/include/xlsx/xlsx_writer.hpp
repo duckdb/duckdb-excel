@@ -65,6 +65,9 @@ private:
 	vector<char> escaped_buffer;
 };
 
+static constexpr auto ENCODING_FRAGMENT = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+)";
+
 inline void XLXSWriter::BeginSheet(const string &sheet_name, const vector<string> &sql_column_names,
                                    const vector<LogicalType> &sql_column_types) {
 
@@ -109,7 +112,7 @@ inline void XLXSWriter::BeginSheet(const string &sheet_name, const vector<string
 		}
 	}
 
-	static constexpr auto WORKSHEET_XML_START = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+	static constexpr auto WORKSHEET_XML_START = R"(
 	<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 	           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 	           xmlns:mx="http://schemas.microsoft.com/office/mac/excel/2008/main"
@@ -123,6 +126,7 @@ inline void XLXSWriter::BeginSheet(const string &sheet_name, const vector<string
 	)";
 
 	stream.BeginFile("xl/worksheets/" + active_sheet.sheet_file);
+	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(WORKSHEET_XML_START);
 }
 
@@ -267,7 +271,7 @@ inline void XLXSWriter::WriteStyles() {
 	//--------------------------------------------------------------------------------------------------
 	// * Note: Excel can only display up to millisecond precision (even if we can store in microseconds)
 
-	static constexpr auto STYLES_XML = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+	static constexpr auto STYLES_XML = R"(
 	<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
 		<numFmts count="6">
 		    <numFmt formatCode="General" numFmtId="164"/>
@@ -277,13 +281,6 @@ inline void XLXSWriter::WriteStyles() {
 			<numFmt formatCode="dd/mm/yyyy\ hh:mm:ss.000" numFmtId="168"/>
 			<numFmt formatCode="&quot;TRUE&quot;;&quot;TRUE&quot;;&quot;FALSE&quot;" numFmtId="169"/>
 		</numFmts>
-		<fonts count="1">
-			<font>
-				<name val="Arial"/>
-				<family val="2"/>
-				<sz val="10"/>
-			</font>
-		</fonts>
 		<fills count="1">
 			<fill>
 				<patternFill patternType="none"/>
@@ -316,13 +313,13 @@ inline void XLXSWriter::WriteStyles() {
 	)";
 
 	stream.BeginFile("xl/styles.xml");
+	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(STYLES_XML);
 	stream.EndFile();
 }
 
 inline void XLXSWriter::WriteContentTypes() {
 	static constexpr auto CONTENT_TYPES_XML_START =
-	    R"(<?xml version="1.0" encoding="UTF-8"?>)"
 	    R"(<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">)"
 	    R"(<Default Extension="xml" ContentType="application/xml"/>)"
 	    R"(<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>)"
@@ -335,15 +332,17 @@ inline void XLXSWriter::WriteContentTypes() {
 	    R"(<Default Extension="mov" ContentType="application/movie"/>)"
 	    R"(<Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/>)"
 	    R"(<Default Extension="xlsx" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/>)"
-	    R"(<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-officedocument.core-properties+xml"/>)"
+	    R"(<Override PartName="/_rels/.rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>)"
+	    R"(<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>)"
 	    R"(<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>)"
-	    R"(<Override PartName="/xl/_rels/workbook.xml.rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>)"
 	    R"(<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>)"
+	    R"(<Override PartName="/xl/_rels/workbook.xml.rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>)"
 	    R"(<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>)"
 	    R"(<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>)";
 	static constexpr auto CONTENT_TYPES_XML_END = R"(</Types>)";
 
 	stream.BeginFile("[Content_Types].xml");
+	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(CONTENT_TYPES_XML_START);
 	for (const auto &sheet : written_sheets) {
 		stream.Write(StringUtil::Format(
@@ -357,7 +356,7 @@ inline void XLXSWriter::WriteContentTypes() {
 
 inline void XLXSWriter::WriteRels() {
 	static constexpr auto WORKBOOK_REL_XML_START =
-	    R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>)";
+	    R"(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>)";
 	static constexpr auto WORKBOOK_REL_XML_END = R"(</Relationships>)";
 	static constexpr auto REL_SHEET_XML =
 	    R"(<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/%s"/>)";
@@ -365,8 +364,9 @@ inline void XLXSWriter::WriteRels() {
 	stream.AddDirectory("xl/_rels/");
 
 	stream.BeginFile("xl/_rels/workbook.xml.rels");
+	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(WORKBOOK_REL_XML_START);
-	idx_t sheet_offset = 4;
+	idx_t sheet_offset = 3;
 	for (const auto &sheet : written_sheets) {
 		stream.Write(StringUtil::Format(REL_SHEET_XML, sheet_offset++, sheet.sheet_file));
 	}
@@ -376,12 +376,13 @@ inline void XLXSWriter::WriteRels() {
 
 inline void XLXSWriter::WriteWorkbook() {
 	static constexpr auto WORKBOOK_XML_START =
-	    R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mx="http://schemas.microsoft.com/office/mac/excel/2008/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:mv="urn:schemas-microsoft-com:mac:vml" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><workbookPr/><sheets>)";
+	    R"(<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mx="http://schemas.microsoft.com/office/mac/excel/2008/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:mv="urn:schemas-microsoft-com:mac:vml" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main" xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac" xmlns:xm="http://schemas.microsoft.com/office/excel/2006/main"><workbookPr/><sheets>)";
 	static constexpr auto WORKBOOK_XML_END = R"(</sheets><definedNames/><calcPr/></workbook>)";
 
 	stream.BeginFile("xl/workbook.xml");
+	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(WORKBOOK_XML_START);
-	idx_t sheet_offset = 4;
+	idx_t sheet_offset = 3;
 	idx_t sheet_id = 1;
 	for (const auto &sheet : written_sheets) {
 		static constexpr auto SHEET_XML = R"(<sheet name="%s" state="visible" sheetId="%d" r:id="rId%d"/>)";
@@ -394,52 +395,51 @@ inline void XLXSWriter::WriteWorkbook() {
 inline void XLXSWriter::WriteSharedStrings() {
 	// We dont use shared strings for now, but still create a dummy file
 	static constexpr auto SHARED_STRINGS_XML =
-	    R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>)";
+	    R"(<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>)";
 
 	stream.BeginFile("xl/sharedStrings.xml");
+	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(SHARED_STRINGS_XML);
 	stream.EndFile();
 }
 
 inline void XLXSWriter::WriteProps() {
-	static constexpr auto CORE_PROPS_XML = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-		<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
-		                   xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcmitype="http://purl.org/dc/dcmitype/"
-		                   xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-		    <dcterms:created xsi:type="dcterms:W3CDTF">2024-11-15T13:37:00.00Z</dcterms:created>
-		    <dc:creator>DuckDB</dc:creator>
-		    <cp:lastModifiedBy>DuckDB</cp:lastModifiedBy>
-		    <dcterms:modified xsi:type="dcterms:W3CDTF">2024-11-15T13:37:00.00Z</dcterms:modified>
-		    <cp:revision>1</cp:revision>
-		</cp:coreProperties>
-	)";
+	static constexpr auto CORE_PROPS_XML =
+	    R"(<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">)"
+	    R"(<dcterms:created xsi:type="dcterms:W3CDTF">2024-11-15T13:37:00.00Z</dcterms:created>)"
+	    R"(<dc:creator>DuckDB</dc:creator>)"
+	    R"(<cp:lastModifiedBy>DuckDB</cp:lastModifiedBy>)"
+	    R"(<dcterms:modified xsi:type="dcterms:W3CDTF">2024-11-15T13:37:00.00Z</dcterms:modified>)"
+	    R"(<cp:revision>1</cp:revision>)"
+	    R"(</cp:coreProperties>)";
 
-	static constexpr auto APP_PROPS_XML = R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-		<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
-			<Application>DuckDB</Application>
-			<TotalTime>0</TotalTime>
-		</Properties>
-	)";
+	static constexpr auto APP_PROPS_XML =
+	    R"(<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">)"
+	    R"(<Application>DuckDB</Application>)"
+	    R"(<TotalTime>0</TotalTime>)"
+	    R"(</Properties>)";
 
-	static constexpr auto ROOT_RELS = R"(<?xml version="1.0" encoding="UTF-8"?>
-		<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-			<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-			<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
-			<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
-		</Relationships>
-	)";
+	static constexpr auto ROOT_RELS =
+	    R"(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">)"
+	    R"(<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>)"
+	    R"(<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>)"
+	    R"(<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>)"
+	    R"(</Relationships>)";
+
+	stream.AddDirectory("_rels/");
+	stream.BeginFile("_rels/.rels");
+	stream.Write(ENCODING_FRAGMENT);
+	stream.Write(ROOT_RELS);
+	stream.EndFile();
 
 	stream.BeginFile("docProps/core.xml");
+	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(CORE_PROPS_XML);
 	stream.EndFile();
 
 	stream.BeginFile("docProps/app.xml");
+	stream.Write(ENCODING_FRAGMENT);
 	stream.Write(APP_PROPS_XML);
-	stream.EndFile();
-
-	stream.AddDirectory("_rels/");
-	stream.BeginFile("_rels/.rels");
-	stream.Write(ROOT_RELS);
 	stream.EndFile();
 }
 
