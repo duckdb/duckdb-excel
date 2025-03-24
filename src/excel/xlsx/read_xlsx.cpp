@@ -197,7 +197,7 @@ static void ParseXLSXFileMeta(const unique_ptr<XLSXReadData> &result, ZipFileRea
 			all_sheets.push_back(sheet.first);
 		}
 		auto suggestions = StringUtil::CandidatesErrorMessage(all_sheets, options.sheet, "Did you mean");
-		throw BinderException("Sheet \"%s\" not found in xlsx file \"%s\"%s", result->file_path, options.sheet,
+		throw BinderException("Sheet \"%s\" not found in xlsx file \"%s\"%s", options.sheet, result->file_path,
 		                      suggestions);
 	}
 	result->sheet_path = found->second;

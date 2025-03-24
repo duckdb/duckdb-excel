@@ -1,0 +1,6 @@
+require excel
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', sheet='FooBar');
+----
+Binder Error: Sheet "FooBar" not found in xlsx file "test/data/xlsx/google_sheets.xlsx"
