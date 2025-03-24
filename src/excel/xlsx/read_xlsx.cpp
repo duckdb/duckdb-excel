@@ -398,10 +398,20 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 	auto result = make_uniq<XLSXReadData>();
 	// Get the file name
 	const auto file_path = StringValue::Get(input.inputs[0]);
-	result->file_path = file_path;
+
+	// Glob here so that we auto load any required extension filesystems
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto files = fs.GlobFiles(file_path, context, FileGlobOptions::ALLOW_EMPTY);
+	if (files.empty()) {
+		// Use our own error message to be less confusing
+		throw IOException("Cannot open file \"%s\": No such file or directory", file_path);
+	}
+
+	// We dont support multi-file-reading, so just take the first file for now
+	result->file_path = files.front();
 
 	// Open the archive
-	ZipFileReader archive(context, file_path);
+	ZipFileReader archive(context, result->file_path);
 
 	// Parse the options
 	ReadXLSX::ParseOptions(result->options, input.named_parameters);
