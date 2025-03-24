@@ -45,6 +45,9 @@ private:
 				state = State::T;
 				// Enable text handling
 				EnableTextHandler(true);
+			} else if (MatchTag("rPh", name)) {
+				// We dont include phonetic text in the strings
+				state = State::RPH;
 			}
 			break;
 		case State::T:
@@ -80,6 +83,11 @@ private:
 				Stop(false);
 			}
 			break;
+		case State::RPH:
+			if (MatchTag("rPh", name)) {
+				state = State::SI;
+			}
+			break;
 		default:
 			break;
 		}
@@ -89,7 +97,7 @@ private:
 	}
 
 private:
-	enum class State : uint8_t { START, SST, SI, T };
+	enum class State : uint8_t { START, SST, SI, T, RPH };
 	State state = State::START;
 	vector<char> data;
 };
