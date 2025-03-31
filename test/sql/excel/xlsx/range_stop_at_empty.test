@@ -1,5 +1,7 @@
 require excel
 
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
 statement ok
 create table t1 as select * from range(0, 100) r(i);
 
