@@ -364,13 +364,15 @@ static void SetBooleanValue(named_parameter_map_t &params, const string &key, co
 		throw BinderException(error_msg, key);
 	}
 	if (val.size() == 1) {
-		if (val.back().type() != LogicalType::BOOLEAN) {
+		auto &value = val.back();
+		if (value.IsNull()) {
 			throw BinderException(error_msg, key);
 		}
-		if (val.back().IsNull()) {
-			throw BinderException(error_msg, key);
+		if (value.type() == LogicalType::FLOAT || value.type() == LogicalType::DOUBLE ||
+		    value.type().id() == LogicalTypeId::DECIMAL) {
+			throw BinderException("'%s' options expects a boolean value (e.g. TRUE or 1)", key);
 		}
-		params[key] = val.back();
+		params[key] = value.DefaultCastAs(LogicalType::BOOLEAN);
 	} else {
 		params[key] = Value::BOOLEAN(true);
 	}
