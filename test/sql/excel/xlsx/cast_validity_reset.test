@@ -13,7 +13,7 @@ create or replace table testtable (
 );
 
 statement ok
-COPY testtable FROM '__TEST_DIR__/test.xlsx' (FORMAT xlsx);
+COPY testtable FROM '__TEST_DIR__/double_date_null.xlsx' (FORMAT xlsx);
 
 query II
 SELECT * FROM testtable
