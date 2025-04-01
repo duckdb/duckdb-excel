@@ -183,6 +183,10 @@ ZipFileWriter::ZipFileWriter(ClientContext &context, const string &file_name) {
 	duckdb_stream.fs = &fs;
 	duckdb_stream.handle = nullptr;
 
+	// Set compression level
+	mz_zip_writer_set_compress_level(handle, MZ_COMPRESS_LEVEL_NORMAL);
+	mz_zip_writer_set_compress_method(handle, MZ_COMPRESS_METHOD_DEFLATE);
+
 	if (mz_stream_open(stream, file_name.c_str(), MZ_OPEN_MODE_CREATE | MZ_OPEN_MODE_WRITE) != MZ_OK) {
 		if (duckdb_stream.last_error.empty()) {
 			throw IOException("Failed to open file for writing");
@@ -218,9 +222,11 @@ ZipFileWriter::~ZipFileWriter() {
 void ZipFileWriter::AddDirectory(const string &dir_path) {
 	// Must end with a slash
 	D_ASSERT(dir_path[dir_path.size() - 1] == '/');
-	mz_zip_file file_info = {0};
+	mz_zip_file file_info = {};
 	file_info.filename = dir_path.c_str();
-	file_info.compression_method = MZ_COMPRESS_METHOD_DEFLATE;
+	file_info.compression_method = MZ_COMPRESS_METHOD_STORE;
+	file_info.zip64 = MZ_ZIP64_DISABLE; // not compatible with XLSX
+
 	mz_zip_writer_add_buffer(handle, nullptr, 0, &file_info);
 }
 
@@ -231,6 +237,7 @@ void ZipFileWriter::BeginFile(const string &file_path) {
 	mz_zip_file file_info = {0};
 	file_info.filename = file_path.c_str();
 	file_info.compression_method = MZ_COMPRESS_METHOD_DEFLATE;
+	file_info.zip64 = MZ_ZIP64_DISABLE; // not compatible with XLSX
 	if (mz_zip_writer_entry_open(handle, &file_info) != MZ_OK) {
 		throw IOException("Failed to open entry for writing");
 	}
