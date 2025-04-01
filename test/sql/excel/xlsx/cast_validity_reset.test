@@ -1,0 +1,21 @@
+require excel
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+
+statement ok
+COPY (select NULL::DATE A, '2024-12-31'::DATE B) TO '__TEST_DIR__/double_date_null.xlsx' WITH(FORMAT xlsx, HEADER true);
+
+statement ok
+create or replace table testtable (
+    A DATE NULL,
+    B DATE NOT NULL,
+);
+
+statement ok
+COPY testtable FROM 'test.xlsx' (FORMAT xlsx);
+
+query II
+SELECT * FROM testtable
+----
+NULL	2024-12-31

@@ -577,10 +577,11 @@ static void TryCastTimestamp(XLSXGlobalState &state, bool ignore_errors, const i
 
 	// Then convert the double to a timestamp
 	const auto row_count = state.parser.GetChunk().size();
-	UnaryExecutor::Execute<double, timestamp_t>(state.cast_vec.data[0], target_col, row_count, [&](const double &input) {
-		const auto epoch_us = ExcelToEpochUS(input);
-		return Timestamp::FromEpochMicroSeconds(epoch_us);
-	});
+	UnaryExecutor::Execute<double, timestamp_t>(state.cast_vec.data[0], target_col, row_count,
+	                                            [&](const double &input) {
+		                                            const auto epoch_us = ExcelToEpochUS(input);
+		                                            return Timestamp::FromEpochMicroSeconds(epoch_us);
+	                                            });
 }
 
 static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
