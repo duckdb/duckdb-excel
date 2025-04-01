@@ -440,7 +440,9 @@ public:
 	                         bool stop_at_empty)
 	    : archive(context, file_name), strings(BufferAllocator::Get(context)),
 	      parser(context, range, strings, stop_at_empty),
-	      buffer(make_unsafe_uniq_array_uninitialized<char>(BUFFER_SIZE)), cast_vec(LogicalType::DOUBLE) {
+	      buffer(make_unsafe_uniq_array_uninitialized<char>(BUFFER_SIZE)) {
+
+		cast_vec.Initialize(context, {LogicalType::DOUBLE});
 	}
 
 	ZipFileReader archive;
@@ -451,7 +453,7 @@ public:
 	XMLParseResult status = XMLParseResult::OK;
 
 	string cast_err;
-	Vector cast_vec;
+	DataChunk cast_vec;
 
 	atomic<idx_t> stream_pos = {0};
 	idx_t stream_len = 0;
@@ -543,11 +545,11 @@ static void TryCastFromString(XLSXGlobalState &state, bool ignore_errors, const 
 static void TryCastTime(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
                         Vector &target_col) {
 	// First cast it to a double
-	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec);
+	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec.data[0]);
 
 	// Then convert the double to a time
 	const auto row_count = state.parser.GetChunk().size();
-	UnaryExecutor::Execute<double, dtime_t>(state.cast_vec, target_col, row_count, [&](const double &input) {
+	UnaryExecutor::Execute<double, dtime_t>(state.cast_vec.data[0], target_col, row_count, [&](const double &input) {
 		const auto epoch_us = ExcelToEpochUS(input);
 		const auto stamp = Timestamp::FromEpochMicroSeconds(epoch_us);
 		return Timestamp::GetTime(stamp);
@@ -557,11 +559,11 @@ static void TryCastTime(XLSXGlobalState &state, bool ignore_errors, const idx_t 
 static void TryCastDate(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
                         Vector &target_col) {
 	// First cast it to a double
-	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec);
+	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec.data[0]);
 
 	// Then convert the double to a date
 	const auto row_count = state.parser.GetChunk().size();
-	UnaryExecutor::Execute<double, date_t>(state.cast_vec, target_col, row_count, [&](const double &input) {
+	UnaryExecutor::Execute<double, date_t>(state.cast_vec.data[0], target_col, row_count, [&](const double &input) {
 		const auto epoch_us = ExcelToEpochUS(input);
 		const auto stamp = Timestamp::FromEpochMicroSeconds(epoch_us);
 		return Timestamp::GetDate(stamp);
@@ -571,14 +573,15 @@ static void TryCastDate(XLSXGlobalState &state, bool ignore_errors, const idx_t 
 static void TryCastTimestamp(XLSXGlobalState &state, bool ignore_errors, const idx_t col_idx, ClientContext &context,
                              Vector &target_col) {
 	// First cast it to a double
-	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec);
+	TryCastFromString(state, ignore_errors, col_idx, context, state.cast_vec.data[0]);
 
 	// Then convert the double to a timestamp
 	const auto row_count = state.parser.GetChunk().size();
-	UnaryExecutor::Execute<double, timestamp_t>(state.cast_vec, target_col, row_count, [&](const double &input) {
-		const auto epoch_us = ExcelToEpochUS(input);
-		return Timestamp::FromEpochMicroSeconds(epoch_us);
-	});
+	UnaryExecutor::Execute<double, timestamp_t>(state.cast_vec.data[0], target_col, row_count,
+	                                            [&](const double &input) {
+		                                            const auto epoch_us = ExcelToEpochUS(input);
+		                                            return Timestamp::FromEpochMicroSeconds(epoch_us);
+	                                            });
 }
 
 static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
@@ -645,7 +648,13 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 		if (source_type == target_type) {
 			// If the types are the same, reference the column
 			target_col.Reference(source_col);
-		} else if (xlsx_type == XLSXCellType::NUMBER && target_type == LogicalTypeId::TIME) {
+			continue;
+		}
+
+		// Clear the cast vector
+		gstate.cast_vec.Reset();
+
+		if (xlsx_type == XLSXCellType::NUMBER && target_type == LogicalTypeId::TIME) {
 			TryCastTime(gstate, options.ignore_errors, col_idx, context, target_col);
 		} else if (xlsx_type == XLSXCellType::NUMBER && target_type == LogicalTypeId::DATE) {
 			TryCastDate(gstate, options.ignore_errors, col_idx, context, target_col);
