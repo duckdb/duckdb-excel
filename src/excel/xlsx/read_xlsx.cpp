@@ -408,7 +408,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 	}
 
 	// We dont support multi-file-reading, so just take the first file for now
-	result->file_path = files.front();
+	result->file_path = files.front().path;
 
 	// Open the archive
 	ZipFileReader archive(context, result->file_path);
