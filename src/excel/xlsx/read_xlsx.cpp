@@ -123,6 +123,49 @@ static void CleanColumnNames(vector<string> &names, bool normalize) {
 }
 
 //-------------------------------------------------------------------
+// Util
+//-------------------------------------------------------------------
+static string XLSXUnescapeXMLEntities(const string &input) {
+    string result;
+    result.reserve(input.length());
+
+    for (idx_t i = 0; i < input.length(); i++) {
+        if (input[i] == '&') {
+            // Look ahead to find semicolon
+            auto semi = input.find(';', i);
+            if (semi != string::npos) {
+                string entity = input.substr(i, semi - i + 1);
+                if (entity == "&lt;") {
+                    result += '<';
+                    i = semi;
+                } else if (entity == "&gt;") {
+                    result += '>';
+                    i = semi;
+                } else if (entity == "&amp;") {
+                    result += '&';
+                    i = semi;
+                } else if (entity == "&quot;") {
+                    result += '"';
+                    i = semi;
+                } else if (entity == "&apos;") {
+                    result += '\'';
+                    i = semi;
+                } else {
+                    // Unknown entity, keep as-is
+                    result += input[i];
+                }
+            } else {
+                // No semicolon found, keep as-is
+                result += input[i];
+            }
+        } else {
+            result += input[i];
+        }
+    }
+    return result;
+}
+
+//-------------------------------------------------------------------
 // Meta
 //-------------------------------------------------------------------
 static void ParseXLSXFileMeta(const unique_ptr<XLSXReadData> &result, ZipFileReader &reader) {
@@ -167,9 +210,9 @@ static void ParseXLSXFileMeta(const unique_ptr<XLSXReadData> &result, ZipFileRea
 
 			// Normalize everything to absolute paths
 			if (StringUtil::StartsWith(found->second, "/xl/")) {
-				candidate_sheets[sheet.first] = found->second.substr(1);
+				candidate_sheets[XLSXUnescapeXMLEntities(sheet.first)] = found->second.substr(1);
 			} else {
-				candidate_sheets[sheet.first] = "xl/" + found->second;
+				candidate_sheets[XLSXUnescapeXMLEntities(sheet.first)] = "xl/" + found->second;
 			}
 
 			// Set the first sheet we find as the primary sheet
@@ -189,7 +232,7 @@ static void ParseXLSXFileMeta(const unique_ptr<XLSXReadData> &result, ZipFileRea
 		options.sheet = primary_sheet;
 	}
 
-	const auto found = candidate_sheets.find(options.sheet);
+	const auto found = candidate_sheets.find(XLSXUnescapeXMLEntities(options.sheet));
 	if (found == candidate_sheets.end()) {
 		// Throw a helpful error message
 		vector<string> all_sheets;
