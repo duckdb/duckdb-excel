@@ -5,6 +5,13 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(ExcelExtension)
 
+if (EMSCRIPTEN)
+  # _LINKED_LIBS influences only Wasm compilation
+  # it's unclear why this is needed, but avoid globals to be incorrectly not linked-in
+  # this solves by basically re-linking (at the moment the Wasm binary is actually produced)
+  set (DUCKDB_EXTENSION_EXCEL_LINKED_LIBS "../../vcpkg_installed/wasm32-emscripten/lib/lib*.a")
+endif()
+
 # Dependencies from VCPKG
 find_package(EXPAT REQUIRED)
 find_package(ZLIB REQUIRED)
