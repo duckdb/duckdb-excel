@@ -1,12 +1,10 @@
-#define DUCKDB_EXTENSION_MAIN
-
 #include "excel_extension.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "nf_calendar.h"
 #include "nf_localedata.h"
 #include "nf_zformat.h"
@@ -70,21 +68,24 @@ static void NumberFormatFunction(DataChunk &args, ExpressionState &state, Vector
 // Load
 //--------------------------------------------------------------------------------------------------
 
-void ExcelExtension::Load(DuckDB &db) {
-	auto &db_instance = *db.instance;
+static void LoadInternal(ExtensionLoader &loader) {
 
 	ScalarFunction text_func("text", {LogicalType::DOUBLE, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-	                         NumberFormatFunction);
-	ExtensionUtil::RegisterFunction(db_instance, text_func);
+							 NumberFormatFunction);
+	loader.RegisterFunction(text_func);
 
 	ScalarFunction excel_text_func("excel_text", {LogicalType::DOUBLE, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-	                               NumberFormatFunction);
+								   NumberFormatFunction);
 
-	ExtensionUtil::RegisterFunction(db_instance, excel_text_func);
+	loader.RegisterFunction(excel_text_func);
 
 	// Register the XLSX functions
-	ReadXLSX::Register(db_instance);
-	WriteXLSX::Register(db_instance);
+	ReadXLSX::Register(loader);
+	WriteXLSX::Register(loader);
+}
+
+void ExcelExtension::Load(ExtensionLoader &loader) {
+	LoadInternal(loader);
 }
 
 std::string ExcelExtension::Name() {
@@ -95,16 +96,8 @@ std::string ExcelExtension::Name() {
 
 extern "C" {
 
-DUCKDB_EXTENSION_API void excel_init(duckdb::DatabaseInstance &db) {
-	duckdb::DuckDB db_wrapper(db);
-	db_wrapper.LoadExtension<duckdb::ExcelExtension>();
+DUCKDB_CPP_EXTENSION_ENTRY(excel, loader) {
+	duckdb::LoadInternal(loader);
 }
 
-DUCKDB_EXTENSION_API const char *excel_version() {
-	return duckdb::DuckDB::LibraryVersion();
 }
-}
-
-#ifndef DUCKDB_EXTENSION_MAIN
-#error DUCKDB_EXTENSION_MAIN not defined
-#endif

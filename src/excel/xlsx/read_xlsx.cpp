@@ -5,7 +5,7 @@
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/main/extension_util.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -726,9 +726,9 @@ TableFunction ReadXLSX::GetFunction() {
 	return read_xlsx;
 }
 
-void ReadXLSX::Register(DatabaseInstance &db) {
-	ExtensionUtil::RegisterFunction(db, GetFunction());
-	db.config.replacement_scans.emplace_back(XLSXReplacementScan);
+void ReadXLSX::Register(ExtensionLoader &loader) {
+	loader.RegisterFunction(GetFunction());
+	loader.GetDatabaseInstance().config.replacement_scans.emplace_back(XLSXReplacementScan);
 }
 
 } // namespace duckdb
