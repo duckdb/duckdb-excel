@@ -6,10 +6,10 @@
 
 namespace duckdb {
 
-class DatabaseInstance;
+class ExtensionLoader;
 
 struct WriteXLSX {
-	static void Register(DatabaseInstance &db);
+	static void Register(ExtensionLoader &loader);
 };
 
 enum class XLSXHeaderMode : uint8_t { NEVER, MAYBE, FORCE };
@@ -47,7 +47,7 @@ struct ReadXLSX {
 	static void ParseOptions(XLSXReadOptions &options, const named_parameter_map_t &input);
 	static void ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReader &archive);
 
-	static void Register(DatabaseInstance &db);
+	static void Register(ExtensionLoader &loader);
 	static TableFunction GetFunction();
 };
 
