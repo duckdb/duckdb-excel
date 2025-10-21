@@ -1,15 +1,14 @@
 #pragma once
-#include "duckdb/function/table_function.hpp"
 #include "duckdb/common/named_parameter_map.hpp"
-
+#include "duckdb/function/table_function.hpp"
 #include "xlsx/xlsx_parts.hpp"
 
 namespace duckdb {
 
-class ExtensionLoader;
+class DatabaseInstance;
 
 struct WriteXLSX {
-	static void Register(ExtensionLoader &loader);
+	static void Register(DatabaseInstance &db);
 };
 
 enum class XLSXHeaderMode : uint8_t { NEVER, MAYBE, FORCE };
@@ -31,6 +30,7 @@ class XLSXReadData final : public TableFunctionData {
 public:
 	string file_path;
 	string sheet_path;
+	vector<string> all_files;
 
 	vector<LogicalType> return_types;
 	vector<XLSXCellType> source_types;
@@ -47,7 +47,7 @@ struct ReadXLSX {
 	static void ParseOptions(XLSXReadOptions &options, const named_parameter_map_t &input);
 	static void ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReader &archive);
 
-	static void Register(ExtensionLoader &loader);
+	static void Register(DatabaseInstance &db);
 	static TableFunction GetFunction();
 };
 

@@ -4,7 +4,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/scalar_function.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_util.hpp"
 #include "nf_calendar.h"
 #include "nf_localedata.h"
 #include "nf_zformat.h"
@@ -68,24 +68,22 @@ static void NumberFormatFunction(DataChunk &args, ExpressionState &state, Vector
 // Load
 //--------------------------------------------------------------------------------------------------
 
-static void LoadInternal(ExtensionLoader &loader) {
-
+static void LoadInternal(DatabaseInstance &db) {
 	ScalarFunction text_func("text", {LogicalType::DOUBLE, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-							 NumberFormatFunction);
-	loader.RegisterFunction(text_func);
+	                         NumberFormatFunction);
+	ExtensionUtil::RegisterFunction(db, text_func);
 
 	ScalarFunction excel_text_func("excel_text", {LogicalType::DOUBLE, LogicalType::VARCHAR}, LogicalType::VARCHAR,
-								   NumberFormatFunction);
-
-	loader.RegisterFunction(excel_text_func);
+	                               NumberFormatFunction);
+	ExtensionUtil::RegisterFunction(db, excel_text_func);
 
 	// Register the XLSX functions
-	ReadXLSX::Register(loader);
-	WriteXLSX::Register(loader);
+	ReadXLSX::Register(db);
+	WriteXLSX::Register(db);
 }
 
-void ExcelExtension::Load(ExtensionLoader &loader) {
-	LoadInternal(loader);
+void ExcelExtension::Load(DuckDB &db) {
+	LoadInternal(*db.instance);
 }
 
 std::string ExcelExtension::Name() {
@@ -93,11 +91,14 @@ std::string ExcelExtension::Name() {
 }
 
 } // namespace duckdb
-
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(excel, loader) {
-	duckdb::LoadInternal(loader);
+DUCKDB_EXTENSION_API void excel_init(duckdb::DatabaseInstance &db) {
+	duckdb::DuckDB db_wrapper(db);
+	db_wrapper.LoadExtension<duckdb::ExcelExtension>();
 }
 
+DUCKDB_EXTENSION_API const char *excel_version() {
+	return duckdb::DuckDB::LibraryVersion();
+}
 }

@@ -5,7 +5,7 @@
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_util.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -126,43 +126,43 @@ static void CleanColumnNames(vector<string> &names, bool normalize) {
 // Util
 //-------------------------------------------------------------------
 static string XLSXUnescapeXMLEntities(const string &input) {
-    string result;
-    result.reserve(input.length());
+	string result;
+	result.reserve(input.length());
 
-    for (idx_t i = 0; i < input.length(); i++) {
-        if (input[i] == '&') {
-            // Look ahead to find semicolon
-            auto semi = input.find(';', i);
-            if (semi != string::npos) {
-                string entity = input.substr(i, semi - i + 1);
-                if (entity == "&lt;") {
-                    result += '<';
-                    i = semi;
-                } else if (entity == "&gt;") {
-                    result += '>';
-                    i = semi;
-                } else if (entity == "&amp;") {
-                    result += '&';
-                    i = semi;
-                } else if (entity == "&quot;") {
-                    result += '"';
-                    i = semi;
-                } else if (entity == "&apos;") {
-                    result += '\'';
-                    i = semi;
-                } else {
-                    // Unknown entity, keep as-is
-                    result += input[i];
-                }
-            } else {
-                // No semicolon found, keep as-is
-                result += input[i];
-            }
-        } else {
-            result += input[i];
-        }
-    }
-    return result;
+	for (idx_t i = 0; i < input.length(); i++) {
+		if (input[i] == '&') {
+			// Look ahead to find semicolon
+			auto semi = input.find(';', i);
+			if (semi != string::npos) {
+				string entity = input.substr(i, semi - i + 1);
+				if (entity == "&lt;") {
+					result += '<';
+					i = semi;
+				} else if (entity == "&gt;") {
+					result += '>';
+					i = semi;
+				} else if (entity == "&amp;") {
+					result += '&';
+					i = semi;
+				} else if (entity == "&quot;") {
+					result += '"';
+					i = semi;
+				} else if (entity == "&apos;") {
+					result += '\'';
+					i = semi;
+				} else {
+					// Unknown entity, keep as-is
+					result += input[i];
+				}
+			} else {
+				// No semicolon found, keep as-is
+				result += input[i];
+			}
+		} else {
+			result += input[i];
+		}
+	}
+	return result;
 }
 
 //-------------------------------------------------------------------
@@ -210,9 +210,9 @@ static void ParseXLSXFileMeta(const unique_ptr<XLSXReadData> &result, ZipFileRea
 
 			// Normalize everything to absolute paths
 			if (StringUtil::StartsWith(found->second, "/xl/")) {
-				candidate_sheets[XLSXUnescapeXMLEntities(sheet.first)] = found->second.substr(1);
+				candidate_sheets[sheet.first] = found->second.substr(1);
 			} else {
-				candidate_sheets[XLSXUnescapeXMLEntities(sheet.first)] = "xl/" + found->second;
+				candidate_sheets[sheet.first] = "xl/" + found->second;
 			}
 
 			// Set the first sheet we find as the primary sheet
@@ -232,7 +232,7 @@ static void ParseXLSXFileMeta(const unique_ptr<XLSXReadData> &result, ZipFileRea
 		options.sheet = primary_sheet;
 	}
 
-	const auto found = candidate_sheets.find(XLSXUnescapeXMLEntities(options.sheet));
+	const auto found = candidate_sheets.find(options.sheet);
 	if (found == candidate_sheets.end()) {
 		// Throw a helpful error message
 		vector<string> all_sheets;
@@ -439,19 +439,42 @@ void ReadXLSX::ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReade
 static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,
                                      vector<LogicalType> &return_types, vector<string> &names) {
 	auto result = make_uniq<XLSXReadData>();
-	// Get the file name
-	const auto file_path = StringValue::Get(input.inputs[0]);
 
-	// Glob here so that we auto load any required extension filesystems
-	auto &fs = FileSystem::GetFileSystem(context);
-	auto files = fs.GlobFiles(file_path, context, FileGlobOptions::ALLOW_EMPTY);
-	if (files.empty()) {
-		// Use our own error message to be less confusing
-		throw IOException("Cannot open file \"%s\": No such file or directory", file_path);
+	// Handle both single file (VARCHAR) and multiple files (LIST(VARCHAR))
+	vector<string> file_paths;
+	if (input.inputs[0].type().id() == LogicalTypeId::VARCHAR) {
+		const auto file_path = StringValue::Get(input.inputs[0]);
+		file_paths.push_back(file_path);
+	} else if (input.inputs[0].type().id() == LogicalTypeId::LIST) {
+		auto &list_children = ListValue::GetChildren(input.inputs[0]);
+		for (auto &child : list_children) {
+			file_paths.push_back(StringValue::Get(child));
+		}
+	} else {
+		throw BinderException("read_xlsx expects a file path (VARCHAR) or list of file paths (VARCHAR[])");
 	}
 
-	// We dont support multi-file-reading, so just take the first file for now
-	result->file_path = files.front().path;
+	// Glob all file paths to expand wildcards
+	auto &fs = FileSystem::GetFileSystem(context);
+	vector<string> expanded_files;
+	for (const auto &path : file_paths) {
+		auto files = fs.GlobFiles(path, context, FileGlobOptions::ALLOW_EMPTY);
+		if (files.empty()) {
+			throw IOException("Cannot open file \"%s\": No such file or directory", path);
+		}
+		for (const auto &file : files) {
+			expanded_files.push_back(file.path);
+		}
+	}
+
+	if (expanded_files.empty()) {
+		throw IOException("No files found to read");
+	}
+
+	// Store all files for multi-file reading
+	result->all_files = expanded_files;
+	// Use the first file for schema detection
+	result->file_path = expanded_files.front();
 
 	// Open the archive
 	ZipFileReader archive(context, result->file_path);
@@ -479,15 +502,20 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 //-------------------------------------------------------------------
 class XLSXGlobalState final : public GlobalTableFunctionState {
 public:
-	explicit XLSXGlobalState(ClientContext &context, const string &file_name, const XLSXCellRange &range,
+	explicit XLSXGlobalState(ClientContext &context, const vector<string> &all_files, const XLSXCellRange &range,
 	                         bool stop_at_empty)
-	    : archive(context, file_name), strings(BufferAllocator::Get(context)),
+	    : all_files(all_files), current_file_idx(0), range_copy(range), stop_at_empty_copy(stop_at_empty),
+	      archive(context, all_files[0]), strings(BufferAllocator::Get(context)),
 	      parser(context, range, strings, stop_at_empty),
 	      buffer(make_unsafe_uniq_array_uninitialized<char>(BUFFER_SIZE)) {
 
 		cast_vec.Initialize(context, {LogicalType::DOUBLE});
 	}
 
+	vector<string> all_files;
+	idx_t current_file_idx;
+	XLSXCellRange range_copy;
+	bool stop_at_empty_copy;
 	ZipFileReader archive;
 	StringTable strings;
 	SheetParser parser;
@@ -508,7 +536,7 @@ public:
 static unique_ptr<GlobalTableFunctionState> InitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &data = input.bind_data->Cast<XLSXReadData>();
 	auto &options = data.options;
-	auto state = make_uniq<XLSXGlobalState>(context, data.file_path, data.options.range, options.stop_at_empty);
+	auto state = make_uniq<XLSXGlobalState>(context, data.all_files, data.options.range, options.stop_at_empty);
 
 	// Check if there is a string table. If there is, extract it
 	if (state->archive.TryOpenEntry("xl/sharedStrings.xml")) {
@@ -627,6 +655,53 @@ static void TryCastTimestamp(XLSXGlobalState &state, bool ignore_errors, const i
 	                                            });
 }
 
+//-------------------------------------------------------------------
+// Switch to next file (helper for multi-file reading)
+//-------------------------------------------------------------------
+static bool SwitchToNextFile(ClientContext &context, XLSXGlobalState &gstate, const XLSXReadData &bind_data,
+                             XMLParseResult &status) {
+	// Check if we have more files to process
+	if (gstate.current_file_idx + 1 >= gstate.all_files.size()) {
+		return false; // No more files
+	}
+
+	// Move to next file
+	gstate.current_file_idx++;
+	const auto &next_file = gstate.all_files[gstate.current_file_idx];
+
+	// Reset archive to next file
+	gstate.archive.~ZipFileReader();
+	new (&gstate.archive) ZipFileReader(context, next_file);
+
+	// Check if there is a string table in the new file
+	if (gstate.archive.TryOpenEntry("xl/sharedStrings.xml")) {
+		gstate.strings.~StringTable();
+		new (&gstate.strings) StringTable(BufferAllocator::Get(context));
+		SharedStringParser::ParseStringTable(gstate.archive, gstate.strings);
+		gstate.archive.CloseEntry();
+	} else {
+		gstate.strings.~StringTable();
+		new (&gstate.strings) StringTable(BufferAllocator::Get(context));
+	}
+
+	// Open the main sheet for reading in the new file
+	if (!gstate.archive.TryOpenEntry(bind_data.sheet_path)) {
+		throw InvalidInputException("Sheet '%s' not found in xlsx file '%s'", bind_data.sheet_path, next_file);
+	}
+
+	// Reset parser for the new file
+	gstate.parser.~SheetParser();
+	new (&gstate.parser) SheetParser(context, gstate.range_copy, gstate.strings, gstate.stop_at_empty_copy);
+
+	// Reset stream tracking
+	gstate.status = XMLParseResult::OK;
+	gstate.stream_pos = 0;
+	gstate.stream_len = gstate.archive.GetEntryLen();
+	status = XMLParseResult::OK;
+
+	return true; // Successfully switched to next file
+}
+
 static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<XLSXReadData>();
 	auto &options = bind_data.options;
@@ -636,7 +711,6 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 	auto &stream = gstate.archive;
 	auto &parser = gstate.parser;
 	auto &status = gstate.status;
-
 	// Ready the chunk
 	auto &chunk = parser.GetChunk();
 	chunk.Reset();
@@ -657,12 +731,33 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 			continue;
 		}
 		if (stream.IsDone()) {
-			break;
+			// Stream is done for current file
+			// If we have rows in the chunk, return them first before switching files
+			if (chunk.size() > 0) {
+				break;
+			}
+
+			// Try to switch to next file, or break if no more files
+			if (SwitchToNextFile(context, gstate, bind_data, status)) {
+				continue; // Continue processing with the new file
+			} else {
+				break; // No more files, we're done
+			}
 		}
 		if (status == XMLParseResult::ABORTED) {
-			break;
-		}
+			// Parser aborted (e.g., hit empty rows with stop_at_empty)
+			// Return any partial data, then switch to next file if available
+			if (chunk.size() > 0) {
+				break;
+			}
 
+			// Try to switch to next file, or break if no more files
+			if (SwitchToNextFile(context, gstate, bind_data, status)) {
+				continue; // Continue processing with the new file
+			} else {
+				break; // No more files, we're done
+			}
+		}
 		// Otherwise, read more data
 		const auto read_size = stream.Read(buffer, XLSXGlobalState::BUFFER_SIZE);
 
@@ -769,9 +864,84 @@ TableFunction ReadXLSX::GetFunction() {
 	return read_xlsx;
 }
 
-void ReadXLSX::Register(ExtensionLoader &loader) {
-	loader.RegisterFunction(GetFunction());
-	loader.GetDatabaseInstance().config.replacement_scans.emplace_back(XLSXReplacementScan);
+//-------------------------------------------------------------------
+// List Sheets Function
+//-------------------------------------------------------------------
+struct XLSXListSheetsBindData : public TableFunctionData {
+	string file_path;
+	vector<pair<string, string>> sheets;
+};
+
+static unique_ptr<FunctionData> ListSheetsBind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<XLSXListSheetsBindData>();
+	const auto file_path = StringValue::Get(input.inputs[0]);
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto files = fs.GlobFiles(file_path, context, FileGlobOptions::ALLOW_EMPTY);
+	if (files.empty()) {
+		throw IOException("Cannot open file \"%s\": No such file or directory", file_path);
+	}
+
+	result->file_path = files.front().path;
+
+	ZipFileReader archive(context, result->file_path);
+
+	if (!archive.TryOpenEntry("xl/workbook.xml")) {
+		throw InvalidInputException("File '%s' does not appear to be a valid xlsx file (missing xl/workbook.xml)",
+		                            result->file_path);
+	}
+
+	result->sheets = WorkBookParser::GetSheets(archive);
+	archive.CloseEntry();
+
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("name");
+
+	return std::move(result);
 }
 
+struct XLSXListSheetsState : public GlobalTableFunctionState {
+	idx_t current_idx = 0;
+};
+
+static unique_ptr<GlobalTableFunctionState> ListSheetsInit(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<XLSXListSheetsState>();
+}
+
+static void ListSheetsExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<XLSXListSheetsBindData>();
+	auto &gstate = data.global_state->Cast<XLSXListSheetsState>();
+	auto &sheets = bind_data.sheets;
+
+	idx_t count = 0;
+	while (gstate.current_idx < sheets.size() && count < STANDARD_VECTOR_SIZE) {
+		output.SetValue(0, count, Value(sheets[gstate.current_idx].first));
+		gstate.current_idx++;
+		count++;
+	}
+
+	output.SetCardinality(count);
+}
+
+static TableFunction GetListSheetsFunction() {
+	TableFunction list_sheets("excel_sheets", {LogicalType::VARCHAR}, ListSheetsExecute, ListSheetsBind);
+	list_sheets.init_global = ListSheetsInit;
+	return list_sheets;
+}
+
+void ReadXLSX::Register(DatabaseInstance &db) {
+	auto single_file_func = GetFunction();
+	ExtensionUtil::RegisterFunction(db, single_file_func);
+
+	TableFunction multi_file_func("read_xlsx", {LogicalType::LIST(LogicalType::VARCHAR)}, Execute, Bind);
+	multi_file_func.init_global = InitGlobal;
+	multi_file_func.table_scan_progress = Progress;
+	multi_file_func.named_parameters = single_file_func.named_parameters;
+	ExtensionUtil::RegisterFunction(db, multi_file_func);
+
+	ExtensionUtil::RegisterFunction(db, GetListSheetsFunction());
+
+	db.config.replacement_scans.emplace_back(XLSXReplacementScan);
+}
 } // namespace duckdb

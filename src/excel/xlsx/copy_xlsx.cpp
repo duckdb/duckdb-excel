@@ -1,7 +1,7 @@
 #include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/database.hpp"
-#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_util.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -421,16 +421,16 @@ static void ParseCopyFromOptions(XLSXReadData &data, const case_insensitive_map_
 	ReadXLSX::ParseOptions(data.options, named_parameters);
 }
 
-static unique_ptr<FunctionData> CopyFromBind(ClientContext &context, CopyFromFunctionBindInput &input, vector<string> &expected_names,
+static unique_ptr<FunctionData> CopyFromBind(ClientContext &context, CopyInfo &info, vector<string> &expected_names,
                                              vector<LogicalType> &expected_types) {
 
 	auto result = make_uniq<XLSXReadData>();
-	result->file_path = input.info.file_path; 
+	result->file_path = info.file_path;
 
 	// TODO: Parse options
-	ParseCopyFromOptions(*result, input.info.options);
+	ParseCopyFromOptions(*result, info.options);
 
-	ZipFileReader archive(context, input.info.file_path);
+	ZipFileReader archive(context, info.file_path);
 	ReadXLSX::ResolveSheet(result, archive);
 
 	// Column count mismatch!
@@ -470,7 +470,7 @@ static unique_ptr<FunctionData> CopyFromBind(ClientContext &context, CopyFromFun
 //------------------------------------------------------------------------------
 // Register
 //------------------------------------------------------------------------------
-void WriteXLSX::Register(ExtensionLoader &loader) {
+void WriteXLSX::Register(DatabaseInstance &db) {
 	CopyFunction info("xlsx");
 
 	info.copy_to_bind = Bind;
@@ -485,7 +485,7 @@ void WriteXLSX::Register(ExtensionLoader &loader) {
 	info.copy_from_function = ReadXLSX::GetFunction();
 
 	info.extension = "xlsx";
-	loader.RegisterFunction(info);
+	ExtensionUtil::RegisterFunction(db, info);
 }
 
 } // namespace duckdb
