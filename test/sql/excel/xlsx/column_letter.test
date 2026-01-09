@@ -1,0 +1,8 @@
+require excel
+
+query IIIIII
+DESCRIBE FROM read_xlsx('test/data/xlsx/columns_letter.xlsx', range='Z:AB', header=false, all_varchar=true);
+----
+Z	VARCHAR	YES	NULL	NULL	NULL
+AA	VARCHAR	YES	NULL	NULL	NULL
+AB	VARCHAR	YES	NULL	NULL	NULL

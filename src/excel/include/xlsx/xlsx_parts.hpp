@@ -86,11 +86,12 @@ inline string XLSXCellPos::ToString() const {
 inline string XLSXCellPos::GetColumnName() const {
 	D_ASSERT(col != 0);
 	string result;
-	idx_t col = this->col - 1;
-	do {
-		result = static_cast<char>('A' + col % 26) + result;
-		col /= 26;
-	} while (col > 0);
+	idx_t col = this->col;
+	while (col > 0) {
+		idx_t remainder = (col - 1) % 26;
+		result = static_cast<char>('A' + remainder) + result;
+		col = (col - 1) / 26;
+	}
 	return result;
 }
 

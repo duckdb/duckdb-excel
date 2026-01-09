@@ -35,6 +35,6 @@ DB
 
 # Lets also test some crazy ranges
 query I
-SELECT count(*) FROM read_xlsx('test/data/xlsx/sparse.xlsx', header = false, range = 'AA1:AB2000') WHERE BA IS NOT NULL;
+SELECT count(*) FROM read_xlsx('test/data/xlsx/sparse.xlsx', header = false, range = 'AA1:AB2000') WHERE AA IS NOT NULL;
 ----
 0
