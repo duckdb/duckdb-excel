@@ -239,6 +239,7 @@ inline void XLXSWriter::Finish() {
 	WriteWorkbook();
 	WriteRels();
 	WriteStyles();
+	WriteSharedStrings();
 	WriteDocProps();
 
 	// Done!
