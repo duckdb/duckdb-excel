@@ -225,7 +225,7 @@ void ZipFileWriter::AddDirectory(const string &dir_path) {
 	mz_zip_file file_info = {};
 	file_info.filename = dir_path.c_str();
 	file_info.compression_method = MZ_COMPRESS_METHOD_STORE;
-	file_info.zip64 = MZ_ZIP64_DISABLE; // not compatible with XLSX
+	file_info.zip64 = MZ_ZIP64_AUTO; // only use 64-bit when necessary
 
 	mz_zip_writer_add_buffer(handle, nullptr, 0, &file_info);
 }
@@ -237,7 +237,11 @@ void ZipFileWriter::BeginFile(const string &file_path) {
 	mz_zip_file file_info = {0};
 	file_info.filename = file_path.c_str();
 	file_info.compression_method = MZ_COMPRESS_METHOD_DEFLATE;
-	file_info.zip64 = MZ_ZIP64_DISABLE; // not compatible with XLSX
+	file_info.zip64 = MZ_ZIP64_AUTO; // only use 64-bit when necessary
+
+	file_info.uncompressed_size = 0;
+	file_info.compressed_size = 0;
+
 	if (mz_zip_writer_entry_open(handle, &file_info) != MZ_OK) {
 		throw IOException("Failed to open entry for writing");
 	}
