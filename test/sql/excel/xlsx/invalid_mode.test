@@ -1,0 +1,23 @@
+# name: test/sql/excel/xlsx/invalid_mode.test
+# group: [xlsx]
+
+require excel
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+# Invalid MODE value must error at bind time
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/invalid_mode.xlsx' (FORMAT 'XLSX', SHEET 'X', MODE 'bogus');
+----
+Invalid MODE
+
+# MODE 'append'/'replace' to a remote path must error before anything is written
+statement error
+COPY (SELECT 1) TO 's3://example-bucket/remote.xlsx' (FORMAT 'XLSX', SHEET 'X', MODE 'append');
+----
+only supported for local files
+
+statement error
+COPY (SELECT 1) TO 'https://example.com/remote.xlsx' (FORMAT 'XLSX', SHEET 'X', MODE 'replace');
+----
+only supported for local files

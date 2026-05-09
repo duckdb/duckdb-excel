@@ -1,0 +1,32 @@
+# name: test/sql/excel/xlsx/replace_basic.test
+# group: [xlsx]
+
+require excel
+
+require notwindows  # COPY framework MoveTmpFile races with Defender on consecutive same-path writes
+
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+# Create a file with sheets A and B
+statement ok
+COPY (SELECT 1 AS x) TO '__TEST_DIR__/replace_basic.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'A');
+
+statement ok
+COPY (SELECT 2 AS x) TO '__TEST_DIR__/replace_basic.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'B', MODE 'append');
+
+# Replace sheet A with new content
+statement ok
+COPY (SELECT 100 AS x) TO '__TEST_DIR__/replace_basic.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'A', MODE 'replace');
+
+# A should now contain 100
+query I
+SELECT * FROM read_xlsx('__TEST_DIR__/replace_basic.xlsx', sheet='A', header=true);
+----
+100
+
+# B should be untouched
+query I
+SELECT * FROM read_xlsx('__TEST_DIR__/replace_basic.xlsx', sheet='B', header=true);
+----
+2

@@ -508,8 +508,9 @@ inline void SheetParser::OnCell(const XLSXCellPos &pos, XLSXCellType type, vecto
 	// Get the column data
 	auto &vec = chunk.data[pos.col - range.beg.col];
 
-	// Push the cell data to our chunk
-	const auto ptr = FlatVector::GetData<string_t>(vec);
+	// const_cast is a no-op on v1.4.x and recovers mutability on v1.5+ where GetData<T> returns const T*.
+	const auto ptr =
+	    const_cast<string_t *>(FlatVector::GetData<string_t>(vec)); // NOLINT(cppcoreguidelines-pro-type-const-cast)
 
 	if (type == XLSXCellType::SHARED_STRING) {
 		// Push a null to the buffer so that the string is null-terminated

@@ -1,0 +1,24 @@
+# name: test/sql/excel/xlsx/append_to_nonexistent.test
+# group: [xlsx]
+
+require excel
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+# APPEND against a path that doesn't exist should fall back to fresh-create
+statement ok
+COPY (SELECT 42 AS x) TO '__TEST_DIR__/append_nonexistent.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'Only', MODE 'append');
+
+query I
+SELECT * FROM read_xlsx('__TEST_DIR__/append_nonexistent.xlsx', sheet='Only', header=true);
+----
+42
+
+# REPLACE against a path that doesn't exist should also fall back to fresh-create
+statement ok
+COPY (SELECT 99 AS x) TO '__TEST_DIR__/replace_nonexistent.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'Only', MODE 'replace');
+
+query I
+SELECT * FROM read_xlsx('__TEST_DIR__/replace_nonexistent.xlsx', sheet='Only', header=true);
+----
+99
