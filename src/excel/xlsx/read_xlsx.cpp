@@ -444,7 +444,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 
 	// Glob here so that we auto load any required extension filesystems
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto files = fs.GlobFiles(file_path, context, FileGlobOptions::ALLOW_EMPTY);
+	auto files = fs.GlobFiles(file_path, FileGlobOptions::ALLOW_EMPTY);
 	if (files.empty()) {
 		// Use our own error message to be less confusing
 		throw IOException("Cannot open file \"%s\": No such file or directory", file_path);
