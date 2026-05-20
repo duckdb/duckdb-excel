@@ -13,29 +13,6 @@
 
 namespace duckdb {
 
-// Forward declaration. Defined in DuckDB v1.5+ (`duckdb/function/scalar_function.hpp`).
-// In v1.4.x this remains an incomplete type, which is fine — the SFINAE adapter below
-// only references it when the v1.5+ BoundFunctionExpression constructor is selected.
-class BoundScalarFunction;
-
-namespace {
-// BoundFunctionExpression's constructor changed between v1.4.x and v1.5+:
-//   v1.4: BoundFunctionExpression(LogicalType, ScalarFunction, vector, FunctionData)
-//   v1.5: BoundFunctionExpression(BoundScalarFunction, vector, FunctionData)
-// SFINAE-dispatch picks whichever exists.
-template <typename SF>
-auto MakeBoundFunctionExpr(LogicalType, SF sfunc, vector<unique_ptr<Expression>> args, int)
-    -> decltype(make_uniq<BoundFunctionExpression>(BoundScalarFunction(std::declval<SF>()), std::move(args), nullptr)) {
-	return make_uniq<BoundFunctionExpression>(BoundScalarFunction(std::move(sfunc)), std::move(args), nullptr);
-}
-template <typename SF>
-auto MakeBoundFunctionExpr(LogicalType return_type, SF sfunc, vector<unique_ptr<Expression>> args, ...)
-    -> decltype(make_uniq<BoundFunctionExpression>(std::declval<LogicalType>(), std::declval<SF>(), std::move(args),
-                                                   nullptr)) {
-	return make_uniq<BoundFunctionExpression>(return_type, std::move(sfunc), std::move(args), nullptr);
-}
-} // namespace
-
 //------------------------------------------------------------------------------
 // Conversion Expressions
 //------------------------------------------------------------------------------
@@ -79,7 +56,7 @@ static unique_ptr<Expression> TimestampConversionExpr(unique_ptr<Expression> ref
 
 	ScalarFunction sfunc("timestamp_to_excel_number", {LogicalType::TIMESTAMP}, LogicalType::DOUBLE,
 	                     TimestampToExcelNumberFunction);
-	auto func = MakeBoundFunctionExpr(LogicalType::DOUBLE, sfunc, std::move(children), 0);
+	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
 	return std::move(func);
 }
 
@@ -88,7 +65,7 @@ static unique_ptr<Expression> TimeConversionExpr(unique_ptr<Expression> ref) {
 	children.push_back(std::move(ref));
 
 	ScalarFunction sfunc("time_to_excel_number", {LogicalType::TIME}, LogicalType::DOUBLE, TimeToExcelNumberFunction);
-	auto func = MakeBoundFunctionExpr(LogicalType::DOUBLE, sfunc, std::move(children), 0);
+	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
 	return std::move(func);
 }
 
@@ -97,7 +74,7 @@ static unique_ptr<Expression> DateConversionExpr(unique_ptr<Expression> ref) {
 	children.push_back(std::move(ref));
 
 	ScalarFunction sfunc("date_to_excel_number", {LogicalType::DATE}, LogicalType::DOUBLE, DateToExcelNumberFunction);
-	auto func = MakeBoundFunctionExpr(LogicalType::DOUBLE, sfunc, std::move(children), 0);
+	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
 	return std::move(func);
 }
 
