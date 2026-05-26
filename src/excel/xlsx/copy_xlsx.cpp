@@ -258,7 +258,14 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
 	const auto row_count = input.size();
 	const auto col_count = input.data.size();
 
-	// First, cast the input columns to the target columns
+	// First, cast the input columns to the target columns.
+	// Reset() before every Execute: cast_chunk is a single GlobalWriteXLSXData
+	// member reused for every Sink chunk, and ExpressionExecutor::Execute does not
+	// reset its result. Without this the cast result validity accumulates stale
+	// NULL bits chunk-to-chunk, so on wide, multi-chunk sheets scanned from an
+	// encoded source (e.g. parquet) populated cells are progressively emitted as
+	// NULL and silently dropped.
+	state.cast_chunk.Reset();
 	state.executor.Execute(input, state.cast_chunk);
 
 	// Then, setup unified formats for the cast columns
