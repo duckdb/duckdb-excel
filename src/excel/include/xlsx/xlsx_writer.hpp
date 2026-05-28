@@ -9,6 +9,10 @@ class XLXSWriter {
 public:
 	void BeginSheet(const string &sheet_name, const vector<string> &sql_column_names,
 	                const vector<LogicalType> &sql_column_types);
+	// Overload used by XLSXAppender: explicit sheet filename, skips directory creation
+	// (the appender stream-copies directory entries verbatim from the source archive).
+	void BeginSheet(const string &sheet_name, const string &sheet_filename,
+	                const vector<string> &sql_column_names, const vector<LogicalType> &sql_column_types);
 	void EndSheet();
 
 	explicit XLXSWriter(ClientContext &context, const string &file_name, idx_t sheet_row_limit_p)
@@ -27,6 +31,16 @@ public:
 	void EndRow();
 
 	void Finish();
+
+	// Override style indices for typed cells. Used by XLSXAppender after resolving
+	// styles against an existing styles.xml.
+	void SetStyleIndices(idx_t date, idx_t timestamp_no_ms, idx_t time_, idx_t timestamp_with_ms, idx_t boolean);
+
+	// Direct access to the underlying stream so XLSXAppender can stream-copy entries
+	// and emit its own metadata files.
+	ZipFileWriter &GetStream() {
+		return stream;
+	}
 
 private:
 	idx_t WriteEscapedXML(const char *str);
@@ -54,6 +68,13 @@ private:
 	ZipFileWriter stream;
 	idx_t sheet_row_limit = XLSX_MAX_CELL_ROWS;
 
+	// Style indices for typed cells. Defaults match this writer's own styles.xml.
+	idx_t style_idx_date = 1;
+	idx_t style_idx_ts_no_ms = 2;
+	idx_t style_idx_time = 3;
+	idx_t style_idx_ts_with_ms = 4;
+	idx_t style_idx_boolean = 5;
+
 	// Current sheet data;
 	string row_str = "1";
 	idx_t row_idx = 0;
@@ -77,11 +98,17 @@ inline void XLXSWriter::BeginSheet(const string &sheet_name, const vector<string
 		stream.AddDirectory("xl/");
 		stream.AddDirectory("xl/worksheets/");
 	}
+	BeginSheet(sheet_name, "sheet" + std::to_string(written_sheets.size() + 1) + ".xml", sql_column_names,
+	           sql_column_types);
+}
 
+inline void XLXSWriter::BeginSheet(const string &sheet_name, const string &sheet_filename,
+                                   const vector<string> &sql_column_names,
+                                   const vector<LogicalType> &sql_column_types) {
 	D_ASSERT(!has_active_sheet);
 	has_active_sheet = true;
 	active_sheet.sheet_name = EscapeXMLString(sheet_name);
-	active_sheet.sheet_file = "sheet" + std::to_string(written_sheets.size() + 1) + ".xml";
+	active_sheet.sheet_file = sheet_filename;
 	active_sheet.sql_column_names = sql_column_names;
 	active_sheet.sql_column_types = sql_column_types;
 
@@ -131,6 +158,15 @@ inline void XLXSWriter::BeginSheet(const string &sheet_name, const vector<string
 	stream.Write(WORKSHEET_XML_START);
 }
 
+inline void XLXSWriter::SetStyleIndices(idx_t date, idx_t timestamp_no_ms, idx_t time_, idx_t timestamp_with_ms,
+                                        idx_t boolean) {
+	style_idx_date = date;
+	style_idx_ts_no_ms = timestamp_no_ms;
+	style_idx_time = time_;
+	style_idx_ts_with_ms = timestamp_with_ms;
+	style_idx_boolean = boolean;
+}
+
 inline void XLXSWriter::EndSheet() {
 	D_ASSERT(has_active_sheet);
 	has_active_sheet = false;
@@ -156,7 +192,8 @@ inline void XLXSWriter::WriteNumberCell(const string_t &value) {
 }
 
 inline void XLXSWriter::WriteBooleanCell(const string_t &value) {
-	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" t=\"b\" s=\"5\"><v>");
+	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" t=\"b\" s=\"" +
+	             std::to_string(style_idx_boolean) + "\"><v>");
 	stream.Write(value.GetData(), value.GetSize());
 	stream.Write("</v></c>");
 
@@ -173,7 +210,8 @@ inline void XLXSWriter::WriteInlineStringCell(const string_t &value) {
 }
 
 inline void XLXSWriter::WriteDateCell(const string_t &value) {
-	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" s=\"1\"><v>");
+	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" s=\"" +
+	             std::to_string(style_idx_date) + "\"><v>");
 	stream.Write(value.GetData(), value.GetSize());
 	stream.Write("</v></c>");
 
@@ -181,7 +219,8 @@ inline void XLXSWriter::WriteDateCell(const string_t &value) {
 }
 
 inline void XLXSWriter::WriteTimeCell(const string_t &value) {
-	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" s=\"3\"><v>");
+	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" s=\"" +
+	             std::to_string(style_idx_time) + "\"><v>");
 	stream.Write(value.GetData(), value.GetSize());
 	stream.Write("</v></c>");
 
@@ -189,7 +228,8 @@ inline void XLXSWriter::WriteTimeCell(const string_t &value) {
 }
 
 inline void XLXSWriter::WriteTimestampCell(const string_t &value) {
-	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" s=\"4\"><v>");
+	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" s=\"" +
+	             std::to_string(style_idx_ts_with_ms) + "\"><v>");
 	stream.Write(value.GetData(), value.GetSize());
 	stream.Write("</v></c>");
 
@@ -197,7 +237,8 @@ inline void XLXSWriter::WriteTimestampCell(const string_t &value) {
 }
 
 inline void XLXSWriter::WriteTimestampCellNoMilliseconds(const string_t &value) {
-	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" s=\"2\"><v>");
+	stream.Write("<c r=\"" + active_sheet.sheet_column_names[col_idx] + row_str + "\" s=\"" +
+	             std::to_string(style_idx_ts_no_ms) + "\"><v>");
 	stream.Write(value.GetData(), value.GetSize());
 	stream.Write("</v></c>");
 

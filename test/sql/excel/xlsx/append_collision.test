@@ -1,0 +1,16 @@
+# name: test/sql/excel/xlsx/append_collision.test
+# group: [xlsx]
+
+require excel
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+# Create a file with sheet 'A'
+statement ok
+COPY (SELECT 1) TO '__TEST_DIR__/append_collision.xlsx' (FORMAT 'XLSX', SHEET 'A');
+
+# Appending another 'A' should error
+statement error
+COPY (SELECT 2) TO '__TEST_DIR__/append_collision.xlsx' (FORMAT 'XLSX', SHEET 'A', MODE 'append');
+----
+already exists

@@ -1,4 +1,6 @@
 #include "duckdb/common/exception/conversion_exception.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -6,6 +8,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "xlsx/read_xlsx.hpp"
+#include "xlsx/xlsx_appender.hpp"
 #include "xlsx/xlsx_writer.hpp"
 
 namespace duckdb {
@@ -86,6 +89,8 @@ struct WriteXLSXData final : TableFunctionData {
 	string sheet_name;
 	idx_t sheet_row_limit;
 	bool header;
+	bool append = false;
+	bool replace = false;
 };
 
 static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
@@ -144,6 +149,26 @@ static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
 	} else {
 		data->sheet_row_limit = XLSX_MAX_CELL_ROWS;
 	}
+
+	// MODE option: 'create' (default), 'append', or 'replace'
+	const auto mode_opt = options.find("mode");
+	if (mode_opt != options.end()) {
+		if (mode_opt->second.size() != 1 || mode_opt->second.back().IsNull() ||
+		    mode_opt->second.back().type() != LogicalType::VARCHAR) {
+			throw BinderException("MODE option must be a string ('create', 'append', or 'replace')");
+		}
+		const auto mode_str = StringUtil::Lower(StringValue::Get(mode_opt->second.back()));
+		if (mode_str == "create") {
+			data->append = false;
+			data->replace = false;
+		} else if (mode_str == "append") {
+			data->append = true;
+		} else if (mode_str == "replace") {
+			data->replace = true;
+		} else {
+			throw BinderException("Invalid MODE '%s' (expected 'create', 'append', or 'replace')", mode_str);
+		}
+	}
 }
 
 static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInput &input, const vector<string> &names,
@@ -165,13 +190,41 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInp
 //------------------------------------------------------------------------------
 struct GlobalWriteXLSXData final : public GlobalFunctionData {
 
-	XLXSWriter writer;
+	// Exactly one of these is set per COPY: fresh_writer for MODE 'create' or no MODE,
+	// appender for MODE 'append' / 'replace' against an existing file.
+	unique_ptr<XLXSWriter> fresh_writer;
+	unique_ptr<XLSXAppender> appender;
 	DataChunk cast_chunk;
 	ExpressionExecutor executor;
 	vector<unique_ptr<Expression>> conversion_expressions;
 
-	GlobalWriteXLSXData(ClientContext &context, const string &file_path, const WriteXLSXData &data)
-	    : writer(context, file_path, data.sheet_row_limit), executor(context) {
+	GlobalWriteXLSXData(ClientContext &context, const string &file_path, const WriteXLSXData &data) : executor(context) {
+
+		// MODE 'append'/'replace' reads the existing workbook and atomically swaps a rebuilt
+		// copy back into place via a sibling temp file + rename. Remote filesystems (s3://,
+		// https://, gcs://, azure://, ...) don't support that rename, so refuse up front
+		// rather than failing partway through after the original has been removed. Checked
+		// against the raw user path before ExpandPath so it fires even without httpfs loaded.
+		if ((data.append || data.replace) && FileSystem::IsRemoteFile(data.file_path)) {
+			throw NotImplementedException(
+			    "XLSX MODE '%s' is only supported for local files; '%s' is on a remote filesystem. "
+			    "Write the workbook to a local path and upload it instead.",
+			    data.replace ? "replace" : "append", data.file_path);
+		}
+
+		auto &fs = FileSystem::GetFileSystem(context);
+		// data.file_path is the user-typed path (may contain `~`); the framework hands us
+		// `file_path` as the temp it'll rename. Expand the user-typed path before checking.
+		const auto target_path = fs.ExpandPath(data.file_path);
+		const bool target_exists = fs.FileExists(target_path);
+		const bool use_appender = (data.append || data.replace) && target_exists;
+
+		if (use_appender) {
+			appender = make_uniq<XLSXAppender>(context, target_path, file_path, data.sheet_name, data.replace,
+			                                   data.sheet_row_limit);
+		} else {
+			fresh_writer = make_uniq<XLXSWriter>(context, file_path, data.sheet_row_limit);
+		}
 
 		// Initialize the expression executor
 		for (idx_t col_idx = 0; col_idx < data.column_types.size(); col_idx++) {
@@ -216,23 +269,104 @@ struct GlobalWriteXLSXData final : public GlobalFunctionData {
 	}
 };
 
+// Tiny dispatcher: GlobalWriteXLSXData holds either a fresh XLXSWriter or an XLSXAppender.
+// Sink/InitGlobal/Finalize forward through this so the hot loop doesn't repeat branches.
+namespace {
+struct WriteDispatch {
+	GlobalWriteXLSXData &state;
+	void BeginRow() {
+		if (state.appender) {
+			state.appender->BeginRow();
+		} else {
+			state.fresh_writer->BeginRow();
+		}
+	}
+	void EndRow() {
+		if (state.appender) {
+			state.appender->EndRow();
+		} else {
+			state.fresh_writer->EndRow();
+		}
+	}
+	void WriteEmptyCell() {
+		if (state.appender) {
+			state.appender->WriteEmptyCell();
+		} else {
+			state.fresh_writer->WriteEmptyCell();
+		}
+	}
+	void WriteBooleanCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteBooleanCell(v);
+		} else {
+			state.fresh_writer->WriteBooleanCell(v);
+		}
+	}
+	void WriteDateCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteDateCell(v);
+		} else {
+			state.fresh_writer->WriteDateCell(v);
+		}
+	}
+	void WriteTimeCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteTimeCell(v);
+		} else {
+			state.fresh_writer->WriteTimeCell(v);
+		}
+	}
+	void WriteTimestampCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteTimestampCell(v);
+		} else {
+			state.fresh_writer->WriteTimestampCell(v);
+		}
+	}
+	void WriteTimestampCellNoMilliseconds(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteTimestampCellNoMilliseconds(v);
+		} else {
+			state.fresh_writer->WriteTimestampCellNoMilliseconds(v);
+		}
+	}
+	void WriteNumberCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteNumberCell(v);
+		} else {
+			state.fresh_writer->WriteNumberCell(v);
+		}
+	}
+	void WriteInlineStringCell(const string_t &v) {
+		if (state.appender) {
+			state.appender->WriteInlineStringCell(v);
+		} else {
+			state.fresh_writer->WriteInlineStringCell(v);
+		}
+	}
+};
+} // namespace
+
 static unique_ptr<GlobalFunctionData> InitGlobal(ClientContext &context, FunctionData &bind_data,
                                                  const string &file_path) {
 	auto &data = bind_data.Cast<WriteXLSXData>();
 	auto gstate = make_uniq<GlobalWriteXLSXData>(context, file_path, data);
 
-	auto &writer = gstate->writer;
-
 	// Begin writing the worksheet
-	writer.BeginSheet(data.sheet_name, data.column_names, data.column_types);
+	if (gstate->appender) {
+		gstate->appender->BeginSheet(data.column_names, data.column_types);
+	} else {
+		gstate->fresh_writer->BeginSheet(data.sheet_name, data.column_names, data.column_types);
+	}
 
 	// Write the header
 	if (data.header) {
-		writer.BeginRow();
+		WriteDispatch sink {*gstate};
+		sink.BeginRow();
 		for (const auto &col_name : data.column_names) {
-			writer.WriteInlineStringCell(string_t(col_name));
+			sink.WriteInlineStringCell(string_t(col_name));
 		}
-		writer.EndRow();
+		sink.EndRow();
 	}
 	return std::move(gstate);
 }
@@ -253,7 +387,7 @@ static void Sink(ExecutionContext &context, FunctionData &bind_data, GlobalFunct
                  LocalFunctionData &lstate, DataChunk &input) {
 	auto &data = bind_data.Cast<WriteXLSXData>();
 	auto &state = gstate.Cast<GlobalWriteXLSXData>();
-	auto &writer = state.writer;
+	WriteDispatch writer {state};
 
 	const auto row_count = input.size();
 	const auto col_count = input.data.size();
@@ -349,9 +483,12 @@ static void Combine(ExecutionContext &context, FunctionData &bind_data, GlobalFu
 static void Finalize(ClientContext &context, FunctionData &bind_data, GlobalFunctionData &gstate) {
 	auto &state = gstate.Cast<GlobalWriteXLSXData>();
 
-	// Finish writing the worksheet
-	state.writer.EndSheet();
-	state.writer.Finish();
+	if (state.appender) {
+		state.appender->Finish();
+	} else {
+		state.fresh_writer->EndSheet();
+		state.fresh_writer->Finish();
+	}
 }
 
 //------------------------------------------------------------------------------

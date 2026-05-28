@@ -1,0 +1,28 @@
+# name: test/sql/excel/xlsx/append_basic.test
+# group: [xlsx]
+
+require excel
+
+require notwindows  # COPY framework MoveTmpFile races with Defender on consecutive same-path writes
+
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+# Create a fresh xlsx with sheet 'A'
+statement ok
+COPY (SELECT 1 AS x, 'hello' AS y) TO '__TEST_DIR__/append_basic.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'A');
+
+# Append a second sheet 'B' to the same file
+statement ok
+COPY (SELECT 2 AS x, 'world' AS y) TO '__TEST_DIR__/append_basic.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'B', MODE 'append');
+
+# Both sheets should resolve and contain the right data
+query IT
+SELECT * FROM read_xlsx('__TEST_DIR__/append_basic.xlsx', sheet='A', header=true);
+----
+1	hello
+
+query IT
+SELECT * FROM read_xlsx('__TEST_DIR__/append_basic.xlsx', sheet='B', header=true);
+----
+2	world

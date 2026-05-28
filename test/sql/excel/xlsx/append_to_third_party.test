@@ -1,0 +1,39 @@
+# name: test/sql/excel/xlsx/append_to_third_party.test
+# group: [xlsx]
+
+require excel
+
+require notwindows  # COPY framework MoveTmpFile races with Defender on consecutive same-path writes
+
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+# Build a multi-sheet workbook using fresh-create + append, then append again.
+# This proves an already-appended file remains appendable. Compatibility with
+# externally-authored xlsx files (Excel/openpyxl/etc.) was verified manually
+# against test/data/xlsx/two_sheets.xlsx.
+
+statement ok
+COPY (SELECT 42 AS a, 1337 AS b) TO '__TEST_DIR__/seeded_multi.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'Sheet1');
+
+statement ok
+COPY (SELECT 'foo' AS X, 'bar' AS Y) TO '__TEST_DIR__/seeded_multi.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'My Sheet', MODE 'append');
+
+statement ok
+COPY (SELECT 7 AS n, 'hi' AS s) TO '__TEST_DIR__/seeded_multi.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'Appended', MODE 'append');
+
+# All three sheets must round-trip
+query II
+SELECT * FROM read_xlsx('__TEST_DIR__/seeded_multi.xlsx', sheet='Sheet1', header=true);
+----
+42	1337
+
+query TT
+SELECT X, Y FROM read_xlsx('__TEST_DIR__/seeded_multi.xlsx', sheet='My Sheet', header=true);
+----
+foo	bar
+
+query IT
+SELECT * FROM read_xlsx('__TEST_DIR__/seeded_multi.xlsx', sheet='Appended', header=true);
+----
+7	hi

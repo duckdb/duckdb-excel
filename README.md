@@ -74,6 +74,7 @@ __Options__:
 | `header` | `BOOLEAN` | `false`   | Whether to write the column names as the first row in the sheet                      |
 | `sheet`| `VARCHAR` | `Sheet1`  | The name of the sheet in the xlsx file to write.                                     |
 | `sheet_row_limit` | `INTEGER` | `1048576` | The maximum number of rows in a sheet. An error is thrown if this limit is exceeded. |
+| `mode` | `VARCHAR` | `create` | How to handle the target file. `create` writes a fresh single-sheet xlsx (overwriting any existing file). `append` adds a new sheet to an existing xlsx (errors if a sheet with the same name already exists). `replace` overwrites a single sheet by name in an existing xlsx (errors if no sheet with that name is found). |
 
 __Example usage__:
 
@@ -81,6 +82,26 @@ __Example usage__:
 CREATE TABLE test AS SELECT * FROM (VALUES (1, 2), (3, 4)) AS t(a, b);
 COPY test TO 'test.xlsx' (format 'xlsx', header 'true');
 ```
+
+### Writing multiple sheets to one xlsx
+
+Successive `COPY` statements with `mode 'append'` add new sheets to the same workbook. The first call creates the file; subsequent calls add sheets. `mode 'replace'` overwrites a single named sheet, leaving every other sheet untouched.
+
+```sql
+COPY (SELECT 1 AS x, 'one'   AS y) TO 'multi.xlsx' (format 'xlsx', header true, sheet 'A');
+COPY (SELECT 2 AS x, 'two'   AS y) TO 'multi.xlsx' (format 'xlsx', header true, sheet 'B', mode 'append');
+COPY (SELECT 3 AS x, 'three' AS y) TO 'multi.xlsx' (format 'xlsx', header true, sheet 'C', mode 'append');
+
+-- Replace sheet B in place — sheets A and C are unchanged
+COPY (SELECT 999 AS x, 'replaced' AS y) TO 'multi.xlsx' (format 'xlsx', header true, sheet 'B', mode 'replace');
+```
+
+Notes:
+- `mode 'append'` against a path that doesn't exist yet falls back to `create`, so the first call in a multi-`COPY` sequence works the same way regardless of whether you pass `mode 'append'` or omit it.
+- `mode 'replace'` keeps the existing sheet's position, internal id, and file path stable, so external references in the workbook (charts, defined names, pivot caches) remain valid after the rewrite.
+- Appending into an xlsx authored by Excel, openpyxl, or another tool is supported: the existing workbook structure, styles, shared strings, and all unrelated sheets are preserved verbatim.
+- Use `mode 'append'` for adding sheets, `mode 'replace'` for overwriting one. Setting an invalid `mode` value raises an error at bind time.
+- `mode 'append'` and `mode 'replace'` only work for **local files**. They need to read the existing workbook and atomically swap a rebuilt copy back into place, which remote filesystems (`s3://`, `https://`, `gcs://`, `azure://`, …) don't support; using either against a remote path raises an error before the destination is touched. Write the workbook to a local path and upload it instead. (`mode 'create'` — the default — works with remote paths as usual, since it just writes a fresh file.)
 
 ## Type Conversions and Inference
 

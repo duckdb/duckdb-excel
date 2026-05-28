@@ -122,8 +122,9 @@ int32_t mz_stream_duckdb_seek(void *stream, int64_t offset, int32_t origin) {
 		self.handle->Seek(self.handle->SeekPosition() + offset);
 		break;
 	case MZ_SEEK_END:
-		// is the offset negative when seeking from the end?
-		self.handle->Seek(self.handle->SeekPosition() + offset);
+		// Seek relative to file end. Required for minizip to locate the central directory
+		// (e.g. when iterating entries via mz_zip_reader_goto_first_entry).
+		self.handle->Seek(self.handle->GetFileSize() + offset);
 		break;
 	default:
 		return MZ_SEEK_ERROR;
@@ -279,6 +280,15 @@ void ZipFileWriter::Finalize() {
 	}
 }
 
+void ZipFileWriter::CopyCurrentEntryFrom(ZipFileReader &source) {
+	if (is_entry_open) {
+		throw IOException("ZipWriter: Cannot copy an entry while another is open on the writer");
+	}
+	if (mz_zip_writer_copy_from_reader(handle, source.handle) != MZ_OK) {
+		throw IOException("ZipWriter: Failed to copy entry from source");
+	}
+}
+
 //-------------------------------------------------------------------------
 // Zip File Reader
 //-------------------------------------------------------------------------
@@ -314,8 +324,32 @@ ZipFileReader::ZipFileReader(ClientContext &context, const string &file_name) {
 }
 
 bool ZipFileReader::TryOpenEntry(const string &file_name) {
-	if (mz_zip_reader_locate_entry(handle, file_name.c_str(), 0) != MZ_OK) {
+	// Some xlsx producers emit duplicate entry names; per OOXML the last occurrence wins.
+	// Walk all entries and select the last one whose filename matches.
+	int32_t target_index = -1;
+	int32_t current = 0;
+	auto status = mz_zip_reader_goto_first_entry(handle);
+	while (status == MZ_OK) {
+		mz_zip_file *info = nullptr;
+		if (mz_zip_reader_entry_get_info(handle, &info) == MZ_OK && info != nullptr && info->filename != nullptr) {
+			if (file_name == info->filename) {
+				target_index = current;
+			}
+		}
+		current++;
+		status = mz_zip_reader_goto_next_entry(handle);
+	}
+	if (target_index < 0) {
 		return false;
+	}
+
+	if (mz_zip_reader_goto_first_entry(handle) != MZ_OK) {
+		return false;
+	}
+	for (int32_t i = 0; i < target_index; i++) {
+		if (mz_zip_reader_goto_next_entry(handle) != MZ_OK) {
+			return false;
+		}
 	}
 
 	if (mz_zip_reader_entry_open(handle) != MZ_OK) {
@@ -372,6 +406,62 @@ idx_t ZipFileReader::GetEntryLen() const {
 
 bool ZipFileReader::IsDone() const {
 	return entry_pos >= entry_len;
+}
+
+vector<string> ZipFileReader::ListEntries() {
+	if (is_entry_open) {
+		throw IOException("ZipReader: Cannot list entries while an entry is open");
+	}
+	vector<string> entries;
+	auto status = mz_zip_reader_goto_first_entry(handle);
+	while (status == MZ_OK) {
+		mz_zip_file *info = nullptr;
+		if (mz_zip_reader_entry_get_info(handle, &info) != MZ_OK || info == nullptr) {
+			throw IOException("ZipReader: Failed to read entry info while listing entries");
+		}
+		entries.emplace_back(info->filename);
+		status = mz_zip_reader_goto_next_entry(handle);
+	}
+	if (status != MZ_END_OF_LIST && status != MZ_OK) {
+		throw IOException("ZipReader: Failed to enumerate entries");
+	}
+	return entries;
+}
+
+bool ZipFileReader::EntryIsDirectory(const string &entry_name) {
+	if (is_entry_open) {
+		throw IOException("ZipReader: Cannot inspect entries while another is open");
+	}
+	if (mz_zip_reader_locate_entry(handle, entry_name.c_str(), 0) != MZ_OK) {
+		return false;
+	}
+	return mz_zip_entry_is_dir(handle) == MZ_OK;
+}
+
+bool ZipFileReader::GotoFirstEntry() {
+	if (is_entry_open) {
+		throw IOException("ZipReader: Cannot walk entries while another is open");
+	}
+	return mz_zip_reader_goto_first_entry(handle) == MZ_OK;
+}
+
+bool ZipFileReader::GotoNextEntry() {
+	if (is_entry_open) {
+		throw IOException("ZipReader: Cannot walk entries while another is open");
+	}
+	return mz_zip_reader_goto_next_entry(handle) == MZ_OK;
+}
+
+string ZipFileReader::CurrentEntryName() {
+	mz_zip_file *info = nullptr;
+	if (mz_zip_reader_entry_get_info(handle, &info) != MZ_OK || info == nullptr || info->filename == nullptr) {
+		return string();
+	}
+	return string(info->filename);
+}
+
+bool ZipFileReader::CurrentEntryIsDirectory() {
+	return mz_zip_entry_is_dir(handle) == MZ_OK;
 }
 
 ZipFileReader::~ZipFileReader() {
