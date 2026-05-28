@@ -1,0 +1,76 @@
+# name: test/sql/excel/xlsx/copy_to_cast_validity_reset.test
+# description: COPY ... TO xlsx must not drop populated cells on wide multi-chunk sheets
+# group: [xlsx]
+
+# Regression test. The COPY-to-xlsx Sink reused a single cast_chunk for every
+# input chunk and passed it to ExpressionExecutor::Execute, which does not reset
+# its result. The cast result validity therefore accumulated stale NULL bits
+# from chunk to chunk, so on wide, multi-chunk sheets scanned from an encoded
+# source (e.g. parquet) populated cells were progressively emitted as NULL and
+# silently dropped. Before the fix the last column below dropped from 1600
+# populated cells to a few dozen.
+
+require excel
+
+require parquet
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+# Wide (40 column), sparse, multi-chunk source. Round-trip through parquet so the
+# xlsx COPY scans encoded vectors -- the condition that surfaced the bug.
+statement ok
+COPY (
+    SELECT
+        CASE WHEN 0 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c0,
+        CASE WHEN 1 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c1,
+        CASE WHEN 2 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c2,
+        CASE WHEN 3 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c3,
+        CASE WHEN 4 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c4,
+        CASE WHEN 5 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c5,
+        CASE WHEN 6 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c6,
+        CASE WHEN 7 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c7,
+        CASE WHEN 8 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c8,
+        CASE WHEN 9 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c9,
+        CASE WHEN 10 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c10,
+        CASE WHEN 11 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c11,
+        CASE WHEN 12 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c12,
+        CASE WHEN 13 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c13,
+        CASE WHEN 14 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c14,
+        CASE WHEN 15 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c15,
+        CASE WHEN 16 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c16,
+        CASE WHEN 17 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c17,
+        CASE WHEN 18 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c18,
+        CASE WHEN 19 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c19,
+        CASE WHEN 20 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c20,
+        CASE WHEN 21 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c21,
+        CASE WHEN 22 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c22,
+        CASE WHEN 23 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c23,
+        CASE WHEN 24 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c24,
+        CASE WHEN 25 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c25,
+        CASE WHEN 26 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c26,
+        CASE WHEN 27 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c27,
+        CASE WHEN 28 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c28,
+        CASE WHEN 29 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c29,
+        CASE WHEN 30 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c30,
+        CASE WHEN 31 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c31,
+        CASE WHEN 32 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c32,
+        CASE WHEN 33 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c33,
+        CASE WHEN 34 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c34,
+        CASE WHEN 35 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c35,
+        CASE WHEN 36 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c36,
+        CASE WHEN 37 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c37,
+        CASE WHEN 38 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c38,
+        CASE WHEN 39 <= (i % 40) THEN ((i % 97) + 0.5)::DOUBLE ELSE NULL END AS c39
+    FROM range(64000) t(i)
+) TO '__TEST_DIR__/wide_validity.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT * FROM read_parquet('__TEST_DIR__/wide_validity.parquet'))
+TO '__TEST_DIR__/wide_validity.xlsx' (FORMAT 'XLSX', header true);
+
+# Every populated cell in the last column must survive the write (diff = 0).
+query I
+SELECT (SELECT count(c39) FROM read_parquet('__TEST_DIR__/wide_validity.parquet'))
+     - (SELECT count(c39) FROM read_xlsx('__TEST_DIR__/wide_validity.xlsx', all_varchar=true));
+----
+0
