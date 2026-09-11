@@ -10,6 +10,7 @@
 #include "xlsx/read_xlsx.hpp"
 #include "xlsx/xlsx_appender.hpp"
 #include "xlsx/xlsx_writer.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 
 namespace duckdb {
 
@@ -35,7 +36,7 @@ static void TimeToExcelNumberFunction(DataChunk &args, ExpressionState &state, V
 	const auto count = args.size();
 	UnaryExecutor::Execute<dtime_t, double>(args.data[0], result, count, [&](dtime_t time) {
 		// 1.0 is a full day;
-		return static_cast<double>(time.micros) / Interval::MICROS_PER_DAY;
+		return static_cast<double>(time.value) / Interval::MICROS_PER_DAY;
 	});
 }
 
@@ -50,32 +51,29 @@ static void DateToExcelNumberFunction(DataChunk &args, ExpressionState &state, V
 	});
 }
 
-static unique_ptr<Expression> TimestampConversionExpr(unique_ptr<Expression> ref) {
+static unique_ptr<Expression> TimestampConversionExpr(ClientContext &context, unique_ptr<Expression> ref) {
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(ref));
 
 	ScalarFunction sfunc("timestamp_to_excel_number", {LogicalType::TIMESTAMP}, LogicalType::DOUBLE,
 	                     TimestampToExcelNumberFunction);
-	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
-	return std::move(func);
+	return sfunc.Bind(context, std::move(children));
 }
 
-static unique_ptr<Expression> TimeConversionExpr(unique_ptr<Expression> ref) {
+static unique_ptr<Expression> TimeConversionExpr(ClientContext &context, unique_ptr<Expression> ref) {
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(ref));
 
 	ScalarFunction sfunc("time_to_excel_number", {LogicalType::TIME}, LogicalType::DOUBLE, TimeToExcelNumberFunction);
-	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
-	return std::move(func);
+	return sfunc.Bind(context, std::move(children));
 }
 
-static unique_ptr<Expression> DateConversionExpr(unique_ptr<Expression> ref) {
+static unique_ptr<Expression> DateConversionExpr(ClientContext &context, unique_ptr<Expression> ref) {
 	vector<unique_ptr<Expression>> children;
 	children.push_back(std::move(ref));
 
 	ScalarFunction sfunc("date_to_excel_number", {LogicalType::DATE}, LogicalType::DOUBLE, DateToExcelNumberFunction);
-	auto func = make_uniq<BoundFunctionExpression>(LogicalType::DOUBLE, sfunc, std::move(children), nullptr);
-	return std::move(func);
+	return sfunc.Bind(context, std::move(children));
 }
 
 //------------------------------------------------------------------------------
@@ -94,7 +92,7 @@ struct WriteXLSXData final : TableFunctionData {
 };
 
 static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
-                               const case_insensitive_map_t<vector<Value>> &options) {
+                               const identifier_map_t<vector<Value>> &options) {
 	// Find the header options
 	const auto header_opt = options.find("header");
 	if (header_opt != options.end()) {
@@ -102,14 +100,14 @@ static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
 			throw BinderException("Header option must be a single boolean value");
 		}
 		string error_msg;
-		Value bool_val;
-		if (!header_opt->second.back().DefaultTryCastAs(LogicalType::BOOLEAN, bool_val, &error_msg)) {
+		auto bool_val = header_opt->second.back().DefaultTryCastAs(LogicalType::BOOLEAN, &error_msg);
+		if (!bool_val) {
 			throw BinderException("Header option must be a single boolean value");
 		}
-		if (bool_val.IsNull()) {
+		if (bool_val->IsNull()) {
 			throw BinderException("Header option must be a single boolean value");
 		}
-		data->header = BooleanValue::Get(bool_val);
+		data->header = BooleanValue::Get(*bool_val);
 	} else {
 		data->header = false;
 	}
@@ -138,14 +136,14 @@ static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
 			throw BinderException("Sheet row limit option must be a single integer value");
 		}
 		string error_msg;
-		Value int_val;
-		if (!sheet_row_limit_opt->second.back().DefaultTryCastAs(LogicalType::INTEGER, int_val, &error_msg)) {
+		auto int_val = sheet_row_limit_opt->second.back().DefaultTryCastAs(LogicalType::INTEGER, &error_msg);
+		if (!int_val) {
 			throw BinderException("Sheet row limit option must be a single integer value");
 		}
-		if (int_val.IsNull()) {
+		if (int_val->IsNull()) {
 			throw BinderException("Sheet row limit option must be a single integer value");
 		}
-		data->sheet_row_limit = IntegerValue::Get(int_val);
+		data->sheet_row_limit = IntegerValue::Get(*int_val);
 	} else {
 		data->sheet_row_limit = XLSX_MAX_CELL_ROWS;
 	}
@@ -171,7 +169,7 @@ static void ParseCopyToOptions(const unique_ptr<WriteXLSXData> &data,
 	}
 }
 
-static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInput &input, const vector<string> &names,
+static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInput &input, const vector<Identifier> &names,
                                      const vector<LogicalType> &sql_types) {
 	auto data = make_uniq<WriteXLSXData>();
 
@@ -179,7 +177,7 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInp
 	ParseCopyToOptions(data, input.info.options);
 
 	data->column_types = sql_types;
-	data->column_names = names;
+	data->column_names = IdentifiersToStrings(names);
 	data->file_path = input.info.file_path;
 
 	return std::move(data);
@@ -238,15 +236,15 @@ struct GlobalWriteXLSXData final : public GlobalFunctionData {
 			case LogicalTypeId::TIMESTAMP_NS:
 				expr = BoundCastExpression::AddCastToType(context, std::move(expr), LogicalType::TIMESTAMP);
 			case LogicalTypeId::TIMESTAMP: // Fall through
-				expr = TimestampConversionExpr(std::move(expr));
+				expr = TimestampConversionExpr(context, std::move(expr));
 				break;
 			case LogicalTypeId::TIME_TZ:
 				expr = BoundCastExpression::AddCastToType(context, std::move(expr), LogicalType::TIME);
 			case LogicalTypeId::TIME: // Fall through
-				expr = TimeConversionExpr(std::move(expr));
+				expr = TimeConversionExpr(context, std::move(expr));
 				break;
 			case LogicalTypeId::DATE:
-				expr = DateConversionExpr(std::move(expr));
+				expr = DateConversionExpr(context, std::move(expr));
 				break;
 			case LogicalTypeId::BOOLEAN:
 				// Convert booleans to numbers first, then number to varchar
@@ -502,7 +500,7 @@ CopyFunctionExecutionMode ExecutionMode(bool preserve_insertion_order, bool supp
 //------------------------------------------------------------------------------
 // Copy From
 //------------------------------------------------------------------------------
-static void SetBooleanValue(named_parameter_map_t &params, const string &key, const vector<Value> &val) {
+static void SetBooleanValue(named_parameter_map_t &params, const Identifier &key, const vector<Value> &val) {
 	static constexpr auto error_msg = "'%s' option must be standalone or a BOOLEAN value";
 	if (val.size() > 1) {
 		throw BinderException(error_msg, key);
@@ -522,7 +520,7 @@ static void SetBooleanValue(named_parameter_map_t &params, const string &key, co
 	}
 }
 
-static void SetVarcharValue(named_parameter_map_t &params, const string &key, const vector<Value> &val) {
+static void SetVarcharValue(named_parameter_map_t &params, const Identifier &key, const vector<Value> &val) {
 	static constexpr auto error_msg = "'%s' option must be a single VARCHAR value";
 	if (val.size() != 1) {
 		throw BinderException(error_msg, key);
@@ -536,13 +534,13 @@ static void SetVarcharValue(named_parameter_map_t &params, const string &key, co
 	params[key] = val.back();
 }
 
-static void ParseCopyFromOptions(XLSXReadData &data, const case_insensitive_map_t<vector<Value>> &options) {
+static void ParseCopyFromOptions(XLSXReadData &data, const identifier_map_t<vector<Value>> &options) {
 
 	// Just make it really easy for us, extract everything into a named parameter map
 	named_parameter_map_t named_parameters;
 
 	for (auto &kv : options) {
-		auto key = StringUtil::Lower(kv.first);
+		auto &key = kv.first;
 		auto &val = kv.second;
 		if (key == "sheet") {
 			SetVarcharValue(named_parameters, key, val);
@@ -565,7 +563,7 @@ static void ParseCopyFromOptions(XLSXReadData &data, const case_insensitive_map_
 	ReadXLSX::ParseOptions(data.options, named_parameters);
 }
 
-static unique_ptr<FunctionData> CopyFromBind(ClientContext &context, CopyFromFunctionBindInput &input, vector<string> &expected_names,
+static unique_ptr<FunctionData> CopyFromBind(ClientContext &context, CopyFromFunctionBindInput &input, vector<Identifier> &expected_names,
                                              vector<LogicalType> &expected_types) {
 
 	auto result = make_uniq<XLSXReadData>();
@@ -584,14 +582,14 @@ static unique_ptr<FunctionData> CopyFromBind(ClientContext &context, CopyFromFun
 			if (col_idx > 0) {
 				extended_error += ", ";
 			}
-			extended_error += expected_names[col_idx] + " " + expected_types[col_idx].ToString();
+			extended_error += expected_names[col_idx].GetIdentifierName() + " " + expected_types[col_idx].ToString();
 		}
 		extended_error += "\nXLSX schema: ";
 		for (idx_t col_idx = 0; col_idx < result->return_types.size(); col_idx++) {
 			if (col_idx > 0) {
 				extended_error += ", ";
 			}
-			extended_error += result->column_names[col_idx] + " " + result->return_types[col_idx].ToString();
+			extended_error += result->column_names[col_idx].GetIdentifierName() + " " + result->return_types[col_idx].ToString();
 		}
 		extended_error += "\n\nPossible solutions:";
 		extended_error += "\n* Manually specify which columns to insert using \"INSERT INTO tbl SELECT ... "
