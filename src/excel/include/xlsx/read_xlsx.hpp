@@ -34,7 +34,7 @@ public:
 
 	vector<LogicalType> return_types;
 	vector<XLSXCellType> source_types;
-	vector<string> column_names;
+	vector<Identifier> column_names;
 
 	XLSXReadOptions options;
 	XLSXStyleSheet style_sheet;

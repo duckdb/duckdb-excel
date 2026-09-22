@@ -111,14 +111,11 @@ static string NormalizeColumnName(const string &col_name) {
 	return col_name_cleaned;
 }
 
-static void CleanColumnNames(vector<string> &names, bool normalize) {
+static void CleanColumnNames(vector<Identifier> &names, bool normalize) {
 	for (auto &name : names) {
 		// normalize names or at least trim whitespace
-		if (normalize) {
-			name = NormalizeColumnName(name);
-		} else {
-			name = TrimWhitespace(name);
-		}
+		auto &raw_name = name.GetIdentifierName();
+		name = Identifier(normalize ? NormalizeColumnName(raw_name) : TrimWhitespace(raw_name));
 	}
 }
 
@@ -409,7 +406,7 @@ static void SniffHeader(const unique_ptr<XLSXReadData> &result, ZipFileReader &a
 
 	// Set the return names
 	for (auto &cell : header_cells) {
-		result->column_names.push_back(cell.data);
+		result->column_names.emplace_back(cell.data);
 	}
 
 	// Convert excel types to duckdb types
@@ -437,7 +434,7 @@ void ReadXLSX::ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReade
 // Bind
 //-------------------------------------------------------------------
 static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input,
-                                     vector<LogicalType> &return_types, vector<string> &names) {
+                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<XLSXReadData>();
 	// Get the file name
 	const auto file_path = StringValue::Get(input.inputs[0]);
@@ -463,9 +460,9 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindIn
 	ReadXLSX::ResolveSheet(result, archive);
 
 	return_types = result->return_types;
-	names = result->column_names;
 
 	// Clean and normalize names if requested
+	names = result->column_names;
 	CleanColumnNames(names, result->options.normalize_names);
 
 	// Deduplicate column names
@@ -691,6 +688,7 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 		if (source_type == target_type) {
 			// If the types are the same, reference the column
 			target_col.Reference(source_col);
+			FlatVector::SetSize(target_col, count_t(row_count));
 			continue;
 		}
 
@@ -707,8 +705,8 @@ static void Execute(ClientContext &context, TableFunctionInput &data, DataChunk 
 			// Cast the from string to the target type
 			TryCastFromString(gstate, options.ignore_errors, col_idx, context, target_col);
 		}
+		FlatVector::SetSize(target_col, count_t(row_count));
 	}
-	output.SetCapacity(row_count);
 	output.SetCardinality(row_count);
 
 	output.Verify();
@@ -741,7 +739,7 @@ static unique_ptr<TableRef> XLSXReplacementScan(ClientContext &context, Replacem
 
 	auto result = make_uniq<TableFunctionRef>();
 	vector<unique_ptr<ParsedExpression>> children;
-	children.push_back(make_uniq<ConstantExpression>(Value(table_name)));
+	children.push_back(ConstantExpression::FromValue(Value(table_name)));
 	result->function = make_uniq_base<ParsedExpression, FunctionExpression>("read_xlsx", std::move(children));
 
 	return std::move(result);

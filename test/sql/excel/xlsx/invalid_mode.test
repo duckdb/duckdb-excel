@@ -3,6 +3,11 @@
 
 require excel
 
+require httpfs
+
+statement ok
+LOAD httpfs;
+
 require no_extension_autoloading "FIXME: make copy to functions autoloadable"
 
 # Invalid MODE value must error at bind time

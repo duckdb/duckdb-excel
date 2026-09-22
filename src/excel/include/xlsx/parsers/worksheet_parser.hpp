@@ -509,7 +509,7 @@ inline void SheetParser::OnCell(const XLSXCellPos &pos, XLSXCellType type, vecto
 	auto &vec = chunk.data[pos.col - range.beg.col];
 
 	// Push the cell data to our chunk
-	const auto ptr = FlatVector::GetData<string_t>(vec);
+	auto ptr = FlatVector::GetDataMutable<string_t>(vec);
 
 	if (type == XLSXCellType::SHARED_STRING) {
 		// Push a null to the buffer so that the string is null-terminated
