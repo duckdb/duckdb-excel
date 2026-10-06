@@ -500,7 +500,7 @@ CopyFunctionExecutionMode ExecutionMode(bool preserve_insertion_order, bool supp
 //------------------------------------------------------------------------------
 // Copy From
 //------------------------------------------------------------------------------
-static void SetBooleanValue(named_parameter_map_t &params, const Identifier &key, const vector<Value> &val) {
+static void SetBooleanValue(named_argument_map_t &params, const Identifier &key, const vector<Value> &val) {
 	static constexpr auto error_msg = "'%s' option must be standalone or a BOOLEAN value";
 	if (val.size() > 1) {
 		throw BinderException(error_msg, key);
@@ -520,7 +520,7 @@ static void SetBooleanValue(named_parameter_map_t &params, const Identifier &key
 	}
 }
 
-static void SetVarcharValue(named_parameter_map_t &params, const Identifier &key, const vector<Value> &val) {
+static void SetVarcharValue(named_argument_map_t &params, const Identifier &key, const vector<Value> &val) {
 	static constexpr auto error_msg = "'%s' option must be a single VARCHAR value";
 	if (val.size() != 1) {
 		throw BinderException(error_msg, key);
@@ -537,7 +537,7 @@ static void SetVarcharValue(named_parameter_map_t &params, const Identifier &key
 static void ParseCopyFromOptions(XLSXReadData &data, const identifier_map_t<vector<Value>> &options) {
 
 	// Just make it really easy for us, extract everything into a named parameter map
-	named_parameter_map_t named_parameters;
+	named_argument_map_t named_parameters;
 
 	for (auto &kv : options) {
 		auto &key = kv.first;
