@@ -1,0 +1,46 @@
+# name: test/sql/excel/test_excel_numformat_currency_text.test
+# description: A currency symbol without digit placeholders is literal text, like any other symbol
+# group: [excel]
+
+require excel
+
+query I
+SELECT text(1234.567, '$');
+----
+$
+
+query I
+SELECT text(1234.567, '€');
+----
+€
+
+query I
+SELECT text(1234.567, '"$"');
+----
+$
+
+query I
+SELECT text(1234.567, '$-');
+----
+$-
+
+# digit placeholders still make it a currency format
+query I
+SELECT text(1234.567, '$#');
+----
+$1235
+
+query I
+SELECT text(1234.567, '$#,##0.00');
+----
+$1,234.57
+
+query I
+SELECT text(-1234.567, '$#,##0.00');
+----
+-$1,234.57
+
+query I
+SELECT text(1234.567, '$0,00');
+----
+$1,235
