@@ -2926,6 +2926,8 @@ bool ImpSvNumberformatScan::InsertSymbol(sal_uInt16 &nPos, NfSymbolType eType, c
 	if (nPos > 0 && nTypeArray[nPos - 1] == NF_SYMBOLTYPE_EMPTY)
 		--nPos; // reuse position
 	else {
+		if (static_cast<size_t>(nAnzStrings) + 1 >= NF_MAX_FORMAT_SYMBOLS)
+			return false;
 		++nAnzStrings;
 		for (size_t i = nAnzStrings; i > nPos; --i) {
 			nTypeArray[i] = nTypeArray[i - 1];
