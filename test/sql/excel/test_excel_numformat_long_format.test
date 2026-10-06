@@ -1,0 +1,28 @@
+# name: test/sql/excel/test_excel_numformat_long_format.test
+# description: Number formats that exceed the format scanner's symbol limit must fail cleanly
+# group: [excel]
+
+require excel
+
+# inserting grouping separators used to write past the end of the symbol array
+query I
+SELECT text(1234567.897, '$#,##0' || repeat('9', 70));
+----
+(empty)
+
+# 70 extra digits plus their separators fit exactly within the symbol limit
+query I
+SELECT text(1234567.897, '#,##0' || repeat('0', 70));
+----
+00,000,000,000,000,000,000,000,000,000,000,000,000,000,000,000,000,000,000,000,000,001,234,568
+
+# one more digit exceeds the limit
+query I
+SELECT text(1234567.897, '#,##0' || repeat('0', 71));
+----
+(empty)
+
+query I
+SELECT text(1234567.897, '#,##0' || repeat('0', 500));
+----
+(empty)
