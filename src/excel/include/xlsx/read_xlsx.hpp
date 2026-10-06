@@ -44,7 +44,7 @@ class ZipFileReader;
 
 struct ReadXLSX {
 	// options and file path need to be resolved already
-	static void ParseOptions(XLSXReadOptions &options, const named_parameter_map_t &input);
+	static void ParseOptions(XLSXReadOptions &options, const named_argument_map_t &input);
 	static void ResolveSheet(const unique_ptr<XLSXReadData> &result, ZipFileReader &archive);
 
 	static void Register(ExtensionLoader &loader);

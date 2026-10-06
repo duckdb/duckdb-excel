@@ -277,7 +277,7 @@ static void ResolveColumnNames(vector<XLSXCell> &header_cells, ZipFileReader &ar
 	}
 }
 
-void ReadXLSX::ParseOptions(XLSXReadOptions &options, const named_parameter_map_t &input) {
+void ReadXLSX::ParseOptions(XLSXReadOptions &options, const named_argument_map_t &input) {
 
 	// Check which sheet to use, default to the primary sheet
 	const auto sheet_opt = input.find("sheet");
@@ -750,19 +750,21 @@ static unique_ptr<TableRef> XLSXReplacementScan(ClientContext &context, Replacem
 //-------------------------------------------------------------------
 TableFunction ReadXLSX::GetFunction() {
 
-	TableFunction read_xlsx("read_xlsx", {LogicalType::VARCHAR}, Execute, Bind);
+	FunctionSignature signature;
+	signature.AddParameter("file_path", LogicalType::VARCHAR).WithTypedKwargs("options", [&](TypedKwargs &options) {
+		options.Add("header", LogicalType::BOOLEAN)
+		    .Add("all_varchar", LogicalType::BOOLEAN)
+		    .Add("ignore_errors", LogicalType::BOOLEAN)
+		    .Add("range", LogicalType::VARCHAR)
+		    .Add("sheet", LogicalType::VARCHAR)
+		    .Add("stop_at_empty", LogicalType::BOOLEAN)
+		    .Add("empty_as_varchar", LogicalType::BOOLEAN)
+		    .Add("normalize_names", LogicalType::BOOLEAN);
+	});
+
+	TableFunction read_xlsx("read_xlsx", std::move(signature), Execute, Bind);
 	read_xlsx.init_global = InitGlobal;
 	read_xlsx.table_scan_progress = Progress;
-
-	// Parameters
-	read_xlsx.named_parameters["header"] = LogicalType::BOOLEAN;
-	read_xlsx.named_parameters["all_varchar"] = LogicalType::BOOLEAN;
-	read_xlsx.named_parameters["ignore_errors"] = LogicalType::BOOLEAN;
-	read_xlsx.named_parameters["range"] = LogicalType::VARCHAR;
-	read_xlsx.named_parameters["sheet"] = LogicalType::VARCHAR;
-	read_xlsx.named_parameters["stop_at_empty"] = LogicalType::BOOLEAN;
-	read_xlsx.named_parameters["empty_as_varchar"] = LogicalType::BOOLEAN;
-	read_xlsx.named_parameters["normalize_names"] = LogicalType::BOOLEAN;
 
 	return read_xlsx;
 }
