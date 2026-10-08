@@ -184,6 +184,45 @@ static unique_ptr<FunctionData> Bind(ClientContext &context, CopyFunctionBindInp
 }
 
 //------------------------------------------------------------------------------
+// Remote staging helpers
+//------------------------------------------------------------------------------
+// Remote MODE 'append'/'replace' can't use the appender's seek-heavy read and atomic
+// rename directly, so the workbook is staged locally: download it, append/replace against
+// the local copy, then upload the result. One GET, one PUT.
+
+// Forward-only byte copy that overwrites the destination, used for both the download and
+// upload legs.
+static void CopyAcrossFileSystems(FileSystem &src_fs, const string &src_path, FileSystem &dst_fs,
+                                  const string &dst_path) {
+	auto in = src_fs.OpenFile(src_path, FileFlags::FILE_FLAGS_READ);
+	auto out = dst_fs.OpenFile(dst_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
+
+	constexpr idx_t BUFFER_SIZE = 1 << 20; // 1 MiB
+	auto buffer = make_unsafe_uniq_array_uninitialized<char>(BUFFER_SIZE);
+	while (true) {
+		const auto read_size = in->Read(buffer.get(), BUFFER_SIZE);
+		if (read_size <= 0) {
+			break;
+		}
+		out->Write(buffer.get(), static_cast<idx_t>(read_size));
+	}
+	out->Sync();
+}
+
+// Stage in the working directory rather than DuckDB's `temporary_directory`, which is DuckDB's
+// own scratch space and may be unset or relative for in-memory databases. The filename mirrors
+// the appender's sibling-temp scheme (high-res clock + atomic counter) so writers never collide.
+static string MakeLocalStagePath(FileSystem &local_fs) {
+	const auto base_dir = FileSystem::GetWorkingDirectory();
+
+	static std::atomic<uint64_t> STAGE_COUNTER {0};
+	const auto now_ns = static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+	const auto seq = STAGE_COUNTER.fetch_add(1);
+	const auto name = "xlsx_stage." + std::to_string(now_ns) + "." + std::to_string(seq) + ".xlsx";
+	return local_fs.JoinPath(base_dir, name);
+}
+
+//------------------------------------------------------------------------------
 // Init Global
 //------------------------------------------------------------------------------
 struct GlobalWriteXLSXData final : public GlobalFunctionData {
@@ -196,32 +235,51 @@ struct GlobalWriteXLSXData final : public GlobalFunctionData {
 	ExpressionExecutor executor;
 	vector<unique_ptr<Expression>> conversion_expressions;
 
+	// Remote append/replace staging. When the COPY target is a remote append/replace, the
+	// appender runs against a local copy and Finalize uploads the result to remote_final_path.
+	bool is_remote_staging = false;
+	string remote_final_path;        // the real remote dest (s3://, ...)
+	string local_stage_path;         // local working file the appender reads + writes
+	unique_ptr<FileSystem> local_fs; // FileSystem::CreateLocal(); owns the stage file ops
+
 	GlobalWriteXLSXData(ClientContext &context, const string &file_path, const WriteXLSXData &data) : executor(context) {
 
-		// MODE 'append'/'replace' reads the existing workbook and atomically swaps a rebuilt
-		// copy back into place via a sibling temp file + rename. Remote filesystems (s3://,
-		// https://, gcs://, azure://, ...) don't support that rename, so refuse up front
-		// rather than failing partway through after the original has been removed. Checked
-		// against the raw user path before ExpandPath so it fires even without httpfs loaded.
-		if ((data.append || data.replace) && FileSystem::IsRemoteFile(data.file_path)) {
-			throw NotImplementedException(
-			    "XLSX MODE '%s' is only supported for local files; '%s' is on a remote filesystem. "
-			    "Write the workbook to a local path and upload it instead.",
-			    data.replace ? "replace" : "append", data.file_path);
-		}
-
 		auto &fs = FileSystem::GetFileSystem(context);
-		// data.file_path is the user-typed path (may contain `~`); the framework hands us
-		// `file_path` as the temp it'll rename. Expand the user-typed path before checking.
-		const auto target_path = fs.ExpandPath(data.file_path);
-		const bool target_exists = fs.FileExists(target_path);
-		const bool use_appender = (data.append || data.replace) && target_exists;
 
-		if (use_appender) {
-			appender = make_uniq<XLSXAppender>(context, target_path, file_path, data.sheet_name, data.replace,
-			                                   data.sheet_row_limit);
+		// For remote files the framework hands us the final path (use_tmp_file=false), and the raw
+		// user path is checked so this fires even when httpfs isn't loaded.
+		if ((data.append || data.replace) && FileSystem::IsRemoteFile(data.file_path)) {
+			remote_final_path = data.file_path;
+			if (!fs.FileExists(remote_final_path)) {
+				// Append/replace to a missing remote object is a fresh create, same as local.
+				fresh_writer = make_uniq<XLXSWriter>(context, file_path, data.sheet_row_limit);
+			} else {
+				is_remote_staging = true;
+				local_fs = FileSystem::CreateLocal();
+				local_stage_path = MakeLocalStagePath(*local_fs);
+				try {
+					CopyAcrossFileSystems(fs, remote_final_path, *local_fs, local_stage_path);
+					appender = make_uniq<XLSXAppender>(context, local_stage_path, local_stage_path,
+					                                   data.sheet_name, data.replace, data.sheet_row_limit);
+				} catch (...) {
+					// Partially constructed, so the destructor won't run; clean up the stage here.
+					local_fs->TryRemoveFile(local_stage_path);
+					throw;
+				}
+			}
 		} else {
-			fresh_writer = make_uniq<XLXSWriter>(context, file_path, data.sheet_row_limit);
+			// data.file_path is the user-typed path (may contain `~`); the framework hands us
+			// `file_path` as the temp it'll rename. Expand the user-typed path before checking.
+			const auto target_path = fs.ExpandPath(data.file_path);
+			const bool target_exists = fs.FileExists(target_path);
+			const bool use_appender = (data.append || data.replace) && target_exists;
+
+			if (use_appender) {
+				appender = make_uniq<XLSXAppender>(context, target_path, file_path, data.sheet_name, data.replace,
+				                                   data.sheet_row_limit);
+			} else {
+				fresh_writer = make_uniq<XLXSWriter>(context, file_path, data.sheet_row_limit);
+			}
 		}
 
 		// Initialize the expression executor
@@ -264,6 +322,14 @@ struct GlobalWriteXLSXData final : public GlobalFunctionData {
 		// Initialize the cast chunk;
 		const vector<LogicalType> types(data.column_types.size(), LogicalType::VARCHAR);
 		cast_chunk.Initialize(BufferAllocator::Get(context), types);
+	}
+
+	// Safety net for a COPY that fails mid-Sink: Finalize cleans up the stage on the normal
+	// paths, but if it never runs the destructor still removes it. TryRemoveFile is idempotent.
+	~GlobalWriteXLSXData() override {
+		if (is_remote_staging && local_fs) {
+			local_fs->TryRemoveFile(local_stage_path);
+		}
 	}
 };
 
@@ -482,7 +548,24 @@ static void Finalize(ClientContext &context, FunctionData &bind_data, GlobalFunc
 	auto &state = gstate.Cast<GlobalWriteXLSXData>();
 
 	if (state.appender) {
-		state.appender->Finish();
+		try {
+			state.appender->Finish();
+			if (state.is_remote_staging) {
+				// The zip central directory is flushed when the appender's writer is destroyed,
+				// not in Finish(), so destroy it before uploading or the stage is truncated.
+				state.appender.reset();
+				auto &fs = FileSystem::GetFileSystem(context);
+				CopyAcrossFileSystems(*state.local_fs, state.local_stage_path, fs, state.remote_final_path);
+			}
+		} catch (...) {
+			if (state.is_remote_staging) {
+				state.local_fs->TryRemoveFile(state.local_stage_path);
+			}
+			throw;
+		}
+		if (state.is_remote_staging) {
+			state.local_fs->TryRemoveFile(state.local_stage_path);
+		}
 	} else {
 		state.fresh_writer->EndSheet();
 		state.fresh_writer->Finish();

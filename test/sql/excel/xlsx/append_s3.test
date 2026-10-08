@@ -1,0 +1,77 @@
+# name: test/sql/excel/xlsx/append_s3.test
+# group: [xlsx]
+
+require excel
+
+require httpfs
+
+require-env S3_TEST_SERVER_AVAILABLE 1
+
+require-env AWS_DEFAULT_REGION
+
+require-env AWS_ACCESS_KEY_ID
+
+require-env AWS_SECRET_ACCESS_KEY
+
+require-env DUCKDB_S3_ENDPOINT
+
+require-env DUCKDB_S3_USE_SSL
+
+require no_extension_autoloading "FIXME: make copy to functions autoloadable"
+
+statement ok
+SET s3_endpoint='${DUCKDB_S3_ENDPOINT}';
+
+statement ok
+SET s3_use_ssl=${DUCKDB_S3_USE_SSL};
+
+statement ok
+SET s3_url_style='path';
+
+# Create a fresh workbook on S3 with sheet 'A'
+statement ok
+COPY (SELECT 1 AS x, 'hello' AS y) TO 's3://test-bucket/xlsx/append_s3.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'A');
+
+# Append a second sheet 'B'
+statement ok
+COPY (SELECT 2 AS x, 'world' AS y) TO 's3://test-bucket/xlsx/append_s3.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'B', MODE 'append');
+
+query IT
+SELECT * FROM read_xlsx('s3://test-bucket/xlsx/append_s3.xlsx', sheet='A', header=true);
+----
+1	hello
+
+query IT
+SELECT * FROM read_xlsx('s3://test-bucket/xlsx/append_s3.xlsx', sheet='B', header=true);
+----
+2	world
+
+# Replace sheet 'A' in place
+statement ok
+COPY (SELECT 99 AS x, 'replaced' AS y) TO 's3://test-bucket/xlsx/append_s3.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'A', MODE 'replace');
+
+query IT
+SELECT * FROM read_xlsx('s3://test-bucket/xlsx/append_s3.xlsx', sheet='A', header=true);
+----
+99	replaced
+
+# Sheet 'B' is untouched
+query IT
+SELECT * FROM read_xlsx('s3://test-bucket/xlsx/append_s3.xlsx', sheet='B', header=true);
+----
+2	world
+
+# Append to a missing key creates a fresh file
+statement ok
+COPY (SELECT 7 AS x, 'fresh' AS y) TO 's3://test-bucket/xlsx/append_s3_new.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'Only', MODE 'append');
+
+query IT
+SELECT * FROM read_xlsx('s3://test-bucket/xlsx/append_s3_new.xlsx', sheet='Only', header=true);
+----
+7	fresh
+
+# Replacing a missing sheet errors
+statement error
+COPY (SELECT 1 AS x) TO 's3://test-bucket/xlsx/append_s3.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'Missing', MODE 'replace');
+----
+not found
