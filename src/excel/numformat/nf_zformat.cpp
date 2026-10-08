@@ -2674,6 +2674,7 @@ uint16_t ImpSvNumberformatScan::ScanType(const String &) {
 	short eNewType;
 	bool bMatchBracket = false;
 	bool bHaveGeneral = false; // if General/Standard encountered
+	bool bHaveDigits = false;  // if a digit placeholder was encountered
 
 	SkipStrings(i, nPos);
 	while (i < nAnzStrings) {
@@ -2749,6 +2750,7 @@ uint16_t ImpSvNumberformatScan::ScanType(const String &) {
 			case L'#':
 			case L'?':
 				eNewType = NUMBERFORMAT_NUMBER;
+				bHaveDigits = true;
 				break;
 			case L'0': {
 				if ((eScannedType & NUMBERFORMAT_TIME) == NUMBERFORMAT_TIME) {
@@ -2757,8 +2759,10 @@ uint16_t ImpSvNumberformatScan::ScanType(const String &) {
 						eNewType = NUMBERFORMAT_TIME;
 					} else
 						return nPos; // Error
-				} else
+				} else {
 					eNewType = NUMBERFORMAT_NUMBER;
+					bHaveDigits = true;
+				}
 			} break;
 			case L'%':
 				eNewType = NUMBERFORMAT_PERCENT;
@@ -2911,8 +2915,9 @@ uint16_t ImpSvNumberformatScan::ScanType(const String &) {
 		SkipStrings(i, nPos);
 	}
 
+	// a currency symbol without any digit placeholder is plain text, not an "automatic" currency format
 	if ((eScannedType == NUMBERFORMAT_NUMBER || eScannedType == NUMBERFORMAT_UNDEFINED) &&
-	    nCurrPos != STRING_NOTFOUND && !bHaveGeneral)
+	    nCurrPos != STRING_NOTFOUND && !bHaveGeneral && bHaveDigits)
 		eScannedType = NUMBERFORMAT_CURRENCY; // old "automatic" currency
 	if (eScannedType == NUMBERFORMAT_UNDEFINED)
 		eScannedType = NUMBERFORMAT_DEFINED;
