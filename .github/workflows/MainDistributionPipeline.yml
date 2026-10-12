@@ -16,7 +16,7 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@969bc76276acec1c0a3922ff500d2ec3a1a3b037
     with:
-      duckdb_version: 5070de3585e846718fac121b5b149f4236e6a58a
+      duckdb_version: c29eca15a2f119e9c9d958fcd54542ba9171da76 # v2.0-cyanoptera 2026-10-09 pin
       ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
       extension_name: excel
 
@@ -27,7 +27,7 @@ jobs:
     if: false # TODO: re-enable when switching back to latest stable
     secrets: inherit
     with:
-      duckdb_version: 5070de3585e846718fac121b5b149f4236e6a58a
+      duckdb_version: c29eca15a2f119e9c9d958fcd54542ba9171da76 # v2.0-cyanoptera 2026-10-09 pin
       ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
       extension_name: excel
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
