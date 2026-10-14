@@ -1,0 +1,83 @@
+# Runs the gated S3 integration test (append_s3.test) against a local minio server; the main
+# distribution pipeline uses a shared reusable workflow that can't attach one. Keep duckdb_version,
+# ci_tools_version, and the vcpkg commit in sync with MainDistributionPipeline.yml.
+name: S3 Integration Tests
+on:
+  push:
+    paths:
+      - 'src/**'
+      - 'test/sql/excel/xlsx/append_s3.test'
+      - '.github/workflows/s3-tests.yml'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'test/sql/excel/xlsx/append_s3.test'
+      - '.github/workflows/s3-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}
+  cancel-in-progress: true
+
+env:
+  MINIO_USER: minio_duckdb_user
+  MINIO_PASSWORD: minio_duckdb_user_password
+  MINIO_BUCKET: test-bucket
+
+jobs:
+  s3-test:
+    name: Build + S3 round-trip (minio)
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_TARGET_TRIPLET: x64-linux
+      GEN: ninja
+      DUCKDB_PLATFORM: linux_amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install build dependencies
+        shell: bash
+        # libcurl/libssl are needed by httpfs, which is linked in for the s3 tests below.
+        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build libcurl4-openssl-dev libssl-dev
+
+      - name: Start minio
+        shell: bash
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=${MINIO_USER} \
+            -e MINIO_ROOT_PASSWORD=${MINIO_PASSWORD} \
+            minio/minio server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint sh minio/mc -c "
+            mc alias set local http://localhost:9000 ${MINIO_USER} ${MINIO_PASSWORD} &&
+            mc mb -p local/${MINIO_BUCKET}"
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@v11.5
+        with:
+          vcpkgGitCommitId: ce613c41372b23b1f51333815feb3edd87ef8a8b
+
+      - name: Build extension
+        shell: bash
+        env:
+          VCPKG_TOOLCHAIN_PATH: ${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
+        # httpfs is linked statically so the unittester has s3 support without extension autoloading.
+        run: make release CORE_EXTENSIONS='httpfs'
+
+      - name: Run S3 integration test
+        shell: bash
+        env:
+          S3_TEST_SERVER_AVAILABLE: 1
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: ${{ env.MINIO_USER }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.MINIO_PASSWORD }}
+          DUCKDB_S3_ENDPOINT: localhost:9000
+          DUCKDB_S3_USE_SSL: false
+        run: ./build/release/test/unittest "test/sql/excel/xlsx/append_s3.test"
