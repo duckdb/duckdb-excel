@@ -47,7 +47,21 @@ struct mz_stream_duckdb {
 	FileSystem *fs;
 	FileHandle *handle;
 	string last_error;
+
+	// Read-only streams buffer their reads. minizip reads in small pieces (zip headers,
+	// central directory entries, ~32 KiB inflate inputs), and on a remote file each
+	// FileHandle::Read is one HTTP request; on DuckDB 2.0's httpfs that turned a 40 KB
+	// workbook into ~2,500 ranged GETs. The stream keeps its own position, reads whole
+	// blocks at it with a positional Read, and answers small reads from the block.
+	bool buffered = false;
+	idx_t position = 0;
+	idx_t file_size = 0;
+	unsafe_unique_array<data_t> block;
+	idx_t block_start = 0;
+	idx_t block_size = 0;
 };
+
+static constexpr idx_t MZ_DUCKDB_READ_BLOCK = 1 << 20; // 1 MiB
 
 int32_t mz_stream_duckdb_open(void *stream, const char *path, int32_t mode) {
 	auto &self = *reinterpret_cast<mz_stream_duckdb *>(stream);
@@ -81,6 +95,14 @@ int32_t mz_stream_duckdb_open(void *stream, const char *path, int32_t mode) {
 			return MZ_OPEN_ERROR;
 		}
 		self.handle = file.release();
+		self.buffered =
+		    (mode & (MZ_OPEN_MODE_WRITE | MZ_OPEN_MODE_APPEND | MZ_OPEN_MODE_CREATE)) == 0 && self.handle->CanSeek();
+		self.position = 0;
+		self.block_start = 0;
+		self.block_size = 0;
+		if (self.buffered) {
+			self.file_size = self.handle->GetFileSize();
+		}
 	} catch (Exception &ex) {
 		ErrorData err(ex);
 		self.last_error = err.RawMessage();
@@ -99,7 +121,38 @@ int32_t mz_stream_duckdb_is_open(void *stream) {
 
 int32_t mz_stream_duckdb_read(void *stream, void *buf, int32_t size) {
 	auto &self = *reinterpret_cast<mz_stream_duckdb *>(stream);
-	return self.handle->Read(buf, size);
+	if (!self.buffered) {
+		return self.handle->Read(buf, size);
+	}
+	if (size <= 0 || self.position >= self.file_size) {
+		return 0;
+	}
+	auto to_read = MinValue<idx_t>(UnsafeNumericCast<idx_t>(size), self.file_size - self.position);
+	auto out = static_cast<data_ptr_t>(buf);
+	if (to_read >= MZ_DUCKDB_READ_BLOCK) {
+		// Large reads gain nothing from the block: read them in place.
+		self.handle->Read(out, to_read, self.position);
+		self.position += to_read;
+		return UnsafeNumericCast<int32_t>(to_read);
+	}
+	idx_t done = 0;
+	while (done < to_read) {
+		if (self.position < self.block_start || self.position >= self.block_start + self.block_size) {
+			// Refill the block at the current position.
+			if (!self.block) {
+				self.block = make_unsafe_uniq_array_uninitialized<data_t>(MZ_DUCKDB_READ_BLOCK);
+			}
+			self.block_start = self.position;
+			self.block_size = MinValue<idx_t>(MZ_DUCKDB_READ_BLOCK, self.file_size - self.position);
+			self.handle->Read(self.block.get(), self.block_size, self.block_start);
+		}
+		auto offset = self.position - self.block_start;
+		auto chunk = MinValue<idx_t>(to_read - done, self.block_size - offset);
+		memcpy(out + done, self.block.get() + offset, chunk);
+		done += chunk;
+		self.position += chunk;
+	}
+	return UnsafeNumericCast<int32_t>(done);
 }
 
 int32_t mz_stream_duckdb_write(void *stream, const void *buf, int32_t size) {
@@ -109,11 +162,36 @@ int32_t mz_stream_duckdb_write(void *stream, const void *buf, int32_t size) {
 
 int64_t mz_stream_duckdb_tell(void *stream) {
 	auto &self = *reinterpret_cast<mz_stream_duckdb *>(stream);
+	if (self.buffered) {
+		return UnsafeNumericCast<int64_t>(self.position);
+	}
 	return self.handle->SeekPosition();
 }
 
 int32_t mz_stream_duckdb_seek(void *stream, int64_t offset, int32_t origin) {
 	auto &self = *reinterpret_cast<mz_stream_duckdb *>(stream);
+	if (self.buffered) {
+		// Only the logical position moves; the next read refills the block if needed.
+		int64_t target;
+		switch (origin) {
+		case MZ_SEEK_SET:
+			target = offset;
+			break;
+		case MZ_SEEK_CUR:
+			target = UnsafeNumericCast<int64_t>(self.position) + offset;
+			break;
+		case MZ_SEEK_END:
+			target = UnsafeNumericCast<int64_t>(self.file_size) + offset;
+			break;
+		default:
+			return MZ_SEEK_ERROR;
+		}
+		if (target < 0) {
+			return MZ_SEEK_ERROR;
+		}
+		self.position = UnsafeNumericCast<idx_t>(target);
+		return MZ_OK;
+	}
 	switch (origin) {
 	case MZ_SEEK_SET:
 		self.handle->Seek(offset);
