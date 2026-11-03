@@ -142,9 +142,9 @@ int32_t mz_stream_duckdb_close(void *stream) {
 }
 
 int32_t mz_stream_duckdb_error(void *stream) {
-	// TODO: DuckDB's fs tend to throw on errors, so this is not needed
-	auto &self = *reinterpret_cast<mz_stream_duckdb *>(stream);
-	return mz_stream_error(&self.base);
+	// DuckDB's file systems throw on errors, so a short read only means the end of the file was reached.
+	// Do not forward to mz_stream_error(): it dispatches back to this callback and never returns.
+	return MZ_OK;
 }
 
 void *mz_stream_duckdb_create(void) {
