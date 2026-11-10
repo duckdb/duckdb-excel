@@ -9,7 +9,7 @@ if (EMSCRIPTEN)
   # _LINKED_LIBS influences only Wasm compilation
   # it's unclear why this is needed, but avoid globals to be incorrectly not linked-in
   # this solves by basically re-linking (at the moment the Wasm binary is actually produced)
-  set (DUCKDB_EXTENSION_EXCEL_LINKED_LIBS "../../vcpkg_installed/wasm32-emscripten/lib/lib*.a")
+  set (DUCKDB_EXTENSION_EXCEL_LINKED_LIBS "../../vcpkg_installed/${VCPKG_TARGET_TRIPLET}/lib/lib*.a")
 endif()
 
 # Dependencies from VCPKG
