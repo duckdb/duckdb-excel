@@ -127,22 +127,26 @@ fn zip64_locator_pointing_nowhere() {
 }
 
 #[test]
-fn zip64_entry_count_far_beyond_the_directory() {
+fn zip64_entry_count_that_disagrees_with_the_directory() {
     let entry = RawEntry::stored("a.txt", b"abc");
     let mut archive = entry.local_header();
     archive.extend_from_slice(&entry.data);
     let offset = archive.len() as u64;
     let directory = entry.central_header(0);
     archive.extend_from_slice(&directory);
-    for count in [2, 1 << 40, u64::MAX] {
-        let mut lying = archive.clone();
-        lying.extend_from_slice(&end_records(
-            count,
-            directory.len() as u64,
-            offset,
-            true,
-            b"",
-        ));
-        assert_eq!(kind(open(&lying)), ErrorKind::InvalidData, "count {count}");
+    let with_count = |count: u64| {
+        let end = end_records(count, directory.len() as u64, offset, true, b"");
+        [&archive[..], &end].concat()
+    };
+    for understated in [0, 1] {
+        let files = read_archive(&with_count(understated)).unwrap();
+        assert_eq!(files, [("a.txt".to_string(), b"abc".to_vec())]);
+    }
+    for overstated in [2, 1 << 40, u64::MAX] {
+        assert_eq!(
+            kind(open(&with_count(overstated))),
+            ErrorKind::InvalidData,
+            "count {overstated}"
+        );
     }
 }

@@ -4,17 +4,13 @@ use std::io::{self, ErrorKind, Read, Write};
 
 use excel_zip::ZipWriter;
 
-use crate::support::{kind, open, read_archive, read_entry, write_archive};
+use crate::support::{RawArchive, RawEntry, kind, open, read_archive, read_entry, write_archive};
 
 #[test]
 fn reader_calls_without_an_open_entry() {
     let archive = write_archive(&[("a.txt", b"abc")]);
     let mut reader = open(&archive).unwrap();
-    assert!(!reader.is_entry_open());
-    assert_eq!(
-        (reader.entry_len(), reader.entry_pos(), reader.is_done()),
-        (0, 0, true)
-    );
+    assert_eq!(reader.entry_len(), 0);
     assert_eq!(kind(reader.read(&mut [0; 8])), ErrorKind::InvalidInput);
     assert_eq!(kind(reader.close_entry()), ErrorKind::InvalidInput);
     assert_eq!(kind(reader.open_entry(1)), ErrorKind::InvalidInput);
@@ -42,11 +38,6 @@ fn writer_calls_without_an_open_file() {
     let mut writer = ZipWriter::new(Vec::new());
     assert_eq!(kind(writer.write(b"abc")), ErrorKind::InvalidInput);
     assert_eq!(kind(writer.end_file()), ErrorKind::InvalidInput);
-    assert_eq!(
-        kind(writer.add_directory("no-slash")),
-        ErrorKind::InvalidInput
-    );
-    assert_eq!(kind(writer.add_directory("")), ErrorKind::InvalidInput);
     writer.flush().unwrap();
     assert_eq!(writer.finish().unwrap().len(), 22);
 }
@@ -58,7 +49,6 @@ fn writer_allows_one_open_file() {
     let mut writer = ZipWriter::new(Vec::new());
     writer.begin_file("a.txt").unwrap();
     assert_eq!(kind(writer.begin_file("b.txt")), ErrorKind::InvalidInput);
-    assert_eq!(kind(writer.add_directory("dir/")), ErrorKind::InvalidInput);
     assert_eq!(
         kind(writer.copy_entry(&mut source, 0)),
         ErrorKind::InvalidInput
@@ -69,7 +59,8 @@ fn writer_allows_one_open_file() {
     let archive = writer.finish().unwrap();
     assert_eq!(
         read_archive(&archive).unwrap(),
-        [("a.txt".to_string(), b"abc".to_vec())]
+        [("a.txt".to_string(), b"abc".to_vec())],
+        "the refused calls left no trace"
     );
 }
 
@@ -87,10 +78,6 @@ fn writer_refuses_names_that_do_not_fit() {
     let fitting = "n".repeat(65_535);
     let long = "n".repeat(65_536);
     assert_eq!(kind(writer.begin_file(&long)), ErrorKind::InvalidInput);
-    assert_eq!(
-        kind(writer.add_directory(&format!("{long}/"))),
-        ErrorKind::InvalidInput
-    );
     writer.begin_file(&fitting).unwrap();
     writer.end_file().unwrap();
     let archive = writer.finish().unwrap();
@@ -99,12 +86,14 @@ fn writer_refuses_names_that_do_not_fit() {
 
 #[test]
 fn writer_refuses_more_entries_than_the_classic_format_holds() {
+    let source = RawArchive::of(vec![RawEntry::stored("e", b"e")]).build();
+    let mut source = open(&source).unwrap();
     let mut writer = ZipWriter::new(Vec::new());
-    for index in 0..65_534 {
-        writer.add_directory(&format!("d{index}/")).unwrap();
+    for _ in 0..65_534 {
+        writer.copy_entry(&mut source, 0).unwrap();
     }
     assert_eq!(
-        kind(writer.add_directory("one-too-many/")),
+        kind(writer.copy_entry(&mut source, 0)),
         ErrorKind::Unsupported
     );
     assert_eq!(
@@ -112,9 +101,10 @@ fn writer_refuses_more_entries_than_the_classic_format_holds() {
         ErrorKind::Unsupported
     );
     let archive = writer.finish().unwrap();
-    let reader = open(&archive).unwrap();
+    let mut reader = open(&archive).unwrap();
     assert_eq!(reader.entries().len(), 65_534);
-    assert_eq!(reader.find("d65533/"), Some(65_533));
+    assert_eq!(reader.find("e"), Some(65_533));
+    assert_eq!(read_entry(&mut reader, 65_533, 8).unwrap(), b"e");
 }
 
 #[test]

@@ -4,7 +4,9 @@
 //! appends to its output, so it works on files that cannot seek.
 //!
 //! Errors are [`std::io::Error`]s: `InvalidData` for malformed archives, `Unsupported` for
-//! features that are not handled and `InvalidInput` for calls made in the wrong state.
+//! features that are not handled, `InvalidInput` for calls made in the wrong state and `Other`
+//! for a writer that is broken or whose compressor failed. Errors of the underlying file pass
+//! through unchanged.
 
 mod directory;
 mod format;

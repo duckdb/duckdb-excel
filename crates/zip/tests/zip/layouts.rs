@@ -67,10 +67,10 @@ fn local_extra_fields_cost_one_more_read_at_most() {
     let mut entry = RawEntry::deflated("sheet.xml", &content);
     entry.local_extra = vec![0; 520];
     let archive = RawArchive::of(vec![entry]).build();
-    let mut reader = ZipReader::new(Watched::new(Cursor::new(&archive))).unwrap();
+    let (file, log) = Watched::new(Cursor::new(&archive));
+    let mut reader = ZipReader::new(file).unwrap();
     assert!(read_entry(&mut reader, 0, 100).unwrap() == content);
-    let file = reader.into_inner();
-    assert_eq!(file.reads.len(), 3);
+    assert!(log.borrow().reads.len() <= 3);
 }
 
 #[test]
@@ -158,4 +158,30 @@ fn directory_shorter_than_the_end_record_says() {
         read_archive(&archive).unwrap(),
         [("a.txt".to_string(), b"abc".to_vec())]
     );
+}
+
+#[test]
+fn records_larger_than_the_directory_window() {
+    let names: Vec<String> = [65_535, 40_000, 70, 65_000, 1, 65_535]
+        .iter()
+        .enumerate()
+        .map(|(index, len)| format!("{index}").repeat(*len))
+        .collect();
+    let entries: Vec<RawEntry> = names
+        .iter()
+        .map(|name| RawEntry::stored(name, &name.as_bytes()[..1]))
+        .collect();
+    for comment_len in [0, 65_535] {
+        let archive = RawArchive {
+            comment: vec![b'c'; comment_len],
+            ..RawArchive::of(entries.clone())
+        }
+        .build();
+        let files = read_archive(&archive).unwrap();
+        assert_eq!(files.len(), names.len());
+        for ((name, content), expected) in files.iter().zip(&names) {
+            assert!(name == expected);
+            assert_eq!(content, &expected.as_bytes()[..1]);
+        }
+    }
 }

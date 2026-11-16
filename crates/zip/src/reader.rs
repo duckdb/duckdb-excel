@@ -132,23 +132,9 @@ impl<R: Read + Seek> ZipReader<R> {
         Ok(())
     }
 
-    pub fn is_entry_open(&self) -> bool {
-        self.open.is_some()
-    }
-
     /// The uncompressed size of the open entry, as the central directory states it.
     pub fn entry_len(&self) -> u64 {
         self.open.as_ref().map_or(0, |open| open.len)
-    }
-
-    /// The number of uncompressed bytes read from the open entry.
-    pub fn entry_pos(&self) -> u64 {
-        self.open.as_ref().map_or(0, |open| open.pos)
-    }
-
-    /// Whether the open entry has been read up to its stated size.
-    pub fn is_done(&self) -> bool {
-        self.entry_pos() >= self.entry_len()
     }
 
     /// Closes the open entry; its checksum is only verified when it was read to the end.
@@ -184,10 +170,6 @@ impl<R: Read + Seek> ZipReader<R> {
             )));
         }
         Ok(())
-    }
-
-    pub fn into_inner(self) -> R {
-        self.source.inner
     }
 
     pub(crate) fn stored_entry(&self, index: usize) -> io::Result<(&ZipEntry, &Record)> {

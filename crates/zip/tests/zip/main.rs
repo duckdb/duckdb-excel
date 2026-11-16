@@ -1,5 +1,6 @@
 //! Integration tests of the ZIP reader and writer, grouped by what they exercise.
 
+mod broken;
 mod copy_entry;
 mod fixtures;
 mod layouts;

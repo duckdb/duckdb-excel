@@ -7,8 +7,11 @@
 //! An archive with data put in front of it keeps its original offsets. Its directory is then
 //! found right before the end record instead of where the end record says, and every entry
 //! offset is off by the same amount.
+//!
+//! The directory is walked record by record for as long as records follow, so entries beyond
+//! an understated count are found, while fewer records than stated are an error. Neither the
+//! stated count nor the stated length sizes a read or an allocation.
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -31,6 +34,7 @@ pub(crate) struct Record {
     pub(crate) dos_time: u16,
     pub(crate) dos_date: u16,
     pub(crate) version_made_by: u16,
+    pub(crate) version_needed: u16,
     pub(crate) internal_attributes: u16,
     pub(crate) external_attributes: u32,
     pub(crate) raw_name: Option<Box<[u8]>>,
@@ -49,6 +53,14 @@ struct Tail {
     bytes: Vec<u8>,
 }
 
+/// Serves ranges of the file from the tail or from one block that follows the walk.
+struct Window<'a, R> {
+    inner: &'a mut R,
+    tail: &'a Tail,
+    start: u64,
+    bytes: Vec<u8>,
+}
+
 struct End {
     position: u64,
     disk: u32,
@@ -59,6 +71,8 @@ struct End {
     directory_offset: u64,
 }
 
+const WINDOW_LEN: usize = 64 * 1024;
+
 pub(crate) fn read_directory<R: Read + Seek>(inner: &mut R) -> io::Result<Directory> {
     let file_len = inner.seek(SeekFrom::End(0))?;
     let tail_len = (END_LEN + MAX_COMMENT_LEN + ZIP64_LOCATOR_LEN) as u64;
@@ -68,13 +82,18 @@ pub(crate) fn read_directory<R: Read + Seek>(inner: &mut R) -> io::Result<Direct
     inner.seek(SeekFrom::Start(start))?;
     read_exact(inner, &mut bytes)?;
     let tail = Tail { start, bytes };
+    let mut window = Window {
+        inner,
+        tail: &tail,
+        start: 0,
+        bytes: Vec::new(),
+    };
 
-    let end = read_end(inner, &tail)?;
+    let end = read_end(&mut window)?;
     if end.disk != 0 || end.directory_disk != 0 || end.entries_on_disk != end.entry_count {
         return Err(unsupported("multi-disk ZIP archives are not supported"));
     }
-    let (directory, shift) = load_directory(inner, &tail, &end)?;
-    let (entries, records) = parse_entries(&directory, end.entry_count, shift)?;
+    let (entries, records) = read_entries(&mut window, &end)?;
     Ok(Directory {
         file_len,
         entries,
@@ -91,32 +110,29 @@ fn read_exact<R: Read>(inner: &mut R, buffer: &mut [u8]) -> io::Result<()> {
         })
 }
 
-impl Tail {
-    fn load<R: Read + Seek>(
-        &self,
-        inner: &mut R,
-        offset: u64,
-        len: usize,
-    ) -> io::Result<Cow<'_, [u8]>> {
-        let buffered = offset
-            .checked_sub(self.start)
-            .and_then(|skip| usize::try_from(skip).ok())
-            .and_then(|skip| self.bytes.get(skip..)?.get(..len));
-        if let Some(bytes) = buffered {
-            return Ok(Cow::Borrowed(bytes));
+impl<R: Read + Seek> Window<'_, R> {
+    fn get(&mut self, offset: u64, len: usize, limit: u64) -> io::Result<Option<&[u8]>> {
+        let Some(available) = limit.checked_sub(offset).filter(|left| *left >= len as u64) else {
+            return Ok(None);
+        };
+        let tail = self.tail;
+        if let Some(bytes) = range(&tail.bytes, tail.start, offset, len) {
+            return Ok(Some(bytes));
         }
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "the central directory does not fit in memory",
-            )
-        })?;
-        bytes.resize(len, 0);
-        inner.seek(SeekFrom::Start(offset))?;
-        read_exact(inner, &mut bytes)?;
-        Ok(Cow::Owned(bytes))
+        if range(&self.bytes, self.start, offset, len).is_none() {
+            let block_len = available.min(len.max(WINDOW_LEN) as u64) as usize;
+            self.bytes.resize(block_len, 0);
+            self.start = offset;
+            self.inner.seek(SeekFrom::Start(offset))?;
+            read_exact(self.inner, &mut self.bytes)?;
+        }
+        Ok(range(&self.bytes, self.start, offset, len))
     }
+}
+
+fn range(bytes: &[u8], start: u64, offset: u64, len: usize) -> Option<&[u8]> {
+    let skip = usize::try_from(offset.checked_sub(start)?).ok()?;
+    bytes.get(skip..)?.get(..len)
 }
 
 fn find_end(tail: &[u8]) -> Option<usize> {
@@ -139,10 +155,11 @@ fn find_end(tail: &[u8]) -> Option<usize> {
     followed_by_more
 }
 
-fn read_end<R: Read + Seek>(inner: &mut R, tail: &Tail) -> io::Result<End> {
+fn read_end<R: Read + Seek>(window: &mut Window<'_, R>) -> io::Result<End> {
     let missing = || invalid("not a ZIP archive: the end of central directory record is missing");
+    let tail = window.tail;
     let at = find_end(&tail.bytes).ok_or_else(missing)?;
-    if let Some(end) = read_zip64_end(inner, tail, at)? {
+    if let Some(end) = read_zip64_end(window, at)? {
         return Ok(end);
     }
     let record = tail.bytes.get(at..).unwrap_or_default();
@@ -164,10 +181,10 @@ fn parse_end(record: &[u8], position: u64) -> Option<End> {
 }
 
 fn read_zip64_end<R: Read + Seek>(
-    inner: &mut R,
-    tail: &Tail,
+    window: &mut Window<'_, R>,
     end_at: usize,
 ) -> io::Result<Option<End>> {
+    let tail = window.tail;
     let Some(locator_at) = end_at.checked_sub(ZIP64_LOCATOR_LEN) else {
         return Ok(None);
     };
@@ -179,16 +196,12 @@ fn read_zip64_end<R: Read + Seek>(
         return Ok(None);
     };
     let locator_position = tail.start + locator_at as u64;
-    if position
-        .checked_add(ZIP64_END_LEN as u64)
-        .is_none_or(|end| end > locator_position)
-    {
+    let Some(record) = window.get(position, ZIP64_END_LEN, locator_position)? else {
         return Err(invalid(
             "the ZIP64 end of central directory record lies outside the file",
         ));
-    }
-    let record = tail.load(inner, position, ZIP64_END_LEN)?;
-    match parse_zip64_end(&record, position) {
+    };
+    match parse_zip64_end(record, position) {
         Some(end) => Ok(Some(end)),
         None => Err(invalid(
             "the ZIP64 end of central directory record is corrupt",
@@ -215,14 +228,10 @@ fn parse_zip64_end(record: &[u8], position: u64) -> Option<End> {
     })
 }
 
-fn load_directory<'a, R: Read + Seek>(
-    inner: &mut R,
-    tail: &'a Tail,
+fn locate_directory<R: Read + Seek>(
+    window: &mut Window<'_, R>,
     end: &End,
-) -> io::Result<(Cow<'a, [u8]>, u64)> {
-    if end.entry_count == 0 {
-        return Ok((Cow::Borrowed(&[]), 0));
-    }
+) -> io::Result<(u64, u64, u64)> {
     let stated = (end.directory_offset, 0);
     let shifted = end
         .position
@@ -232,54 +241,76 @@ fn load_directory<'a, R: Read + Seek>(
             (shift > 0).then_some((start, shift))
         });
     for (start, shift) in [Some(stated), shifted].into_iter().flatten() {
-        let Some(available) = end.position.checked_sub(start) else {
-            continue;
-        };
-        let Ok(len) = usize::try_from(available.min(end.directory_len)) else {
-            continue;
-        };
-        if len < CENTRAL_HEADER_LEN {
-            continue;
-        }
-        let bytes = tail.load(inner, start, len)?;
-        if bytes.starts_with(&CENTRAL_HEADER_SIGNATURE.to_le_bytes()) {
-            return Ok((bytes, shift));
+        let limit = start.saturating_add(end.directory_len).min(end.position);
+        if record_follows(window, start, limit)? {
+            return Ok((start, limit, shift));
         }
     }
-    Err(invalid(
-        "the central directory of the ZIP archive is missing",
-    ))
+    Ok((0, 0, 0))
 }
 
-fn parse_entries(
-    directory: &[u8],
-    count: u64,
-    shift: u64,
+fn record_follows<R: Read + Seek>(
+    window: &mut Window<'_, R>,
+    position: u64,
+    limit: u64,
+) -> io::Result<bool> {
+    let signature = CENTRAL_HEADER_SIGNATURE.to_le_bytes();
+    Ok(window.get(position, signature.len(), limit)? == Some(&signature))
+}
+
+fn read_entries<R: Read + Seek>(
+    window: &mut Window<'_, R>,
+    end: &End,
 ) -> io::Result<(Vec<ZipEntry>, Vec<Record>)> {
-    let capacity = usize::try_from(count)
-        .unwrap_or(usize::MAX)
-        .min(directory.len() / CENTRAL_HEADER_LEN);
-    let mut entries = Vec::with_capacity(capacity);
-    let mut records = Vec::with_capacity(capacity);
-    let mut fields = Fields::new(directory);
-    for index in 0..count {
-        let (entry, record) = parse_entry(&mut fields, shift).ok_or_else(|| {
-            invalid(format!(
-                "the central directory of the ZIP archive is corrupt at entry {index}"
-            ))
-        })?;
+    let (mut position, limit, shift) = locate_directory(window, end)?;
+    let (mut entries, mut records) = (Vec::new(), Vec::new());
+    while record_follows(window, position, limit)? {
+        let Some((entry, record, len)) = read_record(window, position, limit, shift)? else {
+            return Err(invalid(format!(
+                "the central directory of the ZIP archive is corrupt at entry {}",
+                entries.len()
+            )));
+        };
         entries.push(entry);
         records.push(record);
+        position += len as u64;
+    }
+    if (entries.len() as u64) < end.entry_count {
+        return Err(invalid(format!(
+            "the central directory of the ZIP archive holds {} entries where {} are stated",
+            entries.len(),
+            end.entry_count
+        )));
     }
     Ok((entries, records))
 }
 
-fn parse_entry(fields: &mut Fields<'_>, shift: u64) -> Option<(ZipEntry, Record)> {
-    if fields.u32()? != CENTRAL_HEADER_SIGNATURE {
-        return None;
-    }
+fn read_record<R: Read + Seek>(
+    window: &mut Window<'_, R>,
+    position: u64,
+    limit: u64,
+    shift: u64,
+) -> io::Result<Option<(ZipEntry, Record, usize)>> {
+    let header = window.get(position, CENTRAL_HEADER_LEN, limit)?;
+    let Some(len) = header.and_then(record_len) else {
+        return Ok(None);
+    };
+    let record = window.get(position, len, limit)?;
+    let parsed = record.and_then(|record| parse_entry(record, shift));
+    Ok(parsed.map(|(entry, record)| (entry, record, len)))
+}
+
+fn record_len(header: &[u8]) -> Option<usize> {
+    let mut fields = Fields::new(header.get(28..)?);
+    let variable = [fields.u16()?, fields.u16()?, fields.u16()?];
+    Some(CENTRAL_HEADER_LEN + variable.iter().map(|len| usize::from(*len)).sum::<usize>())
+}
+
+fn parse_entry(record: &[u8], shift: u64) -> Option<(ZipEntry, Record)> {
+    let mut fields = Fields::new(record);
+    let _signature = fields.u32()?;
     let version_made_by = fields.u16()?;
-    let _version_needed = fields.u16()?;
+    let version_needed = fields.u16()?;
     let flags = fields.u16()?;
     let method = fields.u16()?;
     let dos_time = fields.u16()?;
@@ -330,6 +361,7 @@ fn parse_entry(fields: &mut Fields<'_>, shift: u64) -> Option<(ZipEntry, Record)
         dos_time,
         dos_date,
         version_made_by,
+        version_needed,
         internal_attributes,
         external_attributes,
         raw_name,

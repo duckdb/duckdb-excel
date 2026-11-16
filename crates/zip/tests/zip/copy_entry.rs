@@ -26,7 +26,6 @@ fn copies_an_archive_of_this_writer() {
     let sheet = rows(400_000);
     let image = noise(200_000, 21);
     let source = write_archive(&[
-        ("xl/", b""),
         ("xl/worksheets/sheet1.xml", &sheet),
         ("xl/media/image.bin", &image),
         ("empty.xml", b""),
@@ -79,10 +78,12 @@ fn keeps_method_time_and_attributes() {
     stored.external_attributes = 0x20;
     stored.flags = 0x0006;
     stored.descriptor = true;
+    stored.version_needed = 10;
     let mut directory = RawEntry::stored("bin/", b"");
     directory.external_attributes = 0x10;
     let mut wide = RawEntry::deflated("wide.xml", &rows(100));
     (wide.zip64_sizes, wide.zip64_offset) = (true, true);
+    wide.version_needed = 45;
     let source = RawArchive {
         zip64: true,
         ..RawArchive::of(vec![script, stored, directory, wide])
@@ -95,6 +96,7 @@ fn keeps_method_time_and_attributes() {
     let expected = |name: &str, content: &[u8], compressed_size: usize| Central {
         name: name.as_bytes().to_vec(),
         version_made_by: 20,
+        version_needed: 20,
         flags: 0,
         method: METHOD_DEFLATED,
         dos_time: 0x6000,
@@ -143,10 +145,16 @@ fn keeps_method_time_and_attributes() {
     assert_eq!(
         records[3],
         Central {
+            version_needed: 45,
             header_offset: offsets[3],
             ..expected("wide.xml", &rows(100), records[3].compressed_size as usize)
         }
     );
+    for record in &records {
+        let local = &copy[record.header_offset as usize..][..30];
+        assert_eq!(local[4..6], record.version_needed.to_le_bytes());
+        assert_eq!(local[6..8], record.flags.to_le_bytes());
+    }
     assert!(offsets.is_sorted() && offsets[1] > 0);
 }
 
@@ -181,7 +189,6 @@ fn mixes_copied_and_new_entries() {
     let (mut first, mut second) = (open(&first).unwrap(), open(&second).unwrap());
 
     let mut writer = ZipWriter::new(Vec::new());
-    writer.add_directory("xl/").unwrap();
     writer.copy_entry(&mut first, 1).unwrap();
     writer.begin_file("xl/workbook.xml").unwrap();
     writer.write_all(b"<new/>").unwrap();
@@ -196,7 +203,6 @@ fn mixes_copied_and_new_entries() {
     assert_eq!(
         names,
         [
-            "xl/",
             "xl/styles.xml",
             "xl/workbook.xml",
             "xl/media/logo.bin",
@@ -204,9 +210,9 @@ fn mixes_copied_and_new_entries() {
             "xl/styles.xml"
         ]
     );
-    assert_eq!(files[2].1, b"<new/>");
-    assert_eq!(files[4].1, b"<old/>");
-    assert_eq!(files[3].1, noise(100, 1));
+    assert_eq!(files[1].1, b"<new/>");
+    assert_eq!(files[3].1, b"<old/>");
+    assert_eq!(files[2].1, noise(100, 1));
 
     assert_eq!(
         read_entry(&mut first, 0, 8).unwrap(),
@@ -216,31 +222,28 @@ fn mixes_copied_and_new_entries() {
 }
 
 #[test]
-fn keeps_names_byte_for_byte() {
+fn keeps_names_and_their_encoding_flag() {
     let mut latin = RawEntry::stored("placeholder", b"latin");
     latin.name = b"caf\xE9.txt".to_vec();
-    let unflagged = RawEntry::stored("crème.txt", b"utf8");
-    let source = RawArchive::of(vec![
-        latin,
-        unflagged,
-        RawEntry::stored("plain.txt", b"plain"),
-    ])
-    .build();
+    let unflagged = RawEntry::stored("crème.txt", b"unflagged");
+    let mut flagged = RawEntry::stored("brûlée.txt", b"flagged");
+    flagged.flags = FLAG_UTF8;
+    let mut flagged_ascii = RawEntry::stored("plain.txt", b"plain");
+    flagged_ascii.flags = FLAG_UTF8;
+    let source = RawArchive::of(vec![latin, unflagged, flagged, flagged_ascii]).build();
 
     let copy = copy_all(&source);
-    let records = central_directory(&copy);
-    assert_eq!(
-        (records[0].name.as_slice(), records[0].flags),
-        (&b"caf\xE9.txt"[..], 0)
-    );
-    assert_eq!(
-        (records[1].name.as_slice(), records[1].flags),
-        ("crème.txt".as_bytes(), FLAG_UTF8)
-    );
-    assert_eq!(
-        (records[2].name.as_slice(), records[2].flags),
-        (&b"plain.txt"[..], 0)
-    );
+    let copied: Vec<(Vec<u8>, u16)> = central_directory(&copy)
+        .into_iter()
+        .map(|record| (record.name, record.flags))
+        .collect();
+    let expected = [
+        (b"caf\xE9.txt".to_vec(), 0),
+        ("crème.txt".as_bytes().to_vec(), 0),
+        ("brûlée.txt".as_bytes().to_vec(), FLAG_UTF8),
+        (b"plain.txt".to_vec(), FLAG_UTF8),
+    ];
+    assert_eq!(copied, expected);
     assert_eq!(read_archive(&copy).unwrap(), read_archive(&source).unwrap());
 }
 
@@ -305,6 +308,7 @@ fn refuses_what_it_cannot_copy() {
 fn copies_an_entry_the_reader_cannot_decode() {
     let mut exotic = RawEntry::stored("exotic.bin", &noise(500, 6));
     exotic.method = 93;
+    exotic.version_needed = 63;
     exotic.uncompressed_size = 2000;
     let source = RawArchive::of(vec![exotic]).build();
     let mut reader = open(&source).unwrap();
@@ -315,11 +319,13 @@ fn copies_an_entry_the_reader_cannot_decode() {
     assert_eq!(
         (
             records[0].method,
+            records[0].version_needed,
             records[0].compressed_size,
             records[0].uncompressed_size
         ),
-        (93, 500, 2000)
+        (93, 63, 500, 2000)
     );
+    assert_eq!(copy[4..6], 63u16.to_le_bytes());
     let data_start = 30 + "exotic.bin".len();
     assert_eq!(copy[data_start..data_start + 500], noise(500, 6));
 }
@@ -351,7 +357,6 @@ fn refuses_to_grow_beyond_4_gib() {
         kind(writer.copy_entry(&mut reader, 0)),
         ErrorKind::Unsupported
     );
-    assert_eq!(kind(writer.add_directory("late/")), ErrorKind::Unsupported);
     assert_eq!(kind(writer.begin_file("late.txt")), ErrorKind::Unsupported);
     assert_eq!(kind(writer.finish()), ErrorKind::Unsupported);
 }

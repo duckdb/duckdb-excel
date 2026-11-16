@@ -124,7 +124,8 @@ fn an_archive_goes_through_duckdb_files_both_ways() {
     let payload = "payload ".repeat(50_000);
 
     let mut zip = ZipWriter::new(FileWriter::create(&file_system, file.path()).unwrap());
-    zip.add_directory("dir/").unwrap();
+    zip.begin_file("dir/").unwrap();
+    zip.end_file().unwrap();
     zip.begin_file("dir/part.xml").unwrap();
     zip.write_all(payload.as_bytes()).unwrap();
     zip.end_file().unwrap();

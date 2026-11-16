@@ -3,12 +3,12 @@
 use std::fs;
 use std::io::{self, ErrorKind, Read};
 
-use excel_zip::ZipWriter;
+use excel_zip::{ZipReader, ZipWriter};
 
-use crate::fixtures::fixture_paths;
+use crate::fixtures::fixture;
 use crate::support::{
-    FLAG_ENCRYPTED, RawArchive, RawEntry, crc32, end_records, kind, noise, open, read_entry, rows,
-    write_archive,
+    FLAG_ENCRYPTED, RawArchive, RawEntry, Sparse, Watched, crc32, end_records, kind, noise, open,
+    read_archive, read_entry, rows, write_archive,
 };
 
 fn exercise(archive: &[u8]) {
@@ -101,13 +101,11 @@ fn truncated_at_every_length() {
 #[test]
 fn every_byte_mutated() {
     let mut archives = small_archives();
-    let fixtures = fixture_paths();
     for name in [
         "gdal/with_xml_prefix.xlsx",
         "gdal/row_without_r_attribute.xlsx",
     ] {
-        let path = fixtures.iter().find(|path| path.ends_with(name)).unwrap();
-        archives.push(fs::read(path).unwrap());
+        archives.push(fs::read(fixture(name)).unwrap());
     }
     for archive in archives {
         let mut mutated = archive.clone();
@@ -150,7 +148,11 @@ fn wrong_checksum() {
         reader.read_to_end(&mut read).unwrap();
         assert!(read == content);
         assert_eq!(kind(reader.close_entry()), ErrorKind::InvalidData);
-        assert!(!reader.is_entry_open());
+        assert_eq!(
+            kind(reader.close_entry()),
+            ErrorKind::InvalidInput,
+            "the failed close closed the entry"
+        );
     }
 }
 
@@ -205,7 +207,6 @@ fn entry_that_overstates_its_size() {
         let mut read = Vec::new();
         assert_eq!(kind(reader.read_to_end(&mut read)), ErrorKind::InvalidData);
         assert!(read == content);
-        assert!(!reader.is_done());
         reader.close_entry().unwrap();
     }
 }
@@ -252,7 +253,7 @@ fn entry_data_outside_the_file() {
             ErrorKind::InvalidData,
             "compressed size {compressed_size}"
         );
-        assert!(!reader.is_entry_open());
+        assert_eq!(kind(reader.close_entry()), ErrorKind::InvalidInput);
     }
 }
 
@@ -334,7 +335,7 @@ fn unsupported_features() {
     let mut reader = open(&archive).unwrap();
     assert_eq!(kind(reader.open_entry(0)), ErrorKind::Unsupported);
     assert_eq!(kind(reader.open_entry(1)), ErrorKind::Unsupported);
-    assert!(!reader.is_entry_open());
+    assert_eq!(kind(reader.close_entry()), ErrorKind::InvalidInput);
     assert_eq!(read_entry(&mut reader, 2, 16).unwrap(), b"fine");
 }
 
@@ -403,5 +404,100 @@ fn file_that_ends_while_an_entry_is_read() {
                 "entry {index} after {reads_left} reads"
             );
         }
+    }
+}
+
+#[test]
+fn directory_cost_does_not_follow_what_the_file_states() {
+    let cases = [
+        (3 << 30, false, 1, true),
+        (3 << 30, false, 2, false),
+        (1 << 40, true, 1, true),
+        (1 << 40, true, 1 << 50, false),
+        (1 << 40, true, u64::MAX, false),
+    ];
+    for (zeros, zip64, count, readable) in cases {
+        let mut file = Sparse::new();
+        file.append(RawEntry::stored("a", b"").central_header(0));
+        file.append_zeros(zeros);
+        let len = file.len();
+        file.append(end_records(count, len, 0, zip64, b""));
+        let (file, log) = Watched::new(file);
+        match ZipReader::new(file) {
+            Ok(reader) => assert!(readable && reader.entries().len() == 1),
+            Err(error) => assert!(!readable && error.kind() == ErrorKind::InvalidData),
+        }
+        let log = log.borrow();
+        let largest_read = log.reads.iter().map(|(_, count)| *count).max();
+        assert!(
+            log.bytes_read() < 1 << 20 && largest_read < Some(1 << 18),
+            "{} bytes read, {largest_read:?} at once, for a one-entry directory",
+            log.bytes_read()
+        );
+    }
+}
+
+#[test]
+fn entry_count_that_disagrees_with_the_directory() {
+    let archive = write_archive(&[("a.txt", b"a"), ("b.txt", b"b")]);
+    let counts = archive.len() - 22 + 8;
+    let with_count = |count: u16| {
+        let mut archive = archive.clone();
+        archive[counts..counts + 2].copy_from_slice(&count.to_le_bytes());
+        archive[counts + 2..counts + 4].copy_from_slice(&count.to_le_bytes());
+        archive
+    };
+    for understated in [0, 1] {
+        let archive = with_count(understated);
+        let mut reader = open(&archive).unwrap();
+        assert_eq!(reader.entries().len(), 2, "count {understated}");
+        assert_eq!(reader.find("b.txt"), Some(1));
+        assert_eq!(read_entry(&mut reader, 1, 8).unwrap(), b"b");
+    }
+    for overstated in [3, u16::MAX] {
+        assert_eq!(
+            kind(open(&with_count(overstated))),
+            ErrorKind::InvalidData,
+            "count {overstated}"
+        );
+    }
+}
+
+#[test]
+fn directory_followed_by_something_else() {
+    let entries = vec![
+        RawEntry::stored("a.txt", b"a"),
+        RawEntry::stored("b.txt", b"b"),
+    ];
+    let mut body = Vec::new();
+    let mut directory = Vec::new();
+    for entry in &entries {
+        directory.extend_from_slice(&entry.central_header(body.len() as u64));
+        body.extend_from_slice(&entry.local_header());
+        body.extend_from_slice(&entry.data);
+    }
+    let offset = body.len() as u64;
+    let digital_signature = b"PK\x05\x05\x04\x00sign";
+    for trailer in [&digital_signature[..], &[0; 100], &[0; 3]] {
+        let mut archive = body.clone();
+        archive.extend_from_slice(&directory);
+        archive.extend_from_slice(trailer);
+        let len = (directory.len() + trailer.len()) as u64;
+        let complete = [&archive[..], &end_records(2, len, offset, false, b"")].concat();
+        assert_eq!(read_archive(&complete).unwrap().len(), 2);
+        let lacking = [&archive[..], &end_records(3, len, offset, false, b"")].concat();
+        assert_eq!(kind(open(&lacking)), ErrorKind::InvalidData);
+    }
+    for cut in [4, 45, 46, 50] {
+        let mut archive = body.clone();
+        archive.extend_from_slice(&directory);
+        archive.extend_from_slice(&directory[..cut]);
+        let len = (directory.len() + cut) as u64;
+        archive.extend_from_slice(&end_records(2, len, offset, false, b""));
+        assert_eq!(
+            kind(open(&archive)),
+            ErrorKind::InvalidData,
+            "a record cut after {cut} bytes"
+        );
     }
 }

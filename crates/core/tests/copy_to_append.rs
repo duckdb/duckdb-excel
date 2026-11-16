@@ -544,13 +544,13 @@ fn the_last_of_repeated_entries_counts_and_directories_are_dropped() {
     let base = Workbook::new().sheet("Data", &row(1, &[inline("A1", "first")]));
     let base_path = base.write("repeated_base.xlsx");
     let mut zip = ZipWriter::new(std::fs::File::create(&path).unwrap());
-    zip.add_directory("xl/").unwrap();
-    zip.add_directory("xl/worksheets/").unwrap();
     let mut add = |name: &str, content: &[u8]| {
         zip.begin_file(name).unwrap();
         zip.write_all(content).unwrap();
         zip.end_file().unwrap();
     };
+    add("xl/", b"");
+    add("xl/worksheets/", b"");
     add("xl/worksheets/sheet1.xml", b"<stale/>");
     add("docProps/custom.xml", b"<stale/>");
     add("[Content_Types].xml", b"<stale/>");

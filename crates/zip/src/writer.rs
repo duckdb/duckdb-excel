@@ -9,23 +9,22 @@ use crate::ZipReader;
 use crate::format::{
     CENTRAL_HEADER_SIGNATURE, DATA_DESCRIPTOR_SIGNATURE, END_SIGNATURE, FLAG_DATA_DESCRIPTOR,
     FLAG_UTF8, FLAGS_DEFLATE_OPTIONS, FLAGS_ENCRYPTED, LOCAL_HEADER_SIGNATURE, METHOD_DEFLATED,
-    METHOD_STORED, ZIP64_MARKER_32, misuse, put_u16, put_u32, unsupported,
+    ZIP64_MARKER_32, misuse, put_u16, put_u32, unsupported,
 };
 
 const OUTPUT_BUFFER_LEN: usize = 64 * 1024;
 const INPUT_BUFFER_LEN: usize = 32 * 1024;
-/// The backend's level 6 takes more than twice the time of level 5 for output of the same size.
-const COMPRESSION_LEVEL: u32 = 5;
+const COMPRESSION_LEVEL: u32 = 6;
 const ZIP_VERSION: u16 = 20;
 const DOS_DATE_1980_01_01: u16 = (1 << 5) | 1;
-const DOS_DIRECTORY_ATTRIBUTE: u32 = 0x10;
 const MAX_ENTRIES: u16 = 0xFFFE;
 
 /// Writes an archive front to back, without ever seeking in its output.
 ///
 /// The archive stays within the limits of the original format, because Excel does not read
-/// ZIP64: anything that would need it is refused. Once writing to the output has failed the
-/// archive is incomplete and the writer must be dropped.
+/// ZIP64: anything that would need it is refused. A call that is refused before it writes
+/// anything leaves the writer usable. Once a call has failed half-way the archive is broken
+/// and every later call fails.
 ///
 /// Small writes into a file are gathered before they reach the compressor, which is slow when
 /// fed a few bytes at a time.
@@ -36,7 +35,9 @@ pub struct ZipWriter<W: Write> {
     entry_count: u16,
     deflater: Compress,
     pending: Vec<u8>,
+    crc: crc32fast::Hasher,
     open: Option<OpenFile>,
+    broken: bool,
 }
 
 /// The archive bytes on their way out, gathered into large writes.
@@ -51,7 +52,6 @@ struct Output<W> {
 struct OpenFile {
     header: Header,
     data_offset: u64,
-    crc: crc32fast::Hasher,
 }
 
 #[derive(Debug)]
@@ -65,6 +65,7 @@ struct Header {
     compressed_size: u32,
     uncompressed_size: u32,
     version_made_by: u16,
+    version_needed: u16,
     internal_attributes: u16,
     external_attributes: u32,
     offset: u32,
@@ -82,61 +83,67 @@ impl<W: Write> ZipWriter<W> {
             entry_count: 0,
             deflater: Compress::new(Compression::new(COMPRESSION_LEVEL), false),
             pending: Vec::with_capacity(INPUT_BUFFER_LEN),
+            crc: crc32fast::Hasher::new(),
             open: None,
+            broken: false,
         }
-    }
-
-    /// Adds an empty directory entry; `name` must end with a slash.
-    pub fn add_directory(&mut self, name: &str) -> io::Result<()> {
-        if !name.ends_with('/') {
-            return Err(misuse(format!(
-                "ZIP directory name '{name}' must end with a slash"
-            )));
-        }
-        let mut header = self.begin_entry(name.as_bytes(), !name.is_ascii())?;
-        header.external_attributes = DOS_DIRECTORY_ATTRIBUTE;
-        self.output.emit(&header.local())?;
-        self.end_entry(&header);
-        Ok(())
     }
 
     /// Starts a deflated entry that receives everything written through [`Write`] until [`Self::end_file`].
     pub fn begin_file(&mut self, name: &str) -> io::Result<()> {
-        let mut header = self.begin_entry(name.as_bytes(), !name.is_ascii())?;
-        header.flags |= FLAG_DATA_DESCRIPTOR;
-        header.method = METHOD_DEFLATED;
-        self.output.emit(&header.local())?;
-        self.deflater.reset();
-        self.open = Some(OpenFile {
-            header,
-            data_offset: self.output.offset,
-            crc: crc32fast::Hasher::new(),
-        });
-        Ok(())
+        let offset = self.next_entry_offset(name.as_bytes())?;
+        let utf8 = if name.is_ascii() { 0 } else { FLAG_UTF8 };
+        let header = Header {
+            name: name.as_bytes().to_vec(),
+            flags: FLAG_DATA_DESCRIPTOR | utf8,
+            method: METHOD_DEFLATED,
+            dos_time: 0,
+            dos_date: DOS_DATE_1980_01_01,
+            crc32: 0,
+            compressed_size: 0,
+            uncompressed_size: 0,
+            version_made_by: ZIP_VERSION,
+            version_needed: ZIP_VERSION,
+            internal_attributes: 0,
+            external_attributes: 0,
+            offset,
+        };
+        self.commit(|writer| {
+            writer.output.emit(&header.local())?;
+            writer.deflater.reset();
+            let data_offset = writer.output.offset;
+            writer.open = Some(OpenFile {
+                header,
+                data_offset,
+            });
+            Ok(())
+        })
     }
 
     pub fn end_file(&mut self) -> io::Result<()> {
-        self.compress_pending()?;
+        self.ensure_intact()?;
         let Some(OpenFile {
             mut header,
             data_offset,
-            crc,
         }) = self.open.take()
         else {
             return Err(misuse("cannot end a ZIP entry when none is open"));
         };
-        self.output.deflate(&mut self.deflater, &[], true)?;
-        header.crc32 = crc.finalize();
-        header.compressed_size =
-            classic(self.output.offset - data_offset).ok_or_else(|| header.too_large())?;
-        let mut descriptor = Vec::with_capacity(16);
-        put_u32(&mut descriptor, DATA_DESCRIPTOR_SIGNATURE);
-        put_u32(&mut descriptor, header.crc32);
-        put_u32(&mut descriptor, header.compressed_size);
-        put_u32(&mut descriptor, header.uncompressed_size);
-        self.output.emit(&descriptor)?;
-        self.end_entry(&header);
-        Ok(())
+        self.commit(|writer| {
+            writer.compress_pending()?;
+            writer.output.deflate(&mut writer.deflater, &[], true)?;
+            header.crc32 = std::mem::take(&mut writer.crc).finalize();
+            header.compressed_size =
+                classic(writer.output.offset - data_offset).ok_or_else(|| header.too_large())?;
+            let mut descriptor = Vec::with_capacity(16);
+            put_u32(&mut descriptor, DATA_DESCRIPTOR_SIGNATURE);
+            put_u32(&mut descriptor, header.crc32);
+            put_u32(&mut descriptor, header.compressed_size);
+            put_u32(&mut descriptor, header.uncompressed_size);
+            writer.output.emit(&descriptor)?;
+            writer.end_entry(&header);
+            Ok(())
+        })
     }
 
     /// Copies entry `index` of `source` as it is stored, without recompressing it.
@@ -145,6 +152,7 @@ impl<W: Write> ZipWriter<W> {
         source: &mut ZipReader<R>,
         index: usize,
     ) -> io::Result<()> {
+        self.ensure_intact()?;
         let (entry, record) = source.stored_entry(index)?;
         if record.flags & FLAGS_ENCRYPTED != 0 {
             return Err(unsupported(format!(
@@ -153,30 +161,35 @@ impl<W: Write> ZipWriter<W> {
             )));
         }
         let name = record.raw_name.as_deref().unwrap_or(entry.name.as_bytes());
-        let utf8 =
-            record.flags & FLAG_UTF8 != 0 || (record.raw_name.is_none() && !entry.name.is_ascii());
-        let mut header = self.begin_entry(name, utf8)?;
-        header.flags |= record.flags & FLAGS_DEFLATE_OPTIONS;
-        header.method = record.method;
-        header.dos_time = record.dos_time;
-        header.dos_date = record.dos_date;
-        header.crc32 = entry.crc32;
-        header.compressed_size =
-            classic(entry.compressed_size).ok_or_else(|| header.too_large())?;
-        header.uncompressed_size =
-            classic(entry.uncompressed_size).ok_or_else(|| header.too_large())?;
-        header.version_made_by = record.version_made_by;
-        header.internal_attributes = record.internal_attributes;
-        header.external_attributes = record.external_attributes;
+        let offset = self.next_entry_offset(name)?;
+        let too_large = || entry_too_large(&entry.name);
+        let header = Header {
+            name: name.to_vec(),
+            flags: record.flags & (FLAGS_DEFLATE_OPTIONS | FLAG_UTF8),
+            method: record.method,
+            dos_time: record.dos_time,
+            dos_date: record.dos_date,
+            crc32: entry.crc32,
+            compressed_size: classic(entry.compressed_size).ok_or_else(too_large)?,
+            uncompressed_size: classic(entry.uncompressed_size).ok_or_else(too_large)?,
+            version_made_by: record.version_made_by,
+            version_needed: record.version_needed.max(ZIP_VERSION),
+            internal_attributes: record.internal_attributes,
+            external_attributes: record.external_attributes,
+            offset,
+        };
         source.locate_raw(index)?;
-        self.output.emit(&header.local())?;
-        source.drain_raw(|bytes| self.output.emit(bytes))?;
-        self.end_entry(&header);
-        Ok(())
+        self.commit(|writer| {
+            writer.output.emit(&header.local())?;
+            source.drain_raw(|bytes| writer.output.emit(bytes))?;
+            writer.end_entry(&header);
+            Ok(())
+        })
     }
 
     /// Writes the central directory and returns the output; fails while an entry is open.
     pub fn finish(mut self) -> io::Result<W> {
+        self.ensure_intact()?;
         if self.open.is_some() {
             return Err(misuse("cannot finish a ZIP archive while an entry is open"));
         }
@@ -199,7 +212,23 @@ impl<W: Write> ZipWriter<W> {
         Ok(self.output.inner)
     }
 
-    fn begin_entry(&self, name: &[u8], utf8: bool) -> io::Result<Header> {
+    fn ensure_intact(&self) -> io::Result<()> {
+        if self.broken {
+            return Err(io::Error::other(
+                "the ZIP archive is broken because writing it failed earlier",
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit<T>(&mut self, step: impl FnOnce(&mut Self) -> io::Result<T>) -> io::Result<T> {
+        let result = step(self);
+        self.broken |= result.is_err();
+        result
+    }
+
+    fn next_entry_offset(&self, name: &[u8]) -> io::Result<u32> {
+        self.ensure_intact()?;
         if self.open.is_some() {
             return Err(misuse("cannot start a ZIP entry while another one is open"));
         }
@@ -211,20 +240,7 @@ impl<W: Write> ZipWriter<W> {
                 "the ZIP archive holds more than {MAX_ENTRIES} entries"
             )));
         }
-        Ok(Header {
-            name: name.to_vec(),
-            flags: if utf8 { FLAG_UTF8 } else { 0 },
-            method: METHOD_STORED,
-            dos_time: 0,
-            dos_date: DOS_DATE_1980_01_01,
-            crc32: 0,
-            compressed_size: 0,
-            uncompressed_size: 0,
-            version_made_by: ZIP_VERSION,
-            internal_attributes: 0,
-            external_attributes: 0,
-            offset: classic(self.output.offset).ok_or_else(archive_too_large)?,
-        })
+        classic(self.output.offset).ok_or_else(archive_too_large)
     }
 
     fn end_entry(&mut self, header: &Header) {
@@ -233,9 +249,7 @@ impl<W: Write> ZipWriter<W> {
     }
 
     fn compress_pending(&mut self) -> io::Result<()> {
-        if let Some(open) = self.open.as_mut() {
-            open.crc.update(&self.pending);
-        }
+        self.crc.update(&self.pending);
         let result = self
             .output
             .deflate(&mut self.deflater, &self.pending, false);
@@ -280,17 +294,21 @@ impl<W: Write> Output<W> {
         Ok(())
     }
 
-    fn emit(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if bytes.len() > self.buffer.capacity() - self.buffer.len() {
-            self.drain()?;
-        }
-        if bytes.len() >= self.buffer.capacity() {
-            self.inner.write_all(bytes)?;
-        } else {
-            self.buffer.extend_from_slice(bytes);
-        }
+    fn emit(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         self.offset += bytes.len() as u64;
-        Ok(())
+        loop {
+            let space = self.buffer.capacity() - self.buffer.len();
+            if self.buffer.is_empty() && bytes.len() >= space {
+                return self.inner.write_all(bytes);
+            }
+            let (fitting, rest) = bytes.split_at(space.min(bytes.len()));
+            self.buffer.extend_from_slice(fitting);
+            if rest.is_empty() {
+                return Ok(());
+            }
+            self.drain()?;
+            bytes = rest;
+        }
     }
 
     fn drain(&mut self) -> io::Result<()> {
@@ -303,6 +321,7 @@ impl<W: Write> Output<W> {
 /// Writes into the entry started by [`ZipWriter::begin_file`].
 impl<W: Write> Write for ZipWriter<W> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.ensure_intact()?;
         let Some(open) = self.open.as_mut() else {
             return Err(misuse(
                 "cannot write to a ZIP archive without an open entry",
@@ -312,32 +331,34 @@ impl<W: Write> Write for ZipWriter<W> {
         header.uncompressed_size =
             classic(u64::from(header.uncompressed_size).saturating_add(buffer.len() as u64))
                 .ok_or_else(|| header.too_large())?;
-        if buffer.len() > self.pending.capacity() - self.pending.len() {
-            self.compress_pending()?;
-        }
-        if buffer.len() < self.pending.capacity() {
-            self.pending.extend_from_slice(buffer);
-        } else if let Some(open) = self.open.as_mut() {
-            open.crc.update(buffer);
-            self.output.deflate(&mut self.deflater, buffer, false)?;
-        }
-        Ok(buffer.len())
+        self.commit(|writer| {
+            if buffer.len() > writer.pending.capacity() - writer.pending.len() {
+                writer.compress_pending()?;
+            }
+            if buffer.len() < writer.pending.capacity() {
+                writer.pending.extend_from_slice(buffer);
+            } else {
+                writer.crc.update(buffer);
+                writer.output.deflate(&mut writer.deflater, buffer, false)?;
+            }
+            Ok(buffer.len())
+        })
     }
 
     /// Pushes the archive bytes produced so far; input the compressor still holds follows later.
     fn flush(&mut self) -> io::Result<()> {
-        self.compress_pending()?;
-        self.output.drain()?;
-        self.output.inner.flush()
+        self.ensure_intact()?;
+        self.commit(|writer| {
+            writer.compress_pending()?;
+            writer.output.drain()?;
+            writer.output.inner.flush()
+        })
     }
 }
 
 impl Header {
     fn too_large(&self) -> io::Error {
-        needs_zip64(format!(
-            "ZIP entry '{}' is larger than 4 GiB",
-            String::from_utf8_lossy(&self.name)
-        ))
+        entry_too_large(&String::from_utf8_lossy(&self.name))
     }
 
     fn local(&self) -> Vec<u8> {
@@ -363,7 +384,7 @@ impl Header {
     }
 
     fn append_common(&self, out: &mut Vec<u8>) {
-        put_u16(out, ZIP_VERSION);
+        put_u16(out, self.version_needed);
         put_u16(out, self.flags);
         put_u16(out, self.method);
         put_u16(out, self.dos_time);
@@ -379,6 +400,10 @@ fn classic(value: u64) -> Option<u32> {
     u32::try_from(value)
         .ok()
         .filter(|value| *value != ZIP64_MARKER_32)
+}
+
+fn entry_too_large(name: &str) -> io::Error {
+    needs_zip64(format!("ZIP entry '{name}' is larger than 4 GiB"))
 }
 
 fn archive_too_large() -> io::Error {

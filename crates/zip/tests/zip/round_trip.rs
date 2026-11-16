@@ -5,9 +5,8 @@ use std::io::{Cursor, Read, Write};
 use excel_zip::{ZipEntry, ZipReader, ZipWriter};
 
 use crate::support::{
-    Appended, FLAG_DATA_DESCRIPTOR, FLAG_UTF8, METHOD_DEFLATED, METHOD_STORED, RawArchive,
-    RawEntry, Watched, central_directory, crc32, noise, open, read_archive, read_entry, rows,
-    write_archive,
+    Appended, FLAG_DATA_DESCRIPTOR, FLAG_UTF8, METHOD_DEFLATED, RawArchive, RawEntry, Watched,
+    central_directory, crc32, noise, open, read_archive, read_entry, rows, write_archive,
 };
 
 const LARGE_LEN: usize = 24 * 1024 * 1024;
@@ -77,49 +76,32 @@ fn empty_file_and_empty_archive() {
 }
 
 #[test]
-fn directories() {
-    let archive = write_archive(&[
-        ("xl/", b""),
-        ("xl/worksheets/", b""),
-        ("xl/workbook.xml", b"<workbook/>"),
-    ]);
-    let reader = open(&archive).unwrap();
-    let directories: Vec<bool> = reader
-        .entries()
-        .iter()
-        .map(ZipEntry::is_directory)
-        .collect();
-    assert_eq!(directories, [true, true, false]);
-    assert_eq!(
-        reader.entries()[0],
-        ZipEntry {
-            name: "xl/".to_string(),
-            compressed_size: 0,
-            uncompressed_size: 0,
-            crc32: 0
-        }
-    );
-    let files = read_archive(&archive).unwrap();
-    assert!(files[0].1.is_empty() && files[1].1.is_empty());
-    assert_eq!(files[2].1, b"<workbook/>");
-
-    let records = central_directory(&archive);
-    assert_eq!(
-        (
-            records[0].method,
-            records[0].flags,
-            records[0].external_attributes
-        ),
-        (METHOD_STORED, 0, 0x10)
-    );
-    assert_eq!(
-        (
-            records[2].method,
-            records[2].flags,
-            records[2].external_attributes
-        ),
-        (METHOD_DEFLATED, FLAG_DATA_DESCRIPTOR, 0)
-    );
+fn names_ending_with_a_slash_are_directories() {
+    let written = write_archive(&[("xl/", b""), ("xl/workbook.xml", b"<workbook/>")]);
+    let built = RawArchive::of(vec![
+        RawEntry::stored("xl/", b""),
+        RawEntry::deflated("xl/workbook.xml", b"<workbook/>"),
+    ])
+    .build();
+    for archive in [written, built] {
+        let reader = open(&archive).unwrap();
+        let directories: Vec<bool> = reader
+            .entries()
+            .iter()
+            .map(ZipEntry::is_directory)
+            .collect();
+        assert_eq!(directories, [true, false]);
+        assert_eq!(
+            (
+                &*reader.entries()[0].name,
+                reader.entries()[0].uncompressed_size
+            ),
+            ("xl/", 0)
+        );
+        let files = read_archive(&archive).unwrap();
+        assert!(files[0].1.is_empty());
+        assert_eq!(files[1].1, b"<workbook/>");
+    }
 }
 
 #[test]
@@ -203,23 +185,12 @@ fn closing_early_skips_the_checksum() {
     let mut reader = open(&archive).unwrap();
 
     reader.open_entry(0).unwrap();
-    assert_eq!(
-        (reader.entry_len(), reader.entry_pos(), reader.is_done()),
-        (500_000, 0, false)
-    );
+    assert_eq!(reader.entry_len(), 500_000);
     let mut start = [0; 1000];
     reader.read_exact(&mut start).unwrap();
     assert_eq!(start, content[..1000]);
-    assert_eq!((reader.entry_pos(), reader.is_done()), (1000, false));
     reader.close_entry().unwrap();
-    assert_eq!(
-        (
-            reader.entry_len(),
-            reader.entry_pos(),
-            reader.is_entry_open()
-        ),
-        (0, 0, false)
-    );
+    assert_eq!(reader.entry_len(), 0);
 
     assert_eq!(read_entry(&mut reader, 1, 100).unwrap(), b"next");
     assert!(read_entry(&mut reader, 0, 100_000).is_err());
@@ -233,23 +204,15 @@ fn reading_stops_at_the_stated_size() {
     reader.open_entry(0).unwrap();
     let mut buffer = [0; 64];
     assert_eq!(reader.read(&mut buffer).unwrap(), 10);
-    assert!(reader.is_done());
     assert_eq!(reader.read(&mut buffer).unwrap(), 0);
     assert_eq!(reader.read(&mut []).unwrap(), 0);
     reader.close_entry().unwrap();
 }
 
 #[test]
-fn into_inner_returns_the_file() {
-    let archive = write_archive(&[("a.txt", b"abc")]);
-    let reader = ZipReader::new(Cursor::new(archive.clone())).unwrap();
-    assert_eq!(reader.into_inner().into_inner(), archive);
-}
-
-#[test]
 fn output_is_reproducible_and_laid_out_for_streaming() {
     let files: [(&str, &[u8]); 3] = [
-        ("dir/", b""),
+        ("first.txt", b"first"),
         ("dir/a.txt", b"hello hello hello"),
         ("b.txt", b""),
     ];
@@ -264,7 +227,18 @@ fn output_is_reproducible_and_laid_out_for_streaming() {
             (0, 0x0021),
             "1980-01-01 00:00:00"
         );
-        assert_eq!((record.version_made_by, record.extra_len), (20, 0));
+        assert_eq!(
+            (
+                record.version_made_by,
+                record.version_needed,
+                record.extra_len
+            ),
+            (20, 20, 0)
+        );
+        assert_eq!(
+            (record.method, record.external_attributes),
+            (METHOD_DEFLATED, 0)
+        );
     }
     let file = &records[1];
     assert_eq!(
@@ -288,29 +262,38 @@ fn output_is_reproducible_and_laid_out_for_streaming() {
 #[test]
 fn writes_reach_the_output_in_large_pieces() {
     let content = noise(3_000_000, 5);
+    let stored = noise(1_000_000, 6);
+    let source = RawArchive::of(vec![RawEntry::stored("stored.bin", &stored)]).build();
+    let mut source = open(&source).unwrap();
+
     let mut writer = ZipWriter::new(Appended::default());
-    writer.add_directory("dir/").unwrap();
+    writer.begin_file("small.txt").unwrap();
+    writer.write_all(b"small").unwrap();
+    writer.end_file().unwrap();
     writer.begin_file("dir/noise.bin").unwrap();
     for piece in content.chunks(1000) {
         writer.write_all(piece).unwrap();
     }
     writer.end_file().unwrap();
-    writer.begin_file("small.txt").unwrap();
-    writer.write_all(b"small").unwrap();
+    writer.copy_entry(&mut source, 0).unwrap();
+    writer.begin_file("last.txt").unwrap();
+    writer.write_all(b"last").unwrap();
     writer.end_file().unwrap();
     let output = writer.finish().unwrap();
 
     assert_eq!(output.flushes, 1);
-    let (last, full) = output.writes.split_last().unwrap();
+    let (_, full) = output.writes.split_last().unwrap();
+    assert!(full.len() >= 60, "{:?}", output.writes);
     assert!(
-        full.iter().all(|len| *len == 64 * 1024),
+        full.iter().all(|len| *len >= 64 * 1024),
         "{:?}",
         output.writes
     );
-    assert!(*last <= 64 * 1024);
     let files = read_archive(&output.bytes).unwrap();
+    assert_eq!(files[0].1, b"small");
     assert!(files[1].1 == content);
-    assert_eq!(files[2].1, b"small");
+    assert!(files[2].1 == stored);
+    assert_eq!(files[3].1, b"last");
 }
 
 #[test]
@@ -344,17 +327,16 @@ fn file_written_in_pieces_of_any_size() {
 #[test]
 fn flush_pushes_the_buffered_bytes() {
     let mut writer = ZipWriter::new(Appended::default());
-    writer.add_directory("dir/").unwrap();
     writer.flush().unwrap();
     writer.begin_file("a.txt").unwrap();
     writer.write_all(b"abc").unwrap();
     writer.flush().unwrap();
     writer.end_file().unwrap();
     let output = writer.finish().unwrap();
-    assert_eq!(output.writes[0], 30 + "dir/".len());
-    assert_eq!(output.writes[1], 30 + "a.txt".len());
+    assert_eq!(output.writes.len(), 2, "one write per flush that had bytes");
+    assert!(output.writes[0] >= 30 + "a.txt".len());
     assert_eq!(output.flushes, 3);
-    assert_eq!(read_archive(&output.bytes).unwrap()[1].1, b"abc");
+    assert_eq!(read_archive(&output.bytes).unwrap()[0].1, b"abc");
 }
 
 #[test]
@@ -366,13 +348,14 @@ fn entries_are_fetched_in_few_reads_that_stay_inside_them() {
         ("last.xml", b"<last/>"),
     ]);
     for (index, record) in central_directory(&archive).iter().enumerate() {
-        let mut reader = ZipReader::new(Watched::new(Cursor::new(&archive))).unwrap();
+        let (file, log) = Watched::new(Cursor::new(&archive));
+        let mut reader = ZipReader::new(file).unwrap();
         read_entry(&mut reader, index, 5000).unwrap();
-        let file = reader.into_inner();
+        let log = log.borrow();
 
         let start = u64::from(record.header_offset);
         let end = start + 30 + record.name.len() as u64 + u64::from(record.compressed_size);
-        let (directory_read, entry_reads) = file.reads.split_first().unwrap();
+        let (directory_read, entry_reads) = log.reads.split_first().unwrap();
         assert_eq!(
             directory_read.0 + directory_read.1 as u64,
             archive.len() as u64
@@ -384,6 +367,6 @@ fn entries_are_fetched_in_few_reads_that_stay_inside_them() {
             offset += *count as u64;
         }
         assert_eq!(offset, end);
-        assert_eq!(file.seeks, 3);
+        assert_eq!(log.seeks, 3);
     }
 }

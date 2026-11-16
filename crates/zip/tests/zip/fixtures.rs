@@ -26,9 +26,14 @@ pub fn fixture_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     collect(&root, &mut paths);
     paths.sort();
-    assert!(paths.iter().any(|path| path.ends_with("basic.xlsx")));
-    assert!(paths.iter().any(|path| path.ends_with("gdal/test.xlsx")));
     paths
+}
+
+pub fn fixture(name: &str) -> PathBuf {
+    let found = fixture_paths()
+        .into_iter()
+        .find(|path| path.ends_with(name));
+    found.unwrap_or_else(|| panic!("no fixture {name}"))
 }
 
 #[test]
@@ -53,15 +58,12 @@ fn every_fixture_reads_with_valid_checksums() {
 
 #[test]
 fn fixtures_cover_data_descriptors_and_plain_headers() {
-    let (mut with_descriptor, mut without_descriptor) = (0, 0);
-    for path in fixture_paths() {
-        for record in central_directory(&fs::read(&path).unwrap()) {
-            if record.flags & FLAG_DATA_DESCRIPTOR != 0 {
-                with_descriptor += 1;
-            } else {
-                without_descriptor += 1;
-            }
-        }
-    }
-    assert!(with_descriptor > 0 && without_descriptor > 0);
+    let uses_descriptors = |name: &str| -> Vec<bool> {
+        central_directory(&fs::read(fixture(name)).unwrap())
+            .iter()
+            .map(|record| record.flags & FLAG_DATA_DESCRIPTOR != 0)
+            .collect()
+    };
+    assert!(uses_descriptors("gdal/test.xlsx").iter().all(|used| *used));
+    assert!(uses_descriptors("basic.xlsx").iter().all(|used| !*used));
 }

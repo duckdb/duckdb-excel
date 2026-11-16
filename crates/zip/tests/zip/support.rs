@@ -1,6 +1,8 @@
 //! Deterministic test data, hand-built archives and instrumented I/O.
 
+use std::cell::RefCell;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::rc::Rc;
 
 use excel_zip::{ZipReader, ZipWriter};
 use flate2::{Compress, Compression, FlushCompress, Status};
@@ -42,17 +44,13 @@ pub fn rows(len: usize) -> Vec<u8> {
     bytes
 }
 
-/// Writes an archive with this crate; names ending with a slash become directories.
+/// Writes an archive with this crate.
 pub fn write_archive(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut writer = ZipWriter::new(Vec::new());
     for (name, content) in files {
-        if name.ends_with('/') {
-            writer.add_directory(name).unwrap();
-        } else {
-            writer.begin_file(name).unwrap();
-            writer.write_all(content).unwrap();
-            writer.end_file().unwrap();
-        }
+        writer.begin_file(name).unwrap();
+        writer.write_all(content).unwrap();
+        writer.end_file().unwrap();
     }
     writer.finish().unwrap()
 }
@@ -84,12 +82,10 @@ pub fn read_entry<R: Read + Seek>(
             break;
         }
         content.extend_from_slice(&chunk[..count]);
-        assert_eq!(reader.entry_pos(), content.len() as u64);
-        assert!(reader.entry_pos() <= stated);
+        assert!(content.len() as u64 <= stated);
     }
-    assert!(reader.is_done());
+    assert_eq!(content.len() as u64, stated);
     reader.close_entry()?;
-    assert!(!reader.is_entry_open());
     Ok(content)
 }
 
@@ -139,6 +135,7 @@ pub struct RawEntry {
     pub zip64_sizes: bool,
     pub zip64_offset: bool,
     pub version_made_by: u16,
+    pub version_needed: u16,
     pub external_attributes: u32,
 }
 
@@ -159,6 +156,7 @@ impl RawEntry {
             zip64_sizes: false,
             zip64_offset: false,
             version_made_by: 20,
+            version_needed: 20,
             external_attributes: 0,
         }
     }
@@ -191,7 +189,7 @@ impl RawEntry {
         };
         let mut out = Vec::new();
         out.extend_from_slice(b"PK\x03\x04");
-        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&self.version_needed.to_le_bytes());
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&self.method.to_le_bytes());
         out.extend_from_slice(&self.dos_time.to_le_bytes());
@@ -247,7 +245,7 @@ impl RawEntry {
         let mut out = Vec::new();
         out.extend_from_slice(b"PK\x01\x02");
         out.extend_from_slice(&self.version_made_by.to_le_bytes());
-        out.extend_from_slice(&20u16.to_le_bytes());
+        out.extend_from_slice(&self.version_needed.to_le_bytes());
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&self.method.to_le_bytes());
         out.extend_from_slice(&self.dos_time.to_le_bytes());
@@ -351,6 +349,7 @@ impl RawArchive {
 pub struct Central {
     pub name: Vec<u8>,
     pub version_made_by: u16,
+    pub version_needed: u16,
     pub flags: u16,
     pub method: u16,
     pub dos_time: u16,
@@ -387,6 +386,7 @@ pub fn central_directory(bytes: &[u8]) -> Vec<Central> {
         records.push(Central {
             name: bytes[at + 46..at + 46 + name_len].to_vec(),
             version_made_by: u16_at(bytes, at + 4),
+            version_needed: u16_at(bytes, at + 6),
             flags: u16_at(bytes, at + 8),
             method: u16_at(bytes, at + 10),
             dos_time: u16_at(bytes, at + 12),
@@ -404,46 +404,77 @@ pub fn central_directory(bytes: &[u8]) -> Vec<Central> {
     records
 }
 
-/// A file that records how it is read: where every read started and how much it returned.
-pub struct Watched<R> {
-    inner: R,
-    limit: Option<usize>,
+/// What a watched file was asked for: where every read started and how much it returned.
+#[derive(Default)]
+pub struct ReadLog {
     pub reads: Vec<(u64, usize)>,
     pub seeks: usize,
 }
 
+impl ReadLog {
+    pub fn bytes_read(&self) -> u64 {
+        self.reads.iter().map(|(_, count)| *count as u64).sum()
+    }
+}
+
+/// A file that records how it is read, in a log that outlives the reader owning the file.
+pub struct Watched<R> {
+    inner: R,
+    limit: Option<usize>,
+    failing_read: Option<usize>,
+    log: Rc<RefCell<ReadLog>>,
+}
+
 impl<R> Watched<R> {
-    pub fn new(inner: R) -> Self {
-        Watched {
+    pub fn new(inner: R) -> (Self, Rc<RefCell<ReadLog>>) {
+        let log = Rc::new(RefCell::new(ReadLog::default()));
+        let file = Watched {
             inner,
             limit: None,
-            reads: Vec::new(),
-            seeks: 0,
-        }
+            failing_read: None,
+            log: Rc::clone(&log),
+        };
+        (file, log)
     }
 
     /// Hands out at most `limit` bytes per read, like a slow network file.
     pub fn trickling(inner: R, limit: usize) -> Self {
         Watched {
             limit: Some(limit),
-            ..Watched::new(inner)
+            ..Watched::new(inner).0
+        }
+    }
+
+    /// Fails the read with this index, counted from zero, and serves all others.
+    pub fn failing(inner: R, failing_read: usize) -> Self {
+        Watched {
+            failing_read: Some(failing_read),
+            ..Watched::new(inner).0
         }
     }
 }
 
 impl<R: Read + Seek> Read for Watched<R> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut log = self.log.borrow_mut();
+        if self.failing_read == Some(log.reads.len()) {
+            log.reads.push((self.inner.stream_position()?, 0));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the connection dropped",
+            ));
+        }
         let offset = self.inner.stream_position()?;
         let limit = self.limit.unwrap_or(buffer.len()).min(buffer.len());
         let count = self.inner.read(&mut buffer[..limit])?;
-        self.reads.push((offset, count));
+        log.reads.push((offset, count));
         Ok(count)
     }
 }
 
 impl<R: Seek> Seek for Watched<R> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        self.seeks += 1;
+        self.log.borrow_mut().seeks += 1;
         self.inner.seek(position)
     }
 }
@@ -507,16 +538,35 @@ impl Seek for Sparse {
     }
 }
 
-/// An output that cannot seek and records the size of every write it receives.
+/// An output that cannot seek and records the size of every write; one chosen write can fail.
 #[derive(Default)]
 pub struct Appended {
     pub bytes: Vec<u8>,
     pub writes: Vec<usize>,
     pub flushes: usize,
+    pub failing_write: Option<usize>,
+    attempts: usize,
+}
+
+impl Appended {
+    /// Fails the write with this index, counted from zero, and accepts all others.
+    pub fn failing(failing_write: usize) -> Self {
+        Appended {
+            failing_write: Some(failing_write),
+            ..Appended::default()
+        }
+    }
 }
 
 impl Write for Appended {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.attempts += 1;
+        if self.failing_write == Some(self.attempts - 1) {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "the disk is full",
+            ));
+        }
         self.writes.push(buffer.len());
         self.bytes.extend_from_slice(buffer);
         Ok(buffer.len())
