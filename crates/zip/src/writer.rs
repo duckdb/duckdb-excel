@@ -14,7 +14,8 @@ use crate::format::{
 
 const OUTPUT_BUFFER_LEN: usize = 64 * 1024;
 const INPUT_BUFFER_LEN: usize = 32 * 1024;
-const COMPRESSION_LEVEL: u32 = 6;
+/// The backend's level 6 takes more than twice the time of level 5 for output of the same size.
+const COMPRESSION_LEVEL: u32 = 5;
 const ZIP_VERSION: u16 = 20;
 const DOS_DATE_1980_01_01: u16 = (1 << 5) | 1;
 const DOS_DIRECTORY_ATTRIBUTE: u32 = 0x10;
