@@ -241,8 +241,9 @@ fn retry(files: &impl FileOperations, mut operation: impl FnMut() -> Result<()>)
 /// The move replaces the workbook in one step where the file system can do that. Where it cannot, the
 /// workbook is removed first; if the move then still fails, the file is the only copy of the workbook and is
 /// kept. In every other case the file is removed when the append does not get to its end. DuckDB's file
-/// system is only there during a callback, so a statement that ends without one is cleaned up after through
-/// the file system of the operating system.
+/// system is only there during a callback, so a statement that ends without one is cleaned up through the
+/// file system of the operating system when DuckDB releases its state, which can be on another thread
+/// after the statement has returned.
 #[derive(Debug)]
 struct SiblingFile {
     path: String,

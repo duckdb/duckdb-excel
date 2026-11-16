@@ -5,6 +5,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 
 use duckdb_neo::{
@@ -157,6 +158,19 @@ impl TempDir {
             .collect();
         names.sort();
         names
+    }
+
+    /// The file names once only `expected` are left, or what is there after ten seconds. DuckDB can release
+    /// what a failed statement held on another thread, after the statement has returned.
+    pub fn file_names_after_failure(&self, expected: &[&str]) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let names = self.file_names();
+            if names == expected || Instant::now() >= deadline {
+                return names;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 

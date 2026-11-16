@@ -198,7 +198,7 @@ fn options_of_the_wrong_kind_are_binder_errors() {
             "{options}"
         );
     }
-    assert!(directory.file_names().is_empty());
+    assert!(directory.file_names_after_failure(&[]).is_empty());
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn of_several_wrong_options_the_first_of_a_fixed_order_is_reported() {
         ),
         sheet
     );
-    assert!(directory.file_names().is_empty());
+    assert!(directory.file_names_after_failure(&[]).is_empty());
 }
 
 #[test]
@@ -331,7 +331,10 @@ fn the_sheet_row_limit() {
             short(limit),
             "{rows} rows{options}"
         );
-        assert!(directory.file_names().is_empty(), "{rows} rows{options}");
+        assert!(
+            directory.file_names_after_failure(&[]).is_empty(),
+            "{rows} rows{options}"
+        );
     }
     for (rows, options) in [
         (2049, ", sheet_row_limit 2049"),
@@ -376,7 +379,7 @@ fn a_sheet_holds_as_many_rows_as_a_spreadsheet_shows() {
          * You can export larger sheets at your own risk by setting the 'sheet_row_limit' parameter to a \
          higher value"
     );
-    assert!(directory.file_names().is_empty());
+    assert!(directory.file_names_after_failure(&[]).is_empty());
 
     copy(&connection, "SELECT i FROM range(1048576) t(i)", &path, "");
     assert_eq!(
@@ -914,7 +917,7 @@ fn a_failing_query_leaves_no_workbook() {
         "",
     );
     assert!(error.starts_with("Conversion Error"), "{error}");
-    assert!(directory.file_names().is_empty());
+    assert!(directory.file_names_after_failure(&[]).is_empty());
 
     let error = copy_error(
         &connection,

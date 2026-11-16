@@ -344,7 +344,11 @@ fn sheet_names_must_fit_the_mode() {
             );
         }
         assert_eq!(std::fs::read(&path).unwrap(), original, "{temporary}");
-        assert_eq!(directory.file_names(), ["book.xlsx"], "{temporary}");
+        assert_eq!(
+            directory.file_names_after_failure(&["book.xlsx"]),
+            ["book.xlsx"],
+            "{temporary}"
+        );
     }
 }
 
@@ -374,7 +378,11 @@ fn a_failed_append_leaves_the_workbook_as_it_was() {
                 "Invalid Input Error: XLSX: Sheet row limit of '3000' rows exceeded!",
                 "{context}"
             );
-            assert_eq!(directory.file_names(), ["book.xlsx"], "{context}");
+            assert_eq!(
+                directory.file_names_after_failure(&["book.xlsx"]),
+                ["book.xlsx"],
+                "{context}"
+            );
             let error = copy_error(
                 &connection,
                 "SELECT i::UTINYINT AS small FROM range(100000) t(i)",
@@ -382,7 +390,11 @@ fn a_failed_append_leaves_the_workbook_as_it_was() {
                 &options,
             );
             assert!(error.starts_with("Conversion Error"), "{context}: {error}");
-            assert_eq!(directory.file_names(), ["book.xlsx"], "{context}");
+            assert_eq!(
+                directory.file_names_after_failure(&["book.xlsx"]),
+                ["book.xlsx"],
+                "{context}"
+            );
             let error = copy_error(
                 &connection,
                 "SELECT 'x' AS a",
@@ -393,7 +405,11 @@ fn a_failed_append_leaves_the_workbook_as_it_was() {
                 error, "Invalid Input Error: XLSX: Sheet row limit of '0' rows exceeded!",
                 "{context}"
             );
-            assert_eq!(directory.file_names(), ["book.xlsx"], "{context}");
+            assert_eq!(
+                directory.file_names_after_failure(&["book.xlsx"]),
+                ["book.xlsx"],
+                "{context}"
+            );
             assert_eq!(std::fs::read(&path).unwrap(), original, "{context}");
         }
     }
@@ -705,7 +721,11 @@ fn workbooks_that_lack_what_a_new_sheet_needs() {
                 "{part}: {content}{temporary}"
             );
             assert_eq!(std::fs::read(&path).unwrap(), original, "{part}: {content}");
-            assert_eq!(directory.file_names(), ["book.xlsx"], "{part}: {content}");
+            assert_eq!(
+                directory.file_names_after_failure(&["book.xlsx"]),
+                ["book.xlsx"],
+                "{part}: {content}"
+            );
         }
     }
 
@@ -716,7 +736,10 @@ fn workbooks_that_lack_what_a_new_sheet_needs() {
         let error = copy_error(&connection, rows, &path, &format!(", MODE '{mode}'"));
         assert!(error.starts_with("IO Error: "), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), b"this is not a workbook");
-        assert_eq!(directory.file_names(), ["book.xlsx"]);
+        assert_eq!(
+            directory.file_names_after_failure(&["book.xlsx"]),
+            ["book.xlsx"]
+        );
     }
 }
 

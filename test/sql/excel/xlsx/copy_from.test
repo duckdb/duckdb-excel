@@ -127,4 +127,4 @@ Binder Error: Invalid range 'B2' specified
 statement error
 COPY sheet FROM 'test/data/xlsx/does_not_exist.xlsx' (FORMAT xlsx);
 ----
-IO Error: Cannot open file "test/data/xlsx/does_not_exist.xlsx": No such file or directory
+IO Error: Cannot open file
