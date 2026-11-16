@@ -7,5 +7,7 @@ pub mod relationships;
 pub mod row_collector;
 pub mod shared_strings;
 pub mod styles;
+pub mod styles_append;
 pub mod workbook;
+pub mod workbook_append;
 pub mod worksheet;

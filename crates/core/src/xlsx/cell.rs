@@ -169,6 +169,32 @@ pub fn parse_integer(text: &str) -> i64 {
     value
 }
 
+/// Parses a decimal integer the way C's `strtoul` does: as [`parse_integer`], but a value with a minus sign
+/// wraps around and one that does not fit is the largest there is.
+pub fn parse_unsigned(text: &str) -> u64 {
+    let text = text.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, digits) = match text.as_bytes() {
+        [b'-', digits @ ..] => (true, digits),
+        [b'+', digits @ ..] => (false, digits),
+        digits => (false, digits),
+    };
+    let mut value: u64 = 0;
+    for digit in digits.iter().take_while(|byte| byte.is_ascii_digit()) {
+        let next = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(u64::from(digit - b'0')));
+        match next {
+            Some(next) => value = next,
+            None => return u64::MAX,
+        }
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +315,25 @@ mod tests {
             ("\t\n 5", 5),
         ] {
             assert_eq!(parse_integer(text), value, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn unsigned_integers_like_strtoul() {
+        for (text, value) in [
+            ("42", 42),
+            ("  7abc", 7),
+            ("+3", 3),
+            ("", 0),
+            ("abc", 0),
+            ("-1", u64::MAX),
+            ("-0", 0),
+            ("18446744073709551615", u64::MAX),
+            ("18446744073709551616", u64::MAX),
+            ("-18446744073709551616", u64::MAX),
+            ("\t 12.9", 12),
+        ] {
+            assert_eq!(parse_unsigned(text), value, "{text:?}");
         }
     }
 }

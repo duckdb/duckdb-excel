@@ -17,7 +17,7 @@ macro_rules! register_functions {
         $crate::text::text_function(link, "excel_text")?.register(link)?;
         $crate::xlsx::read::table_function().register(link)?;
         $crate::xlsx::replacement::replacement_scan().register(link)?;
-        $crate::xlsx::copy::copy_function().register_from(link)?;
+        $crate::xlsx::copy::copy_function().register_to_and_from(link)?;
         duckdb_neo::Result::Ok(())
     }};
 }

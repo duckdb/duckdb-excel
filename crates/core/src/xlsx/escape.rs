@@ -17,6 +17,28 @@ pub fn escape_xml(text: &str) -> String {
     escaped
 }
 
+/// Appends `text` to `escaped` the way [`escape_xml`] escapes it; bytes that are not UTF-8 pass through.
+pub fn escape_xml_into(text: &[u8], escaped: &mut Vec<u8>) {
+    let mut rest = text;
+    let is_special = |byte: &u8| matches!(byte, 0 | b'&' | b'<' | b'>' | b'"' | b'\'');
+    while let Some(index) = rest.iter().position(is_special) {
+        let (plain, special) = rest.split_at(index);
+        escaped.extend_from_slice(plain);
+        let (replacement, after): (&[u8], &[u8]) = match special {
+            [b'&', after @ ..] => (b"&amp;", after),
+            [b'<', after @ ..] => (b"&lt;", after),
+            [b'>', after @ ..] => (b"&gt;", after),
+            [b'"', after @ ..] => (b"&quot;", after),
+            [b'\'', after @ ..] => (b"&apos;", after),
+            [_, after @ ..] => (b"", after),
+            [] => (b"", special),
+        };
+        escaped.extend_from_slice(replacement);
+        rest = after;
+    }
+    escaped.extend_from_slice(rest);
+}
+
 /// Replaces the five predefined entities; any other `&` stays as it is.
 pub fn unescape_xml_entities(text: &str) -> String {
     let mut unescaped = String::with_capacity(text.len());
@@ -60,6 +82,18 @@ mod tests {
         for text in ["", "plain", "a&b<c>d\"e'f", "&amp;", "&&;;", "&unknown; &"] {
             assert_eq!(unescape_xml_entities(&escape_xml(text)), text);
         }
+    }
+
+    #[test]
+    fn bytes_are_escaped_like_text() {
+        for text in ["", "plain", "a&b<c>d\"e'f", "\0a\0\0b\0", "<<>>", "é&ü"] {
+            let mut escaped = b"kept ".to_vec();
+            escape_xml_into(text.as_bytes(), &mut escaped);
+            assert_eq!(escaped, format!("kept {}", escape_xml(text)).into_bytes());
+        }
+        let mut escaped = Vec::new();
+        escape_xml_into(b"\xff<\xfe\0", &mut escaped);
+        assert_eq!(escaped, b"\xff&lt;\xfe");
     }
 
     #[test]

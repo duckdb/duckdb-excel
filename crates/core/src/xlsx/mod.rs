@@ -13,4 +13,5 @@ pub mod resolve;
 pub mod scan;
 pub mod serial;
 pub mod strings;
+pub mod write;
 pub mod xml;

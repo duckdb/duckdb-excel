@@ -1,0 +1,120 @@
+# name: test/sql/excel/xlsx/copy_to_types.test
+# description: What COPY ... TO (FORMAT xlsx) makes of the types of DuckDB, read back with read_xlsx
+# group: [xlsx]
+
+require excel
+
+# Numbers are written as DuckDB prints them
+statement ok
+COPY (
+    SELECT (-128)::TINYINT AS a, 9223372036854775807::BIGINT AS b, 18446744073709551615::UBIGINT AS c,
+           (-170141183460469231731687303715884105728)::HUGEINT AS d, 0.1::FLOAT AS e, 1e22::DOUBLE AS f,
+           (-12.5)::DECIMAL(4, 1) AS g, 1234567890.0123456789::DECIMAL(38, 10) AS h
+) TO '__TEST_DIR__/types_numbers.xlsx' (FORMAT xlsx, HEADER true);
+
+query TTTTTTTT
+SELECT * FROM read_xlsx('__TEST_DIR__/types_numbers.xlsx', all_varchar = true);
+----
+-128	9223372036854775807	18446744073709551615	-170141183460469231731687303715884105728	0.1	1e+22	-12.5	1234567890.0123456789
+
+query TTTTTTTT
+SELECT typeof(COLUMNS(*)) FROM read_xlsx('__TEST_DIR__/types_numbers.xlsx');
+----
+DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE	DOUBLE
+
+# Booleans, dates, times and timestamps of every kind come back as what they were
+statement ok
+CREATE TABLE moments AS
+SELECT i % 3 = 0 AS flag,
+       DATE '1899-12-30' + (i * 997)::INTEGER AS day,
+       TIME '00:00:00' + INTERVAL (i * 1237) SECOND AS tod,
+       TIMESTAMP '1960-01-01 00:00:00' + INTERVAL (i * 100003) MINUTE AS ts
+FROM range(500) t(i);
+
+statement ok
+COPY (
+    SELECT flag, day, tod, ts, ts::TIMESTAMP_S AS ts_s, ts::TIMESTAMP_MS AS ts_ms, ts::TIMESTAMP_NS AS ts_ns,
+           ts::TIMESTAMPTZ AS ts_tz, tod::TIMETZ AS tod_tz
+    FROM moments
+) TO '__TEST_DIR__/types_moments.xlsx' (FORMAT xlsx, HEADER true);
+
+query TTTTTTTTT
+SELECT typeof(COLUMNS(*)) FROM read_xlsx('__TEST_DIR__/types_moments.xlsx') LIMIT 1;
+----
+BOOLEAN	DATE	TIME	TIMESTAMP	TIMESTAMP	TIMESTAMP	TIMESTAMP	TIMESTAMP	TIME
+
+query I
+SELECT count(*)
+FROM (SELECT *, row_number() OVER () AS position FROM read_xlsx('__TEST_DIR__/types_moments.xlsx')) written
+JOIN (SELECT *, row_number() OVER () AS position FROM moments) original USING (position)
+WHERE written.flag = original.flag AND written.day = original.day AND written.tod = original.tod
+  AND written.ts = original.ts AND written.ts_s = original.ts AND written.ts_ms = original.ts
+  AND written.ts_ns = original.ts AND written.ts_tz = original.ts AND written.tod_tz = original.tod;
+----
+500
+
+# Timestamps with a time zone are written as UTC
+statement ok
+COPY (SELECT TIMESTAMPTZ '2024-06-01 12:00:00+02' AS moment, TIMETZ '12:34:56+02:00' AS tod)
+TO '__TEST_DIR__/types_zones.xlsx' (FORMAT xlsx);
+
+query TT
+SELECT * FROM read_xlsx('__TEST_DIR__/types_zones.xlsx');
+----
+2024-06-01 10:00:00	12:34:56
+
+# Everything else is text, as the cast to VARCHAR gives it
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+statement ok
+CREATE TABLE things AS
+SELECT 'a<b>&"c''' AS s, '\xAA\x00<'::BLOB AS bytes, '0110'::BIT AS bits,
+       'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS id, INTERVAL '1 year 2 days 3.5 seconds' AS span,
+       'happy'::mood AS m, [1, NULL, 3] AS list, {'a': 1, 'b': 'x<y'} AS record, MAP {'k': 'v&w'} AS pairs,
+       [1, 2, 3]::INTEGER[3] AS fixed, union_value(n := 5) AS choice;
+
+statement ok
+COPY things TO '__TEST_DIR__/types_things.xlsx' (FORMAT xlsx, HEADER true);
+
+query TTTTTTTTTTT
+SELECT * FROM read_xlsx('__TEST_DIR__/types_things.xlsx');
+----
+a<b>&"c'	\xAA\x00<	0110	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11	1 year 2 days 00:00:03.5	happy	[1, NULL, 3]	{'a': 1, 'b': x<y}	{k=v&w}	[1, 2, 3]	5
+
+# Empty cells are left out, and NUL cannot be written
+statement ok
+COPY (
+    SELECT CASE WHEN i % 2 = 0 THEN i END AS a, CASE WHEN i % 3 = 0 THEN 's' || chr(0) || i END AS b,
+           CASE WHEN i = 1 THEN DATE '2024-01-01' END AS c, NULL AS d
+    FROM range(5) t(i)
+) TO '__TEST_DIR__/types_nulls.xlsx' (FORMAT xlsx);
+
+query TTTT
+SELECT * FROM read_xlsx('__TEST_DIR__/types_nulls.xlsx', all_varchar = true, header = false, range = 'A1:D5');
+----
+0	s0	NULL	NULL
+NULL	NULL	45292.0	NULL
+2	NULL	NULL	NULL
+NULL	s3	NULL	NULL
+4	NULL	NULL	NULL
+
+# Rows keep their order over many batches
+statement ok
+COPY (SELECT i AS n, 'row ' || i AS label FROM range(100000) t(i) ORDER BY i DESC)
+TO '__TEST_DIR__/types_order.xlsx' (FORMAT xlsx);
+
+query II
+SELECT count(*), count(*) FILTER (A1 <> 100000 - position OR B1 <> 'row ' || (100000 - position))
+FROM (SELECT A1, B1, row_number() OVER () AS position FROM read_xlsx('__TEST_DIR__/types_order.xlsx'));
+----
+100000	0
+
+# A query without rows gives a sheet with the header alone
+statement ok
+COPY (SELECT 1 AS a, 'x' AS b WHERE false) TO '__TEST_DIR__/types_empty.xlsx' (FORMAT xlsx, HEADER true);
+
+query I
+SELECT count(*) FROM read_xlsx('__TEST_DIR__/types_empty.xlsx', header = true);
+----
+0

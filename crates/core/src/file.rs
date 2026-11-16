@@ -74,9 +74,7 @@ impl Seek for FileReader {
     }
 }
 
-/// A DuckDB file opened for writing, created when it does not exist.
-///
-/// An existing file is written over from its start and keeps what lies beyond the bytes written.
+/// A DuckDB file opened for writing: created when it does not exist, emptied when it does.
 #[derive(Debug)]
 pub struct FileWriter {
     file: File,
@@ -86,7 +84,7 @@ impl FileWriter {
     pub fn create(file_system: &FileSystem<'_>, path: &str) -> Result<FileWriter> {
         let file = FileBuilder::new(file_system, path)?
             .write()
-            .create()
+            .create_new()
             .open()
             .map_err(reraise)?;
         Ok(FileWriter { file })

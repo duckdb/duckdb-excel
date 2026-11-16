@@ -28,6 +28,10 @@ pub fn conversion(message: impl Into<String>) -> Error {
     error(DuckDBError::TypeConversion, message)
 }
 
+pub fn not_implemented(message: impl Into<String>) -> Error {
+    error(DuckDBError::QueryNotImplemented, message)
+}
+
 pub fn internal(message: impl Into<String>) -> Error {
     error(DuckDBError::RuntimeInternal, message)
 }

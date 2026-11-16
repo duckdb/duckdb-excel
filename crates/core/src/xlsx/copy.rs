@@ -1,9 +1,14 @@
-//! The `xlsx` format of `COPY`: `COPY tbl FROM 'file.xlsx' (FORMAT xlsx)` fills a table from a sheet.
+//! The `xlsx` format of `COPY`: `COPY tbl FROM 'file.xlsx' (FORMAT xlsx)` fills a table from a sheet, and
+//! `COPY ... TO 'file.xlsx' (FORMAT xlsx)` writes rows into a sheet.
 
 use duckdb_neo::{
     DuckDBType, Result,
+    column_data_collection::ColumnDataCollection,
     connection::Context,
-    copy_function::{CopyFromBindInfo, CopyFromFunctionCallbacks, CopyFunctionBuilder},
+    copy_function::{
+        CopyFromBindInfo, CopyFromFunctionCallbacks, CopyFunctionBuilder, CopyToBindInfo,
+        CopyToFunctionCallbacks,
+    },
     data_chunk::DataChunkRef,
     file::FileSystem,
     logical_type::LogicalTypeID,
@@ -17,6 +22,7 @@ use crate::{
         options::{NamedOptions, ReadOptions},
         resolve::resolve_sheet,
         scan::{ScanPlan, ScanProgress, SheetScan},
+        write::export::{WorkbookOutput, WritePlan},
     },
 };
 
@@ -27,6 +33,14 @@ pub const FORMAT_NAME: &str = "xlsx";
 /// `COPY ... FROM` runs the scan of `read_xlsx` with the column types of the table. Its options are those of
 /// `read_xlsx` but for `normalize_names`: a flag given without a value is set, and options the format does not
 /// know are ignored.
+///
+/// `COPY ... TO` writes one sheet. `HEADER` puts the column names into the first row, `SHEET` names the sheet,
+/// `SHEET_ROW_LIMIT` is the number of rows it may have, and `MODE 'append'` or `MODE 'replace'` add the sheet
+/// to a workbook that exists, where `MODE 'create'` writes the workbook anew.
+///
+/// DuckDB may prepare the batches of a `COPY ... TO` on several threads at once and for a file other than the
+/// one they end up in, but it flushes the batches of a file one after the other and in the order of their
+/// rows. All the work is therefore done when a batch is flushed.
 #[derive(Debug)]
 pub struct XlsxCopy;
 
@@ -190,6 +204,55 @@ impl CopyFromFunctionCallbacks for XlsxCopy {
         global_state: Option<&ScanProgress>,
     ) -> Result<Option<f64>> {
         Ok(global_state.map(ScanProgress::fraction))
+    }
+}
+
+impl CopyToFunctionCallbacks for XlsxCopy {
+    type InitData = WorkbookOutput;
+    type BindData = WritePlan;
+    type BatchData = ();
+
+    fn bind(&self, context: &Context, bind_info: &CopyToBindInfo) -> Result<WritePlan> {
+        WritePlan::new(context, bind_info)
+    }
+
+    fn init(
+        &self,
+        context: &Context,
+        bind_data: &WritePlan,
+        file_path: &str,
+    ) -> Result<WorkbookOutput> {
+        WorkbookOutput::begin(context, bind_data, file_path)
+    }
+
+    fn batch(
+        &self,
+        _context: &Context,
+        _bind_data: &WritePlan,
+        _init_data: &WorkbookOutput,
+        _input: &ColumnDataCollection<'_>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn flush(
+        &self,
+        context: &Context,
+        bind_data: &WritePlan,
+        init_data: &WorkbookOutput,
+        input: &ColumnDataCollection<'_>,
+        _batch_data: &mut (),
+    ) -> Result<()> {
+        init_data.write_rows(context, bind_data, input)
+    }
+
+    fn finalize(
+        &self,
+        context: &Context,
+        bind_data: &WritePlan,
+        init_data: &WorkbookOutput,
+    ) -> Result<()> {
+        init_data.finish(context, bind_data)
     }
 }
 

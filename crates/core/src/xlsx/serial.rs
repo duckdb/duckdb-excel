@@ -44,11 +44,58 @@ pub fn epoch_micros_to_time(micros: i64) -> Result<i64> {
     Ok(micros.rem_euclid(MICROS_PER_DAY))
 }
 
+/// The serial number of a TIMESTAMP in microseconds since 1970-01-01.
+pub fn epoch_micros_to_serial(micros: i64) -> f64 {
+    let seconds = micros as f64 / MICROS_PER_SECOND;
+    seconds / SECONDS_PER_DAY + DAYS_BETWEEN_1900_AND_1970
+}
+
+/// The serial number of a DATE in days since 1970-01-01.
+pub fn epoch_days_to_serial(days: i32) -> f64 {
+    (i64::from(days) + DAYS_BETWEEN_1900_AND_1970 as i64) as f64
+}
+
+/// The fraction of a day a TIME in microseconds since midnight is.
+pub fn time_micros_to_serial(micros: i64) -> f64 {
+    micros as f64 / MICROS_PER_DAY as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const DAY: i64 = MICROS_PER_DAY;
+
+    #[test]
+    fn serial_numbers_of_timestamps_dates_and_times() {
+        assert_eq!(epoch_micros_to_serial(0), 25569.0);
+        assert_eq!(
+            epoch_micros_to_serial(1_710_505_845_123_000),
+            45366.521355590274
+        );
+        assert_eq!(epoch_micros_to_serial(-DAY / 2), 25568.5);
+        assert_eq!(epoch_micros_to_serial(i64::MAX), 106777560.16730064);
+        assert_eq!(epoch_micros_to_serial(-i64::MAX), -106726422.16730064);
+        assert_eq!(epoch_days_to_serial(0), 25569.0);
+        assert_eq!(epoch_days_to_serial(19797), 45366.0);
+        assert_eq!(epoch_days_to_serial(-25569), 0.0);
+        assert_eq!(epoch_days_to_serial(i32::MAX), 2147509216.0);
+        assert_eq!(epoch_days_to_serial(-i32::MAX), -2147458078.0);
+        assert_eq!(time_micros_to_serial(0), 0.0);
+        assert_eq!(time_micros_to_serial(29_700_000_000), 0.34375);
+        assert_eq!(time_micros_to_serial(DAY), 1.0);
+    }
+
+    #[test]
+    fn serial_numbers_read_back_as_what_was_written() {
+        for micros in [0, 1, 999_999, 1_710_505_845_123_456, -86_400_000_001] {
+            let read = serial_to_epoch_micros(epoch_micros_to_serial(micros));
+            assert!(
+                (read - micros).abs() <= 1000,
+                "{micros} came back as {read}"
+            );
+        }
+    }
 
     #[test]
     fn serial_numbers() {

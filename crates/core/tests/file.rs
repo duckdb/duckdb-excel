@@ -87,7 +87,7 @@ fn globs_give_their_first_match() {
 }
 
 #[test]
-fn a_writer_creates_the_file_and_writes_in_order() {
+fn a_writer_creates_or_empties_the_file_and_writes_in_order() {
     let connection = connect();
     let file_system = FileSystem::new(&connection).unwrap();
     let file = TempFile::new("writer.bin");
@@ -105,9 +105,7 @@ fn a_writer_creates_the_file_and_writes_in_order() {
     let mut writer = FileWriter::create(&file_system, file.path()).unwrap();
     writer.write_all(b"HELLO").unwrap();
     writer.close().unwrap();
-    let overwritten = std::fs::read(file.path()).unwrap();
-    assert_eq!(overwritten.len(), written.len());
-    assert!(overwritten.starts_with(b"HELLO, xxx"));
+    assert_eq!(std::fs::read(file.path()).unwrap(), b"HELLO");
 
     let error = FileWriter::create(&file_system, "/nonexistent/dir/out.xlsx").unwrap_err();
     assert_eq!(error.code, DuckDBError::IoGeneral);

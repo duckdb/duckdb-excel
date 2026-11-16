@@ -1,9 +1,9 @@
 //! A workbook as the ZIP archive it is, read through DuckDB's file system.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 use duckdb_neo::{Result, file::FileSystem};
-use excel_zip::ZipReader;
+use excel_zip::{ZipEntry, ZipReader, ZipWriter};
 
 use crate::{
     error::from_io,
@@ -45,6 +45,31 @@ impl Archive {
     /// The uncompressed size of the open part.
     pub fn entry_len(&self) -> u64 {
         self.zip.entry_len()
+    }
+
+    /// The entries of the archive in the order of its directory, directories and repeated names included.
+    pub fn entries(&self) -> &[ZipEntry] {
+        self.zip.entries()
+    }
+
+    /// The bytes of the part called `name`, or `None` when the archive does not have it.
+    pub fn read_entry(&mut self, name: &str) -> Result<Option<Vec<u8>>> {
+        if !self.try_open_entry(name)? {
+            return Ok(None);
+        }
+        let mut bytes = Vec::new();
+        self.zip
+            .read_to_end(&mut bytes)
+            .map_err(|error| from_io(&error))?;
+        self.close_entry()?;
+        Ok(Some(bytes))
+    }
+
+    /// Copies entry `index` into `target` as it is stored, without recompressing it.
+    pub fn copy_entry<W: Write>(&mut self, index: usize, target: &mut ZipWriter<W>) -> Result<()> {
+        target
+            .copy_entry(&mut self.zip, index)
+            .map_err(|error| from_io(&error))
     }
 
     /// Runs `handler` over the part called `name` and returns whether the archive has that part.

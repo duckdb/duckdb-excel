@@ -1,0 +1,177 @@
+# name: test/sql/excel/xlsx/copy_to_options.test
+# description: The options of COPY ... TO (FORMAT xlsx): HEADER, SHEET, SHEET_ROW_LIMIT and MODE
+# group: [xlsx]
+
+require excel
+
+# Without options: the sheet 'Sheet1' without a header row
+statement ok
+COPY (SELECT i AS n, 'row ' || i AS label FROM range(3) t(i)) TO '__TEST_DIR__/options_default.xlsx' (FORMAT xlsx);
+
+query RT
+SELECT * FROM read_xlsx('__TEST_DIR__/options_default.xlsx', sheet = 'Sheet1', header = false);
+----
+0.0	row 0
+1.0	row 1
+2.0	row 2
+
+# The format follows from the file name
+statement ok
+COPY (SELECT 7 AS seven) TO '__TEST_DIR__/options_by_name.xlsx' WITH (HEADER true);
+
+query R
+SELECT seven FROM '__TEST_DIR__/options_by_name.xlsx';
+----
+7.0
+
+# HEADER takes anything that casts to a boolean
+foreach header true 1 'yes' 't'
+
+statement ok
+COPY (SELECT 1 AS "a & b", 'x' AS "<c>") TO '__TEST_DIR__/options_header.xlsx' (FORMAT xlsx, HEADER ${header});
+
+query RT
+SELECT "a & b", "<c>" FROM read_xlsx('__TEST_DIR__/options_header.xlsx', header = true);
+----
+1.0	x
+
+endloop
+
+foreach header false 0 'no'
+
+statement ok
+COPY (SELECT 1 AS a, 'x' AS b) TO '__TEST_DIR__/options_no_header.xlsx' (FORMAT xlsx, HEADER ${header});
+
+query RT
+SELECT A1, B1 FROM read_xlsx('__TEST_DIR__/options_no_header.xlsx');
+----
+1.0	x
+
+endloop
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, HEADER 'maybe');
+----
+Binder Error: Header option must be a single boolean value
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, HEADER (true, false));
+----
+Binder Error: Header option must be a single boolean value
+
+# SHEET names the sheet, whatever characters the name has
+statement ok
+COPY (SELECT 5 AS five) TO '__TEST_DIR__/options_sheet.xlsx' (FORMAT xlsx, SHEET 'A&B <1> "q" it''s');
+
+query R
+SELECT * FROM read_xlsx('__TEST_DIR__/options_sheet.xlsx', sheet = 'A&B <1> "q" it''s');
+----
+5.0
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, SHEET 5);
+----
+Binder Error: Sheet name option must be a single string value
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, SHEET);
+----
+Binder Error: Sheet name option must be a single string value
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, SHEET ('a', 'b'));
+----
+Binder Error: Sheet name option must be a single string value
+
+# SHEET_ROW_LIMIT counts the header row as well
+statement ok
+COPY (SELECT * FROM range(3)) TO '__TEST_DIR__/options_limit.xlsx' (FORMAT xlsx, SHEET_ROW_LIMIT 3);
+
+statement ok
+COPY (SELECT * FROM range(3)) TO '__TEST_DIR__/options_limit.xlsx' (FORMAT xlsx, SHEET_ROW_LIMIT '4', HEADER true);
+
+statement error
+COPY (SELECT * FROM range(3)) TO '__TEST_DIR__/options_limit.xlsx' (FORMAT xlsx, SHEET_ROW_LIMIT 3, HEADER true);
+----
+Invalid Input Error: XLSX: Sheet row limit of '3' rows exceeded!
+
+statement error
+COPY (SELECT * FROM range(3)) TO '__TEST_DIR__/options_limit.xlsx' (FORMAT xlsx, SHEET_ROW_LIMIT 0);
+----
+Invalid Input Error: XLSX: Sheet row limit of '0' rows exceeded!
+
+# The workbook of the last statement that succeeded is still there
+query I
+SELECT count(*) FROM read_xlsx('__TEST_DIR__/options_limit.xlsx', header = false);
+----
+4
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, SHEET_ROW_LIMIT 'abc');
+----
+Binder Error: Sheet row limit option must be a single integer value
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, SHEET_ROW_LIMIT);
+----
+Binder Error: Sheet row limit option must be a single integer value
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, SHEET_ROW_LIMIT 2147483648);
+----
+Binder Error: Sheet row limit option must be a single integer value
+
+# MODE is 'create', 'append' or 'replace' in any case
+statement ok
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/options_mode.xlsx' (FORMAT xlsx, MODE 'CREATE', SHEET 'One');
+
+statement ok
+COPY (SELECT 2 AS a) TO '__TEST_DIR__/options_mode.xlsx' (FORMAT xlsx, MODE 'Append', SHEET 'Two');
+
+statement ok
+COPY (SELECT 3 AS a) TO '__TEST_DIR__/options_mode.xlsx' (FORMAT xlsx, MODE 'REPLACE', SHEET 'one');
+
+query R
+SELECT * FROM read_xlsx('__TEST_DIR__/options_mode.xlsx', sheet = 'One');
+----
+3.0
+
+query R
+SELECT * FROM read_xlsx('__TEST_DIR__/options_mode.xlsx', sheet = 'Two');
+----
+2.0
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, MODE 'BoGuS');
+----
+Binder Error: Invalid MODE 'bogus' (expected 'create', 'append', or 'replace')
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, MODE 1);
+----
+Binder Error: MODE option must be a string ('create', 'append', or 'replace')
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/options_error.xlsx' (FORMAT xlsx, MODE);
+----
+Binder Error: MODE option must be a string ('create', 'append', or 'replace')
+
+# A workbook somewhere else cannot be added to, and the error comes before anything is written
+statement error
+COPY (SELECT 1) TO 's3://example-bucket/remote.xlsx' (FORMAT xlsx, SHEET 'X', MODE 'append');
+----
+Not implemented Error: XLSX MODE 'append' is only supported for local files; 's3://example-bucket/remote.xlsx' is on a remote filesystem. Write the workbook to a local path and upload it instead.
+
+statement error
+COPY (SELECT 1) TO 'gcs://example-bucket/remote.xlsx' (FORMAT xlsx, SHEET 'X', MODE 'replace');
+----
+Not implemented Error: XLSX MODE 'replace' is only supported for local files; 'gcs://example-bucket/remote.xlsx' is on a remote filesystem. Write the workbook to a local path and upload it instead.
+
+# Options the format does not know are ignored
+statement ok
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/options_unknown.xlsx' (FORMAT xlsx, sheet_name 'ignored', all_varchar true);
+
+query R
+SELECT * FROM read_xlsx('__TEST_DIR__/options_unknown.xlsx', sheet = 'Sheet1');
+----
+1.0
