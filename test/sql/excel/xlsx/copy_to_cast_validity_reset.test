@@ -14,8 +14,6 @@ require excel
 
 require parquet
 
-require no_extension_autoloading "FIXME: make copy to functions autoloadable"
-
 # Wide (40 column), sparse, multi-chunk source. Round-trip through parquet so the
 # xlsx COPY scans encoded vectors -- the condition that surfaced the bug.
 statement ok

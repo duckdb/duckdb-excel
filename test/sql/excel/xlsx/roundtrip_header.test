@@ -1,7 +1,5 @@
 require excel
 
-require no_extension_autoloading "FIXME: make copy to functions autoloadable"
-
 statement ok
 COPY (SELECT 1 as xxx) TO 'test_header.xlsx' (FORMAT 'XLSX', HEADER true);
 

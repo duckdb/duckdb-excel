@@ -2,8 +2,6 @@ require excel
 
 require tpch
 
-require no_extension_autoloading "FIXME: make copy to functions autoloadable"
-
 statement ok
 CALL dbgen(sf=0.01);
 
