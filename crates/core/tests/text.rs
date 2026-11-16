@@ -101,3 +101,40 @@ fn the_signature_is_positional() {
         ]
     );
 }
+
+#[test]
+fn formats_that_cannot_be_processed_are_errors_the_connection_survives() {
+    let connection = connect();
+    for sql in [
+        "SELECT text(1, '[$')",
+        "SELECT text(-48.5, '@')",
+        "SELECT text(i, CASE WHEN i = 3 THEN '0E' ELSE '0' END) FROM range(5) r(i)",
+    ] {
+        let error = query_error(&connection, sql);
+        assert!(
+            error.contains("Invalid Input Error: Unexpected result for number format"),
+            "{sql}: {error}"
+        );
+    }
+    assert_eq!(query(&connection, "SELECT text(1, '0.0')"), ["1.0"]);
+}
+
+#[test]
+fn formats_that_show_nothing_give_an_empty_string() {
+    let connection = connect();
+    let rows = query(
+        &connection,
+        "SELECT text(1234567.897, '#,##0' || repeat('0', 71)) = '', text(1, '') = ''",
+    );
+    assert_eq!(rows, ["true|true"]);
+}
+
+#[test]
+fn formats_that_change_from_row_to_row() {
+    let connection = connect();
+    let rows = query(
+        &connection,
+        "SELECT string_agg(text(i, CASE i % 3 WHEN 0 THEN '0.0' WHEN 1 THEN '0%' ELSE '0.0' END), ',' ORDER BY i) FROM range(6) r(i)",
+    );
+    assert_eq!(rows, ["0.0,100%,2.0,3.0,400%,5.0"]);
+}

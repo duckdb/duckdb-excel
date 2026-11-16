@@ -8,9 +8,12 @@ use duckdb_neo::{
     signature::{FunctionParameter, FunctionParameterKind, SignatureBuilder},
     vector::{StorageKind, Unknown, Vector},
 };
-use excel_numformat::format_number;
+use excel_numformat::{FormatError, NumberFormat};
+
+use crate::error::invalid_input;
 
 /// Formats a DOUBLE with an Excel number format; NULL when either argument is NULL.
+/// A format the formatter cannot process is an error.
 #[derive(Debug)]
 pub struct TextFunction;
 
@@ -39,14 +42,27 @@ impl ScalarCallbacks for TextFunction {
         let formats = formats.cast::<String>()?;
         let (numbers, formats) = (numbers.reader()?, formats.reader()?);
         let mut writer = output.writer()?;
+        let mut parsed: Option<(&str, NumberFormat)> = None;
         for row in 0..rows {
-            match (numbers.get(row)?, formats.get(row)?) {
-                (Some(number), Some(format)) => writer.set(row, &format_number(format, *number))?,
-                _ => writer.set_null(row)?,
-            }
+            let (Some(number), Some(code)) = (numbers.get(row)?, formats.get(row)?) else {
+                writer.set_null(row)?;
+                continue;
+            };
+            let format = match &parsed {
+                Some((parsed_code, format)) if *parsed_code == code => format,
+                _ => {
+                    let format = NumberFormat::new(code).map_err(unexpected_result)?;
+                    &parsed.insert((code, format)).1
+                }
+            };
+            writer.set(row, &format.format(*number).map_err(unexpected_result)?)?;
         }
         Ok(())
     }
+}
+
+fn unexpected_result(error: FormatError) -> duckdb_neo::Error {
+    invalid_input(error.to_string())
 }
 
 /// The scalar function under `name`: `text` or `excel_text`.
