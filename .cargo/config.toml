@@ -1,3 +1,7 @@
 # statically linking the C runtime on windows seems sensible?
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-Ctarget-feature=+crt-static"]
+
+# musl links the C runtime statically by default, which rules out shared libraries and proc macros.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-Ctarget-feature=-crt-static"]

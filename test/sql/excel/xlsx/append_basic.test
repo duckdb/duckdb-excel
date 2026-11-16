@@ -3,6 +3,8 @@
 
 require excel
 
+require notwindows  # COPY framework MoveTmpFile races with Defender on consecutive same-path writes
+
 # Create a fresh xlsx with sheet 'A'
 statement ok
 COPY (SELECT 1 AS x, 'hello' AS y) TO '__TEST_DIR__/append_basic.xlsx' (FORMAT 'XLSX', HEADER true, SHEET 'A');

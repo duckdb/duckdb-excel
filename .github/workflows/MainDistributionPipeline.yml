@@ -20,7 +20,7 @@ jobs:
       ci_tools_version: c286b12cee2aa16b714e76d0b46e530fcdb6dc05 # v2.0-cyanoptera 2026-11-11 pin
       extension_name: excel
       extra_toolchains: rust;python3
-      exclude_archs: 'linux_amd64_musl'
+      opt_in_archs: 'linux_amd64_musl'
 
   duckdb-stable-deploy:
     name: Deploy extension binaries
@@ -32,6 +32,6 @@ jobs:
       duckdb_version: v2.0.0
       ci_tools_version: c286b12cee2aa16b714e76d0b46e530fcdb6dc05 # v2.0-cyanoptera 2026-11-11 pin
       extension_name: excel
-      exclude_archs: 'linux_amd64_musl'
+      opt_in_archs: 'linux_amd64_musl'
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
