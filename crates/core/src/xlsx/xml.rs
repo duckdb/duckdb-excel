@@ -89,6 +89,10 @@ impl<'a> Attributes<'a> {
     /// The values of the attributes called `names`, unescaped and with whitespace normalized.
     /// Fails when any attribute of the tag is malformed, whether it was asked for or not.
     pub fn get<const N: usize>(&self, names: [&str; N]) -> Result<[Option<Cow<'a, str>>; N]> {
+        if let Some(values) = self.get_plain(names) {
+            self.checked.set(true);
+            return Ok(values);
+        }
         let mut values = [const { None }; N];
         let mut seen = [""; Self::SMALL_TAG];
         let mut count = 0;
@@ -125,9 +129,55 @@ impl<'a> Attributes<'a> {
         Ok(values)
     }
 
+    fn get_plain<const N: usize>(&self, names: [&str; N]) -> Option<[Option<Cow<'a, str>>; N]> {
+        // Nearly every tag is written as `name="value"` pairs with nothing to unescape or normalize. Such a
+        // tag is read here in one pass; `None` leaves anything else, errors included, to the full parser.
+        let raw = self.tag.attributes_raw();
+        let bytes = raw.as_bytes();
+        let mut values = [const { None }; N];
+        let mut seen = [""; Self::SMALL_TAG];
+        let mut count = 0;
+        let mut at = 0;
+        loop {
+            let name_start = at + run_len(bytes.get(at..)?, is_xml_whitespace);
+            if name_start == bytes.len() {
+                return Some(values);
+            }
+            if name_start == at && count > 0 {
+                return None;
+            }
+            let name_end = name_start + run_len(bytes.get(name_start..)?, is_name_byte);
+            let quote = match bytes.get(name_end..)? {
+                [b'=', quote @ (b'"' | b'\''), ..] => *quote,
+                _ => return None,
+            };
+            let value_start = name_end + 2;
+            let is_plain =
+                |byte: u8| byte != quote && !matches!(byte, b'<' | b'&' | b'\t' | b'\n' | b'\r');
+            let value_end = value_start + run_len(bytes.get(value_start..)?, is_plain);
+            if bytes.get(value_end) != Some(&quote) {
+                return None;
+            }
+            let name = raw.get(name_start..name_end)?;
+            if name.is_empty() || seen.iter().take(count).any(|known| *known == name) {
+                return None;
+            }
+            *seen.get_mut(count)? = name;
+            count += 1;
+            if let Some(index) = names.iter().position(|wanted| *wanted == name) {
+                values[index] = Some(Cow::Borrowed(raw.get(value_start..value_end)?));
+            }
+            at = value_end + 1;
+        }
+    }
+
     fn error(&self, error: impl fmt::Display) -> Error {
         parse_error(self.position, error)
     }
+}
+
+fn run_len(bytes: &[u8], belongs: impl Fn(u8) -> bool) -> usize {
+    bytes.iter().take_while(|byte| belongs(**byte)).count()
 }
 
 fn parse_error(position: u64, error: impl fmt::Display) -> Error {
@@ -149,7 +199,7 @@ impl std::error::Error for Oversized {}
 /// Buffers the document and watches what quick-xml does not: it refuses to feed a single event more than
 /// `limit` bytes, which keeps a document that never closes a tag or a text from being held in memory as a whole,
 /// and it notes where the first control character that XML forbids is, which is cheaper to find in whole
-/// buffers than in every event.
+/// buffers than in every event. `event_start` is where in the document the event being read begins.
 #[derive(Debug)]
 struct Source<R> {
     inner: R,
@@ -157,9 +207,8 @@ struct Source<R> {
     start: usize,
     end: usize,
     bytes_read: u64,
-    consumed: u64,
     first_control: Option<u64>,
-    event_len: usize,
+    event_start: u64,
     limit: usize,
 }
 
@@ -175,40 +224,47 @@ impl<R: Read> Read for Source<R> {
     }
 }
 
-impl<R: Read> BufRead for Source<R> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if self.start == self.end {
-            if self.event_len > self.limit {
-                return Err(io::Error::other(Oversized));
+impl<R: Read> Source<R> {
+    #[cold]
+    fn refill(&mut self) -> io::Result<()> {
+        // Everything read so far has been taken, so this is how long the event has become.
+        if self.bytes_read - self.event_start > self.limit as u64 {
+            return Err(io::Error::other(Oversized));
+        }
+        let count = loop {
+            match self.inner.read(&mut self.buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                result => break result?,
             }
-            let count = loop {
-                match self.inner.read(&mut self.buffer) {
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    result => break result?,
-                }
-            };
-            self.start = 0;
-            self.end = count.min(self.buffer.len());
-            let fresh = self.buffer.get(..self.end).unwrap_or_default();
-            let has_control = fresh
+        };
+        self.start = 0;
+        self.end = count.min(self.buffer.len());
+        let fresh = self.buffer.get(..self.end).unwrap_or_default();
+        if self.first_control.is_none() && has_control_character(fresh) {
+            self.first_control = fresh
                 .iter()
-                .fold(false, |found, byte| found | is_control_character(*byte));
-            if has_control && self.first_control.is_none() {
-                self.first_control = fresh
-                    .iter()
-                    .position(|byte| is_control_character(*byte))
-                    .map(|index| self.bytes_read + index as u64);
-            }
-            self.bytes_read += self.end as u64;
+                .position(|byte| is_control_character(*byte))
+                .map(|index| self.bytes_read + index as u64);
+        }
+        self.bytes_read += self.end as u64;
+        Ok(())
+    }
+}
+
+impl<R: Read> BufRead for Source<R> {
+    #[inline]
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        // The parser asks several times for every event: refilling is kept apart so that this stays small
+        // enough to be inlined into it.
+        if self.start == self.end {
+            self.refill()?;
         }
         Ok(self.buffer.get(self.start..self.end).unwrap_or_default())
     }
 
+    #[inline]
     fn consume(&mut self, count: usize) {
-        let count = count.min(self.end - self.start);
-        self.start += count;
-        self.consumed += count as u64;
-        self.event_len = self.event_len.saturating_add(count);
+        self.start = self.start.saturating_add(count).min(self.end);
     }
 }
 
@@ -243,9 +299,8 @@ impl<R: Read> XmlReader<R> {
             start: 0,
             end: 0,
             bytes_read: 0,
-            consumed: 0,
             first_control: None,
-            event_len: 0,
+            event_start: 0,
             limit: limit.unwrap_or(usize::MAX),
         });
         reader.config_mut().check_comments = true;
@@ -289,7 +344,7 @@ impl<R: Read> XmlReader<R> {
                 Flow::Stop => return Ok(Parsed::Done),
             }
             self.buffer.clear();
-            self.reader.get_mut().event_len = 0;
+            self.reader.get_mut().event_start = self.reader.buffer_position();
             let event = match self.reader.read_event_into(&mut self.buffer) {
                 Ok(event) => event,
                 Err(error) => {
@@ -298,12 +353,9 @@ impl<R: Read> XmlReader<R> {
                     return Err(read_error(error, position, limit, handler));
                 }
             };
-            let source = self.reader.get_ref();
-            let position = source.consumed;
-            if source
-                .first_control
-                .is_some_and(|control| control < position)
-            {
+            let position = self.reader.buffer_position();
+            let first_control = self.reader.get_ref().first_control;
+            if first_control.is_some_and(|control| control < position) {
                 return Err(parse_error(position, "invalid character"));
             }
             let at_start = std::mem::take(&mut self.at_start);
@@ -491,16 +543,21 @@ fn is_xml_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
 }
 
+fn has_control_character(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .fold(false, |found, byte| found | is_control_character(*byte))
+}
+
 fn is_control_character(byte: u8) -> bool {
     (byte < b' ') & (byte != b'\t') & (byte != b'\n') & (byte != b'\r')
 }
 
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-' | b'.') || !byte.is_ascii()
+}
+
 fn is_name(name: &str) -> bool {
-    let is_name_byte = |byte: u8| {
-        byte.is_ascii_alphanumeric()
-            || matches!(byte, b'_' | b':' | b'-' | b'.')
-            || !byte.is_ascii()
-    };
     match name.as_bytes() {
         [first, rest @ ..] => {
             is_name_byte(*first)
@@ -660,6 +717,82 @@ mod tests {
             events("<r a=\"one\ttwo\nthree\r\nfour&#10;five\"/>"),
             ["<r a=\"one two three four\\nfive\"", "</r"]
         );
+    }
+
+    fn plain_values(tag: &str) -> Option<Vec<Option<String>>> {
+        let tag = BytesStart::from_content(tag, 1);
+        let attributes = Attributes {
+            tag: &tag,
+            position: 0,
+            checked: Cell::new(false),
+        };
+        let values = attributes.get_plain(["r", "t"])?;
+        Some(
+            values
+                .into_iter()
+                .map(|value| value.map(|value| value.into_owned()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn tags_written_the_plain_way_are_read_in_one_pass() {
+        let some = |value: &str| Some(value.to_owned());
+        for (tag, values) in [
+            ("c", [None, None]),
+            ("c ", [None, None]),
+            ("c r=\"A1\"", [some("A1"), None]),
+            (
+                "c t='s' x:y=\"\" r=\"B'2> é\" ",
+                [some("B'2> é"), some("s")],
+            ),
+            ("c\n  r='\"'\tt=\"\"\r\n", [some("\""), some("")]),
+        ] {
+            assert_eq!(plain_values(tag), Some(values.to_vec()), "{tag:?}");
+        }
+    }
+
+    #[test]
+    fn other_tags_are_left_to_the_full_parser() {
+        let many: String = (0..9).map(|index| format!(" a{index}=\"\"")).collect();
+        for tag in [
+            "c r = \"A1\"",
+            "c r=\"A1\"t=\"s\"",
+            "c r=\"a&amp;b\"",
+            "c r=\"a\tb\"",
+            "c r=\"a\nb\"",
+            "c r=\"a\rb\"",
+            "c r=\"<\"",
+            "c r=\"1\" r=\"2\"",
+            "c r=1",
+            "c r",
+            "c r=\"1",
+            "c r=\"1'",
+            "c =\"1\"",
+            "c r$=\"1\"",
+            &format!("c{many}"),
+        ] {
+            assert_eq!(plain_values(tag), None, "{tag:?}");
+        }
+    }
+
+    #[test]
+    fn attributes_read_the_same_however_the_tag_is_written() {
+        for (plain, other) in [
+            (r#"<r a="1" r:id="x"/>"#, r#"<r a = "1"  r:id= 'x' />"#),
+            (r#"<r a="1" r:id="x y"/>"#, "<r a=\"&#49;\" r:id=\"x\ty\"/>"),
+            (
+                r#"<r a="é'" r:id=">"/>"#,
+                r#"<r a="&#233;&apos;" r:id="&gt;"/>"#,
+            ),
+            (r#"<r r:id="2" a="1"/>"#, r#"<r r:id="2"a="1"/>"#),
+            (
+                r#"<r z="" a="" r:id=""/>"#,
+                r#"<r a='' z='' b='' c='' d='' e='' f='' g='' r:id=''/>"#,
+            ),
+        ] {
+            assert_eq!(events(plain), events(other), "{other}");
+        }
     }
 
     #[test]
