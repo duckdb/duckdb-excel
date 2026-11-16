@@ -1,12 +1,10 @@
 //! What `read_xlsx` makes of the first rows of a sheet: the range, the header, the column types and names.
 
-mod support;
-
-use support::{
+use crate::support::{
     Workbook, connect, describe, inline, number, query, query_error, row, shared, styled, typed,
 };
 
-fn write(name: &str, sheet_data: &str) -> support::TempFile {
+fn write(name: &str, sheet_data: &str) -> crate::support::TempFile {
     Workbook::new().sheet("S", sheet_data).write(name)
 }
 

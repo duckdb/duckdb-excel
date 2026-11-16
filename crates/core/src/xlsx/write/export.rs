@@ -76,15 +76,21 @@ impl WritePlan {
             cell_kinds: Vec::new(),
             conversions: ConversionPlan::default(),
         };
-        for index in 0..bind_info.option_count()? {
-            let (name, value) = bind_info.get_option(index)?;
-            match name.to_ascii_lowercase().as_str() {
-                "header" => plan.header = header_option(context, &value)?,
-                "sheet" => plan.sheet_name = sheet_option(&value)?,
-                "sheet_row_limit" => plan.row_limit = row_limit_option(context, &value)?,
-                "mode" => plan.mode = mode_option(&value)?,
-                _ => {}
-            }
+        // DuckDB hands the options over sorted by name; of several that are wrong, the first of this list is
+        // the one reported.
+        let [header, sheet, row_limit, mode] =
+            given_options(bind_info, ["header", "sheet", "sheet_row_limit", "mode"])?;
+        if let Some(value) = header {
+            plan.header = header_option(context, &value)?;
+        }
+        if let Some(value) = sheet {
+            plan.sheet_name = sheet_option(&value)?;
+        }
+        if let Some(value) = row_limit {
+            plan.row_limit = row_limit_option(context, &value)?;
+        }
+        if let Some(value) = mode {
+            plan.mode = mode_option(&value)?;
         }
         plan.check_mode(context)?;
         for index in 0..bind_info.column_count()? {
@@ -111,6 +117,23 @@ impl WritePlan {
             self.file_path
         )))
     }
+}
+
+fn given_options<const N: usize>(
+    bind_info: &CopyToBindInfo,
+    names: [&str; N],
+) -> Result<[Option<Value>; N]> {
+    let mut values = [const { None }; N];
+    for index in 0..bind_info.option_count()? {
+        let (name, value) = bind_info.get_option(index)?;
+        let wanted = names
+            .iter()
+            .position(|wanted| name.eq_ignore_ascii_case(wanted));
+        if let Some(slot) = wanted.and_then(|position| values.get_mut(position)) {
+            *slot = Some(value);
+        }
+    }
+    Ok(values)
 }
 
 fn cast_option<T: DuckDBType + duckdb_neo::types::FromValue>(
@@ -171,13 +194,40 @@ fn mode_option(value: &Value) -> Result<WriteMode> {
 const FILE_ATTEMPTS: u32 = 40;
 const FILE_RETRY_PAUSE: Duration = Duration::from_millis(50);
 
-fn retry(mut operation: impl FnMut() -> Result<()>) -> Result<()> {
+/// What putting a file in the place of another takes of a file system.
+trait FileOperations {
+    fn exists(&self, path: &str) -> Result<bool>;
+
+    fn remove(&self, path: &str) -> Result<bool>;
+
+    fn move_item(&self, from: &str, to: &str) -> Result<()>;
+
+    fn pause(&self) {
+        thread::sleep(FILE_RETRY_PAUSE);
+    }
+}
+
+impl FileOperations for FileSystem<'_> {
+    fn exists(&self, path: &str) -> Result<bool> {
+        FileSystem::exists(self, path)
+    }
+
+    fn remove(&self, path: &str) -> Result<bool> {
+        FileSystem::remove(self, path)
+    }
+
+    fn move_item(&self, from: &str, to: &str) -> Result<()> {
+        FileSystem::move_item(self, from, to)
+    }
+}
+
+fn retry(files: &impl FileOperations, mut operation: impl FnMut() -> Result<()>) -> Result<()> {
     let mut attempt = 1;
     loop {
         match operation() {
             Err(_) if attempt < FILE_ATTEMPTS => {
                 attempt += 1;
-                thread::sleep(FILE_RETRY_PAUSE);
+                files.pause();
             }
             result => return result,
         }
@@ -188,13 +238,16 @@ fn retry(mut operation: impl FnMut() -> Result<()>) -> Result<()> {
 /// while its entries are still being copied out of it, so the new one is built next to it and moved over it
 /// at the end.
 ///
-/// The file is removed when the append does not get that far. DuckDB's file system is only there during a
-/// callback, so a statement that ends without one is cleaned up after through the file system of the
-/// operating system.
+/// The move replaces the workbook in one step where the file system can do that. Where it cannot, the
+/// workbook is removed first; if the move then still fails, the file is the only copy of the workbook and is
+/// kept. In every other case the file is removed when the append does not get to its end. DuckDB's file
+/// system is only there during a callback, so a statement that ends without one is cleaned up after through
+/// the file system of the operating system.
 #[derive(Debug)]
 struct SiblingFile {
     path: String,
     target: String,
+    is_kept: bool,
 }
 
 impl SiblingFile {
@@ -207,31 +260,52 @@ impl SiblingFile {
         SiblingFile {
             path: format!("{target}.xlsxapp.tmp.{nanos}.{sequence}"),
             target: target.to_owned(),
+            is_kept: false,
         }
     }
 
-    fn replace_target(&self, file_system: &FileSystem<'_>) -> Result<()> {
-        let moved = retry(|| {
-            if file_system.exists(&self.target)? {
-                file_system.remove(&self.target)?;
+    fn replace_target(&mut self, files: &impl FileOperations) -> Result<()> {
+        if files.move_item(&self.path, &self.target).is_ok() {
+            return Ok(());
+        }
+        let mut target_removed = false;
+        let made_room = retry(files, || {
+            // Without the new workbook there is nothing to make room for.
+            if files.exists(&self.path)? && files.exists(&self.target)? {
+                target_removed |= files.remove(&self.target)?;
             }
             Ok(())
-        })
-        .and_then(|()| retry(|| file_system.move_item(&self.path, &self.target)));
-        if moved.is_err() {
-            self.remove(file_system);
+        });
+        let moved =
+            made_room.and_then(|()| retry(files, || files.move_item(&self.path, &self.target)));
+        let Err(error) = moved else {
+            return Ok(());
+        };
+        let error = reraise(error);
+        if target_removed || !files.exists(&self.target).unwrap_or(false) {
+            self.is_kept = true;
+            return Err(duckdb_neo::Error {
+                code: error.code,
+                message: format!(
+                    "{}. '{}' is gone; the new workbook was kept as '{}'",
+                    error.message, self.target, self.path
+                ),
+            });
         }
-        moved.map_err(reraise)
+        self.remove(files);
+        Err(error)
     }
 
-    fn remove(&self, file_system: &FileSystem<'_>) {
-        let _ = file_system.remove(&self.path);
+    fn remove(&self, files: &impl FileOperations) {
+        let _ = files.remove(&self.path);
     }
 }
 
 impl Drop for SiblingFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if !self.is_kept {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -374,7 +448,10 @@ impl Export {
     }
 
     fn finish(self, context: &Context, plan: &WritePlan) -> Result<()> {
-        let Export { sheet, completion } = self;
+        let Export {
+            sheet,
+            mut completion,
+        } = self;
         let file_system = FileSystem::new(context)?;
         let written = sheet.finish().and_then(|mut zip| {
             zip.end_file().map_err(|error| from_io(&error))?;
@@ -388,7 +465,7 @@ impl Export {
         let Completion::Appended {
             sibling: Some(sibling),
             ..
-        } = &completion
+        } = &mut completion
         else {
             return written;
         };
@@ -465,4 +542,193 @@ impl WorkbookOutput {
 
 fn gone() -> duckdb_neo::Error {
     internal("COPY TO xlsx: the workbook is not being written any more")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeSet,
+    };
+
+    use super::*;
+    use crate::error::io;
+
+    const TARGET: &str = "book.xlsx";
+
+    /// Files as names only; the first `failing_moves` moves and `failing_removes` removals fail.
+    #[derive(Default)]
+    struct FakeFiles {
+        names: RefCell<BTreeSet<String>>,
+        failing_moves: Cell<u32>,
+        failing_removes: Cell<u32>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl FakeFiles {
+        fn with(names: &[&str]) -> FakeFiles {
+            let files = FakeFiles::default();
+            files
+                .names
+                .borrow_mut()
+                .extend(names.iter().map(|name| (*name).to_owned()));
+            files
+        }
+
+        fn names(&self) -> Vec<String> {
+            self.names.borrow().iter().cloned().collect()
+        }
+
+        fn fails(&self, left: &Cell<u32>) -> bool {
+            let fails = left.get() > 0;
+            left.set(left.get().saturating_sub(1));
+            fails
+        }
+    }
+
+    impl FileOperations for FakeFiles {
+        fn exists(&self, path: &str) -> Result<bool> {
+            Ok(self.names.borrow().contains(path))
+        }
+
+        fn remove(&self, path: &str) -> Result<bool> {
+            self.calls.borrow_mut().push("remove");
+            if self.fails(&self.failing_removes) {
+                return Err(io("IO Error: the file is in use"));
+            }
+            Ok(self.names.borrow_mut().remove(path))
+        }
+
+        fn move_item(&self, from: &str, to: &str) -> Result<()> {
+            self.calls.borrow_mut().push("move");
+            if self.fails(&self.failing_moves) || !self.names.borrow_mut().remove(from) {
+                return Err(io("IO Error: Could not rename file"));
+            }
+            self.names.borrow_mut().insert(to.to_owned());
+            Ok(())
+        }
+
+        fn pause(&self) {}
+    }
+
+    fn sibling() -> SiblingFile {
+        SiblingFile {
+            path: "book.xlsx.new".to_owned(),
+            target: TARGET.to_owned(),
+            is_kept: false,
+        }
+    }
+
+    #[test]
+    fn the_new_workbook_is_moved_over_the_old_one_in_one_step() {
+        let files = FakeFiles::with(&[TARGET, "book.xlsx.new"]);
+        let mut sibling = sibling();
+        sibling.replace_target(&files).unwrap();
+        assert_eq!(files.names(), [TARGET]);
+        assert_eq!(*files.calls.borrow(), ["move"]);
+        assert!(!sibling.is_kept);
+    }
+
+    #[test]
+    fn a_file_system_that_does_not_replace_gets_room_made_first() {
+        let files = FakeFiles::with(&[TARGET, "book.xlsx.new"]);
+        files.failing_moves.set(1);
+        let mut sibling = sibling();
+        sibling.replace_target(&files).unwrap();
+        assert_eq!(files.names(), [TARGET]);
+        assert_eq!(*files.calls.borrow(), ["move", "remove", "move"]);
+    }
+
+    #[test]
+    fn operations_are_tried_again_for_a_while() {
+        let files = FakeFiles::with(&[TARGET, "book.xlsx.new"]);
+        files.failing_moves.set(FILE_ATTEMPTS);
+        files.failing_removes.set(FILE_ATTEMPTS - 1);
+        let mut sibling = sibling();
+        sibling.replace_target(&files).unwrap();
+        assert_eq!(files.names(), [TARGET]);
+        let calls = files.calls.borrow();
+        let moves = calls.iter().filter(|call| **call == "move").count();
+        assert_eq!(moves as u32, FILE_ATTEMPTS + 1);
+        assert_eq!(calls.len() as u32, 2 * FILE_ATTEMPTS + 1);
+    }
+
+    #[test]
+    fn a_workbook_that_cannot_be_removed_stays_and_the_new_one_goes() {
+        let files = FakeFiles::with(&[TARGET, "book.xlsx.new"]);
+        files.failing_moves.set(1);
+        files.failing_removes.set(FILE_ATTEMPTS);
+        let mut sibling = sibling();
+        let error = sibling.replace_target(&files).unwrap_err();
+        assert_eq!(error.message, "the file is in use");
+        assert_eq!(files.names(), [TARGET]);
+        assert!(!sibling.is_kept);
+    }
+
+    #[test]
+    fn the_new_workbook_is_kept_once_the_old_one_is_removed() {
+        let files = FakeFiles::with(&[TARGET, "book.xlsx.new"]);
+        files.failing_moves.set(u32::MAX);
+        let mut sibling = sibling();
+        let error = sibling.replace_target(&files).unwrap_err();
+        assert_eq!(
+            error.message,
+            "Could not rename file. 'book.xlsx' is gone; the new workbook was kept as 'book.xlsx.new'"
+        );
+        assert_eq!(error.code, duckdb_neo::error::DuckDBError::IoGeneral);
+        assert_eq!(files.names(), ["book.xlsx.new"]);
+        assert!(sibling.is_kept);
+        let removals = files
+            .calls
+            .borrow()
+            .iter()
+            .filter(|call| **call == "remove")
+            .count();
+        assert_eq!(removals, 1);
+    }
+
+    #[test]
+    fn the_new_workbook_is_kept_when_the_old_one_has_vanished() {
+        let files = FakeFiles::with(&["book.xlsx.new"]);
+        files.failing_moves.set(u32::MAX);
+        let mut sibling = sibling();
+        let error = sibling.replace_target(&files).unwrap_err();
+        assert!(
+            error.message.ends_with("was kept as 'book.xlsx.new'"),
+            "{}",
+            error.message
+        );
+        assert_eq!(files.names(), ["book.xlsx.new"]);
+        assert!(sibling.is_kept);
+        assert!(!files.calls.borrow().contains(&"remove"));
+    }
+
+    #[test]
+    fn the_old_workbook_is_not_removed_for_a_new_one_that_is_missing() {
+        let files = FakeFiles::with(&[TARGET]);
+        let mut sibling = sibling();
+        let error = sibling.replace_target(&files).unwrap_err();
+        assert_eq!(error.message, "Could not rename file");
+        assert_eq!(files.names(), [TARGET]);
+        assert!(!sibling.is_kept);
+    }
+
+    #[test]
+    fn a_kept_file_outlives_its_owner() {
+        let path = std::env::temp_dir().join(format!(
+            "excel_core_{}_kept_sibling.tmp",
+            std::process::id()
+        ));
+        let path_text = path.to_str().unwrap().to_owned();
+        for is_kept in [false, true] {
+            std::fs::write(&path, b"workbook").unwrap();
+            drop(SiblingFile {
+                path: path_text.clone(),
+                target: TARGET.to_owned(),
+                is_kept,
+            });
+            assert_eq!(path.exists(), is_kept);
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
 }

@@ -16,7 +16,7 @@ use duckdb_neo::{
 };
 
 use crate::{
-    error::{binder, conversion, internal, reraise},
+    error::{binder, conversion, reraise},
     xlsx::{
         archive::Archive,
         options::{NamedOptions, ReadOptions},
@@ -179,8 +179,7 @@ impl CopyFromFunctionCallbacks for XlsxCopy {
         bind_data: &ScanPlan,
         global_state: Option<&ScanProgress>,
     ) -> Result<Option<SheetScan>> {
-        let progress = global_state.ok_or_else(missing_state)?;
-        SheetScan::open(context, bind_data, progress).map(Some)
+        SheetScan::open(context, bind_data, global_state)
     }
 
     fn exec(
@@ -191,10 +190,7 @@ impl CopyFromFunctionCallbacks for XlsxCopy {
         global_state: Option<&ScanProgress>,
         output: DataChunkRef<'_>,
     ) -> Result<()> {
-        let (Some(scan), Some(progress)) = (local_state, global_state) else {
-            return Err(missing_state());
-        };
-        scan.exec(context, bind_data, progress, output)
+        SheetScan::exec(context, bind_data, local_state, global_state, output)
     }
 
     fn progress(
@@ -254,10 +250,6 @@ impl CopyToFunctionCallbacks for XlsxCopy {
     ) -> Result<()> {
         init_data.finish(context, bind_data)
     }
-}
-
-fn missing_state() -> duckdb_neo::Error {
-    internal("COPY FROM xlsx: the scan state is missing")
 }
 
 /// The `xlsx` copy function; files DuckDB names itself get the extension `.xlsx`.

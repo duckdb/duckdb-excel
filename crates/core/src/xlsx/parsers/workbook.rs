@@ -7,11 +7,13 @@ use crate::{
     xlsx::xml::{Attributes, Flow, XmlHandler},
 };
 
-/// A `sheet` element: the name of a sheet and the id of the relationship that leads to its part.
+/// A `sheet` element: the name of a sheet, the id of the relationship that leads to its part, and its
+/// `sheetId`, which is empty when the element has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SheetEntry {
     pub name: String,
     pub relation_id: String,
+    pub sheet_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,10 +24,12 @@ enum State {
     Sheet,
 }
 
-/// Collects the sheets of a workbook in the order the workbook shows them.
+/// Collects the sheets of a workbook in the order the workbook shows them. A sheet needs a name and a
+/// relationship id.
 #[derive(Debug)]
 pub struct WorkbookParser {
     state: State,
+    refuses_empty_values: bool,
     pub sheets: Vec<SheetEntry>,
 }
 
@@ -33,7 +37,16 @@ impl WorkbookParser {
     pub fn new() -> WorkbookParser {
         WorkbookParser {
             state: State::Start,
+            refuses_empty_values: false,
             sheets: Vec::new(),
+        }
+    }
+
+    /// A parser for which the name and the relationship id of a sheet must not be empty either.
+    pub fn refusing_empty_values() -> WorkbookParser {
+        WorkbookParser {
+            refuses_empty_values: true,
+            ..WorkbookParser::new()
         }
     }
 }
@@ -51,12 +64,19 @@ impl XmlHandler for WorkbookParser {
             State::Workbook if name == "sheets" => self.state = State::Sheets,
             State::Sheets if name == "sheet" => {
                 self.state = State::Sheet;
-                let [Some(name), Some(relation_id)] = attributes.get(["name", "r:id"])? else {
-                    return Err(invalid_input("Invalid sheet entry in workbook.xml"));
+                let invalid = || invalid_input("Invalid sheet entry in workbook.xml");
+                let [Some(name), Some(relation_id), sheet_id] =
+                    attributes.get(["name", "r:id", "sheetId"])?
+                else {
+                    return Err(invalid());
                 };
+                if self.refuses_empty_values && (name.is_empty() || relation_id.is_empty()) {
+                    return Err(invalid());
+                }
                 self.sheets.push(SheetEntry {
                     name: name.into_owned(),
                     relation_id: relation_id.into_owned(),
+                    sheet_id: sheet_id.map(|id| id.into_owned()).unwrap_or_default(),
                 });
             }
             _ => {}
@@ -81,14 +101,17 @@ mod tests {
     use crate::xlsx::xml::XmlReader;
     use duckdb_neo::error::DuckDBError;
 
-    fn parse(xml: &str) -> Result<Vec<(String, String)>> {
-        let mut parser = WorkbookParser::new();
+    fn parse_with(mut parser: WorkbookParser, xml: &str) -> Result<Vec<(String, String)>> {
         XmlReader::new(xml.as_bytes(), None).parse_all(&mut parser)?;
         Ok(parser
             .sheets
             .into_iter()
             .map(|sheet| (sheet.name, sheet.relation_id))
             .collect())
+    }
+
+    fn parse(xml: &str) -> Result<Vec<(String, String)>> {
+        parse_with(WorkbookParser::new(), xml)
     }
 
     fn pairs(sheets: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -110,6 +133,42 @@ mod tests {
             sheets.unwrap(),
             pairs(&[("Second", "rId7"), ("A & B", "rId3")])
         );
+    }
+
+    #[test]
+    fn sheets_come_with_their_ids() {
+        let mut parser = WorkbookParser::refusing_empty_values();
+        let xml = r#"<workbook><sheets><sheet name="A" sheetId="7" r:id="rId4"/><sheet r:id="rId1" name="B"/>
+            <sheet name="C" sheetId="" r:id="rId2"/></sheets></workbook>"#;
+        XmlReader::new(xml.as_bytes(), None)
+            .parse_all(&mut parser)
+            .unwrap();
+        let ids: Vec<&str> = parser
+            .sheets
+            .iter()
+            .map(|sheet| sheet.sheet_id.as_str())
+            .collect();
+        assert_eq!(ids, ["7", "", ""]);
+    }
+
+    #[test]
+    fn empty_names_and_relationship_ids_are_refused_on_request() {
+        for xml in [
+            r#"<workbook><sheets><sheet name="" r:id="rId1"/></sheets></workbook>"#,
+            r#"<workbook><sheets><sheet name="S" r:id=""/></sheets></workbook>"#,
+        ] {
+            assert_eq!(parse(xml).unwrap().len(), 1, "{xml}");
+            let error = parse_with(WorkbookParser::refusing_empty_values(), xml).unwrap_err();
+            assert_eq!(error.code, DuckDBError::InputInvalid, "{xml}");
+            assert_eq!(error.message, "Invalid sheet entry in workbook.xml");
+        }
+        for xml in [
+            r#"<workbook><sheets><sheet name="S" sheetId="1"/></sheets></workbook>"#,
+            r#"<workbook><sheets><sheet r:id="rId1"/></sheets></workbook>"#,
+        ] {
+            assert!(parse(xml).is_err(), "{xml}");
+            assert!(parse_with(WorkbookParser::refusing_empty_values(), xml).is_err());
+        }
     }
 
     #[test]

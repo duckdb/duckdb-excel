@@ -1,8 +1,6 @@
 //! The options of `read_xlsx`: how they are passed, checked and combined.
 
-mod support;
-
-use support::{
+use crate::support::{
     Workbook, connect, describe, fixture, inline, number, numbered_rows, query, query_error, row,
 };
 
@@ -250,6 +248,138 @@ fn sheets_are_chosen_by_name() {
     );
 }
 
+const WORKSHEET_RELATION: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet";
+
+fn workbook_part(sheets: &str) -> String {
+    format!(
+        "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         <sheets>{sheets}</sheets></workbook>"
+    )
+}
+
+fn relations_part(relations: &str) -> String {
+    format!(
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+         {relations}</Relationships>"
+    )
+}
+
+#[test]
+fn the_last_of_repeated_sheets_and_relationships_counts() {
+    let connection = connect();
+    let relation = |id: &str, kind: &str, target: &str| {
+        format!(r#"<Relationship Id="{id}" Type="{kind}" Target="{target}"/>"#)
+    };
+    let theme = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme";
+    let chart = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet";
+    let relations = [
+        relation("rId1", WORKSHEET_RELATION, "worksheets/sheet1.xml"),
+        relation("rId2", WORKSHEET_RELATION, "worksheets/sheet2.xml"),
+        relation("rId3", WORKSHEET_RELATION, "worksheets/sheet3.xml"),
+        relation("rId2", WORKSHEET_RELATION, "worksheets/sheet4.xml"),
+        relation("rId4", chart, "worksheets/sheet1.xml"),
+        relation("rId3", theme, "theme/theme1.xml"),
+        relation("rId5", theme, "theme/theme1.xml"),
+        relation("rId5", WORKSHEET_RELATION, "/xl/worksheets/sheet2.xml"),
+    ]
+    .concat();
+    let sheets = concat!(
+        r#"<sheet name="Dup" sheetId="1" r:id="rId1"/><sheet name="Other" sheetId="2" r:id="rId2"/>"#,
+        r#"<sheet name="Dup" sheetId="3" r:id="rId3"/><sheet name="NoRelation" sheetId="4" r:id="rId9"/>"#,
+        r#"<sheet name="Chart" sheetId="5" r:id="rId4"/><sheet name="Late" sheetId="6" r:id="rId5"/>"#
+    );
+    let mut book = Workbook::new();
+    for value in 1..=4 {
+        book = book.sheet(&format!("S{value}"), &row(1, &[number("A1", value)]));
+    }
+    let book = book
+        .part("xl/workbook.xml", workbook_part(sheets))
+        .part("xl/_rels/workbook.xml.rels", relations_part(&relations))
+        .write("repeated_sheets.xlsx");
+    let path = book.path();
+    for (sheet, value) in [
+        ("Dup", "3.0"),
+        ("Other", "4.0"),
+        ("Late", "2.0"),
+        ("", "3.0"),
+    ] {
+        assert_eq!(
+            query(
+                &connection,
+                &format!("FROM read_xlsx('{path}', sheet = '{sheet}')")
+            ),
+            [value],
+            "{sheet}"
+        );
+    }
+    assert_eq!(
+        query_error(
+            &connection,
+            &format!("FROM read_xlsx('{path}', sheet = 'Chart')")
+        ),
+        format!(
+            "Binder Error: Sheet \"Chart\" not found in xlsx file \"{path}\"\nDid you mean: \"Late\""
+        )
+    );
+    assert!(
+        query_error(
+            &connection,
+            &format!("FROM read_xlsx('{path}', sheet = 'NoRelation')")
+        )
+        .starts_with("Binder Error: Sheet \"NoRelation\" not found")
+    );
+}
+
+#[test]
+fn a_sheet_is_found_among_very_many() {
+    let connection = connect();
+    let count = 30_000;
+    let sheets: String = (1..=count)
+        .map(|id| format!(r#"<sheet name="Sheet {id}" sheetId="{id}" r:id="rId{id}"/>"#))
+        .collect();
+    let relations: String = (1..=count)
+        .map(|id| {
+            let part = if id == 29_999 { 2 } else { 1 };
+            format!(
+                r#"<Relationship Id="rId{id}" Type="{WORKSHEET_RELATION}" Target="worksheets/sheet{part}.xml"/>"#
+            )
+        })
+        .collect();
+    let book = Workbook::new()
+        .sheet("S1", &row(1, &[number("A1", 1)]))
+        .sheet("S2", &row(1, &[number("A1", 2)]))
+        .part("xl/workbook.xml", workbook_part(&sheets))
+        .part("xl/_rels/workbook.xml.rels", relations_part(&relations))
+        .write("many_sheets.xlsx");
+    let path = book.path();
+    for (sheet, value) in [
+        ("Sheet 1", "1.0"),
+        ("Sheet 29999", "2.0"),
+        ("Sheet 30000", "1.0"),
+    ] {
+        assert_eq!(
+            query(
+                &connection,
+                &format!("FROM read_xlsx('{path}', sheet = '{sheet}')")
+            ),
+            [value],
+            "{sheet}"
+        );
+    }
+    assert_eq!(
+        query_error(
+            &connection,
+            &format!("FROM read_xlsx('{path}', sheet = 'Sheet 30001')")
+        ),
+        format!(
+            "Binder Error: Sheet \"Sheet 30001\" not found in xlsx file \"{path}\"\nDid you mean: \
+             \"Sheet 3000\", \"Sheet 3001\", \"Sheet 10001\", \"Sheet 13000\", \"Sheet 13001\""
+        )
+    );
+}
+
 #[test]
 fn sheet_names_are_unescaped_once_more_than_xml_asks_for() {
     let connection = connect();
@@ -399,12 +529,12 @@ fn a_missing_file_is_reported_before_a_bad_range() {
 fn parameters_of_prepared_statements_are_options() {
     let connection = connect();
     let path = fixture("google_sheets.xlsx");
-    support::execute(
+    crate::support::execute(
         &connection,
         "PREPARE read AS SELECT CAST(COLUMNS(*) AS VARCHAR) FROM read_xlsx($1, header = $2, range = $3)",
     );
     let execute = |arguments: &str| {
-        support::try_query_text(&connection, &format!("EXECUTE read('{path}', {arguments})"))
+        crate::support::try_query_text(&connection, &format!("EXECUTE read('{path}', {arguments})"))
             .unwrap()
     };
     assert_eq!(execute("true, 'A1:B2'"), ["123.0|500,60"]);

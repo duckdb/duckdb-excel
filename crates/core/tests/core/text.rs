@@ -1,8 +1,6 @@
 //! `text` and `excel_text`.
 
-mod support;
-
-use support::{connect, execute, query, query_error};
+use crate::support::{connect, execute, query, query_error};
 
 #[test]
 fn text_and_excel_text_format_numbers() {

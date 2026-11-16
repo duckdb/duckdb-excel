@@ -1,8 +1,6 @@
 //! `COPY tbl FROM 'file.xlsx' (FORMAT xlsx)`.
 
-mod support;
-
-use support::{
+use crate::support::{
     Workbook, connect, execute, execute_error, fixture, inline, number, numbered_rows, query, row,
     styled, typed,
 };

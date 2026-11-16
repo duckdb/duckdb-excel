@@ -1,13 +1,11 @@
 //! How cell text becomes values of the column types, and what happens to cells that do not convert.
 
-mod support;
-
-use support::{
+use crate::support::{
     Workbook, connect, inline, number, numbered_rows, query, query_error, row, shared, styled,
     typed,
 };
 
-fn write(name: &str, sheet_data: &str) -> support::TempFile {
+fn write(name: &str, sheet_data: &str) -> crate::support::TempFile {
     Workbook::new().sheet("S", sheet_data).write(name)
 }
 

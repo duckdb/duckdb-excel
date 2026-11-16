@@ -25,10 +25,21 @@ const SOURCE_BUFFER_LEN: usize = 32 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
     Continue,
-    /// Return from [`XmlReader::parse`]; the next call goes on after this element.
+    /// Return from [`XmlReader::parse`]; the next call goes on after this element. An empty element that
+    /// pauses at its start is still shown its end first.
     Pause,
     /// Nothing after this element is of interest: the rest of the document is never read.
     Stop,
+}
+
+impl Flow {
+    fn then(self, next: Flow) -> Flow {
+        match (self, next) {
+            (Flow::Stop, _) | (_, Flow::Stop) => Flow::Stop,
+            (Flow::Pause, _) | (_, Flow::Pause) => Flow::Pause,
+            (Flow::Continue, Flow::Continue) => Flow::Continue,
+        }
+    }
 }
 
 /// Why [`XmlReader::parse`] returned.
@@ -210,7 +221,6 @@ pub struct XmlReader<R: Read> {
     has_root: bool,
     started: bool,
     at_start: bool,
-    pending_end: Option<String>,
     done: bool,
 }
 
@@ -246,7 +256,6 @@ impl<R: Read> XmlReader<R> {
             has_root: false,
             started: false,
             at_start: true,
-            pending_end: None,
             done: false,
         }
     }
@@ -272,10 +281,7 @@ impl<R: Read> XmlReader<R> {
             self.started = true;
             self.reject_utf16()?;
         }
-        let mut flow = match self.pending_end.take() {
-            Some(name) => handler.end_element(&name)?,
-            None => Flow::Continue,
-        };
+        let mut flow = Flow::Continue;
         loop {
             match flow {
                 Flow::Continue => {}
@@ -309,18 +315,9 @@ impl<R: Read> XmlReader<R> {
                     flow
                 }
                 Event::Empty(tag) => {
-                    let flow = start_element(handler, &tag, position, self.depth, self.has_root)?;
+                    let flow = empty_element(handler, &tag, position, self.depth, self.has_root)?;
                     self.has_root = true;
-                    let name = local_name(tag.name().0);
-                    match flow {
-                        Flow::Continue => handler.end_element(name)?,
-                        Flow::Pause => {
-                            // The end of the element is delivered when the reader carries on.
-                            self.pending_end = Some(name.to_owned());
-                            Flow::Pause
-                        }
-                        Flow::Stop => Flow::Stop,
-                    }
+                    flow
                 }
                 Event::End(tag) => {
                     self.depth = self.depth.saturating_sub(1);
@@ -441,6 +438,19 @@ fn start_element<H: XmlHandler>(
         attributes.get([])?;
     }
     Ok(flow)
+}
+
+fn empty_element<H: XmlHandler>(
+    handler: &mut H,
+    tag: &BytesStart<'_>,
+    position: u64,
+    depth: usize,
+    has_root: bool,
+) -> Result<Flow> {
+    let start = start_element(handler, tag, position, depth, has_root)?;
+    // A handler that pauses or stops at the start of an empty element has seen all of it.
+    let end = handler.end_element(local_name(tag.name().0))?;
+    Ok(start.then(end))
 }
 
 fn unsupported_encoding(encoding: &str) -> Error {
@@ -716,11 +726,34 @@ mod tests {
                 Parsed::Paused,
                 "{pause_at}"
             );
-            assert_eq!(recorder.events.last().map(String::as_str), Some(pause_at));
+            let last = if pause_at == "<a" { "</a" } else { pause_at };
+            assert_eq!(recorder.events.last().map(String::as_str), Some(last));
             assert_eq!(reader.parse(&mut recorder).unwrap(), Parsed::Done);
             assert_eq!(recorder.events, events(xml));
             assert_eq!(reader.parse(&mut recorder).unwrap(), Parsed::Done);
         }
+    }
+
+    #[test]
+    fn an_empty_element_is_shown_its_end_whatever_its_start_says() {
+        let xml = "<r><a/><b/></r>";
+        let mut recorder = Recorder {
+            pause_at: Some("<a"),
+            stop_at: Some("</a"),
+            ..Recorder::default()
+        };
+        let mut reader = XmlReader::new(xml.as_bytes(), None);
+        assert_eq!(reader.parse(&mut recorder).unwrap(), Parsed::Done);
+        assert_eq!(recorder.events, ["<r", "<a", "</a"]);
+
+        let recorder = Recorder {
+            stop_at: Some("<b"),
+            ..Recorder::default()
+        };
+        assert_eq!(
+            record(xml, recorder).unwrap(),
+            ["<r", "<a", "</a", "<b", "</b"]
+        );
     }
 
     #[test]

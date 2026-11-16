@@ -18,7 +18,7 @@ use duckdb_neo::{
 
 use crate::{
     duckdb_compat::deduplicate_columns,
-    error::{binder, internal, invalid_input, raw_message},
+    error::{binder, invalid_input, raw_message},
     file::first_match,
     xlsx::{
         archive::Archive,
@@ -218,8 +218,7 @@ impl TableFunctionCallbacks for ReadXlsx {
         global_state: Option<&ScanProgress>,
         _column_data: InitColumnData<'_>,
     ) -> Result<Option<SheetScan>> {
-        let progress = global_state.ok_or_else(missing_state)?;
-        SheetScan::open(context, bind_data, progress).map(Some)
+        SheetScan::open(context, bind_data, global_state)
     }
 
     fn exec(
@@ -231,10 +230,7 @@ impl TableFunctionCallbacks for ReadXlsx {
         output: DataChunkRef<'_>,
         _column_info: ExecColumnInfo<'_>,
     ) -> Result<()> {
-        let (Some(scan), Some(progress)) = (local_state, global_state) else {
-            return Err(missing_state());
-        };
-        scan.exec(context, bind_data, progress, output)
+        SheetScan::exec(context, bind_data, local_state, global_state, output)
     }
 
     fn progress(
@@ -245,10 +241,6 @@ impl TableFunctionCallbacks for ReadXlsx {
     ) -> Result<Option<f64>> {
         Ok(global_state.map(ScanProgress::fraction))
     }
-}
-
-fn missing_state() -> duckdb_neo::Error {
-    internal(format!("{FUNCTION_NAME}: the scan state is missing"))
 }
 
 /// `read_xlsx(file_path, header, all_varchar, ignore_errors, range, sheet, stop_at_empty, empty_as_varchar,

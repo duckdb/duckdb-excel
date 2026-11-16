@@ -254,15 +254,6 @@ fn no_scratch() -> duckdb_neo::Error {
     internal("COPY TO xlsx: a conversion has no scratch vector")
 }
 
-impl std::fmt::Debug for TextConverter<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TextConverter")
-            .field("plan", self.plan)
-            .finish_non_exhaustive()
-    }
-}
-
 fn cast<T: NativeElement>(
     context: &Context,
     source: &Vector<'_, T>,

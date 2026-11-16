@@ -1,13 +1,15 @@
 //! Collects the rows of a range in batches for the scan.
 
+use std::io::Read;
+
 use duckdb_neo::Result;
 
 use crate::{
     error::invalid_input,
     xlsx::{
         cell::{CellPos, CellRange, CellType, parse_integer},
-        parsers::worksheet::SheetVisitor,
-        xml::Flow,
+        parsers::worksheet::{MAX_EVENT_LEN, SheetVisitor, WorksheetParser},
+        xml::{Flow, Parsed, XmlReader},
     },
 };
 
@@ -95,16 +97,16 @@ impl RowBatch {
 }
 
 /// Gathers the cells of the rows of a range into a [`RowBatch`] and pauses the parser when the batch is full
-/// or when the sheet leaves out rows, which [`Self::skip_rows`] then fills in.
+/// or when the sheet leaves out rows, which a [`RowReader`] then fills in.
 ///
 /// A cell a row leaves out is NULL, and so is a cell that comes after a later cell of its row.
 #[derive(Debug)]
-pub struct RowCollector {
+struct RowCollector {
     range: CellRange,
     stop_at_empty: bool,
     string_count: usize,
     batch_rows: usize,
-    pub batch: RowBatch,
+    batch: RowBatch,
     current: Vec<Slot>,
     last_col: u64,
     last_row: u64,
@@ -113,19 +115,13 @@ pub struct RowCollector {
 }
 
 impl RowCollector {
-    /// Collects up to `batch_rows` rows of `range` at a time; cells may refer to `string_count` shared strings.
-    pub fn new(
-        range: CellRange,
-        stop_at_empty: bool,
-        string_count: usize,
-        batch_rows: usize,
-    ) -> RowCollector {
+    fn new(range: CellRange, stop_at_empty: bool, string_count: usize) -> RowCollector {
         let width = usize::try_from(range.width()).unwrap_or(usize::MAX);
         RowCollector {
             range,
             stop_at_empty,
             string_count,
-            batch_rows,
+            batch_rows: 0,
             batch: RowBatch::new(width),
             current: vec![Slot::Open; width],
             last_col: range.beg.col.wrapping_sub(1),
@@ -135,25 +131,27 @@ impl RowCollector {
         }
     }
 
-    pub fn is_batch_full(&self) -> bool {
+    fn start_batch(&mut self, batch_rows: usize) {
+        self.batch.clear();
+        self.batch_rows = batch_rows;
+    }
+
+    fn is_batch_full(&self) -> bool {
         self.batch.len() >= self.batch_rows
     }
 
-    /// Whether the sheet left out rows before the row the parser paused at.
-    pub fn found_skipped_row(&self) -> bool {
+    fn found_skipped_row(&self) -> bool {
         self.last_row.wrapping_add(1) < self.current_row
     }
 
-    /// Adds the rows the sheet left out as rows of NULLs, as far as the batch has room.
-    pub fn skip_rows(&mut self) {
+    fn skip_rows(&mut self) {
         while self.found_skipped_row() && !self.is_batch_full() {
-            self.last_row += 1;
+            self.last_row = self.last_row.wrapping_add(1);
             self.batch.push_null_row(self.last_row);
         }
     }
 
-    /// Adds rows of NULLs up to the end of the range, as far as the batch has room.
-    pub fn fill_rows(&mut self) {
+    fn fill_rows(&mut self) {
         let remaining = self
             .range
             .end
@@ -252,13 +250,70 @@ impl SheetVisitor for RowCollector {
     }
 }
 
+/// Reads the rows of a range out of a worksheet part, a batch at a time.
+///
+/// Rows the sheet leaves out are rows of NULLs, unless the reader stops at empty rows, where they end the
+/// sheet. With `fill_range` the rows after the last one of the sheet are rows of NULLs as well, up to the end
+/// of the range.
+#[derive(Debug)]
+pub struct RowReader<R: Read> {
+    xml: XmlReader<R>,
+    parser: WorksheetParser<RowCollector>,
+    status: Parsed,
+    fill_range: bool,
+}
+
+impl<R: Read> RowReader<R> {
+    /// Reads `range` of the worksheet part in `source`, whose cells may refer to `string_count` shared strings.
+    pub fn new(
+        source: R,
+        range: CellRange,
+        stop_at_empty: bool,
+        fill_range: bool,
+        string_count: usize,
+    ) -> RowReader<R> {
+        let collector = RowCollector::new(range, stop_at_empty, string_count);
+        RowReader {
+            xml: XmlReader::new(source, Some(MAX_EVENT_LEN)),
+            parser: WorksheetParser::new(collector),
+            status: Parsed::Paused,
+            fill_range,
+        }
+    }
+
+    /// Reads the next rows, at most `max_rows` of them, into [`Self::batch`]; a batch without rows is the end
+    /// of the range.
+    pub fn read_batch(&mut self, max_rows: usize) -> Result<()> {
+        self.parser.visitor.start_batch(max_rows);
+        while !self.parser.visitor.is_batch_full() && self.status == Parsed::Paused {
+            if !self.parser.visitor.found_skipped_row() {
+                self.status = self.xml.parse(&mut self.parser)?;
+            } else if self.parser.visitor.stop_at_empty {
+                self.status = Parsed::Done;
+            } else {
+                self.parser.visitor.skip_rows();
+            }
+        }
+        if self.fill_range {
+            self.parser.visitor.fill_rows();
+        }
+        Ok(())
+    }
+
+    /// The rows read last.
+    pub fn batch(&self) -> &RowBatch {
+        &self.parser.visitor.batch
+    }
+
+    /// The number of bytes of the part read so far.
+    pub fn bytes_read(&self) -> u64 {
+        self.xml.bytes_read()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::xlsx::{
-        parsers::worksheet::WorksheetParser,
-        xml::{Parsed, XmlReader},
-    };
     use duckdb_neo::error::DuckDBError;
 
     const BATCH_ROWS: usize = 4;
@@ -293,31 +348,14 @@ mod tests {
     ) -> Result<Vec<Vec<String>>> {
         let xml = format!("<worksheet><sheetData>{sheet_data}</sheetData></worksheet>");
         let width = range.width() as usize;
-        let mut reader = XmlReader::new(xml.as_bytes(), None);
-        let mut parser =
-            WorksheetParser::new(RowCollector::new(range, stop_at_empty, 3, BATCH_ROWS));
-        let mut status = Parsed::Paused;
+        let mut reader = RowReader::new(xml.as_bytes(), range, stop_at_empty, fill, 3);
         let mut batches = Vec::new();
         loop {
-            parser.visitor.batch.clear();
-            while !parser.visitor.is_batch_full() && status == Parsed::Paused {
-                if parser.visitor.found_skipped_row() {
-                    if stop_at_empty {
-                        status = Parsed::Done;
-                    } else {
-                        parser.visitor.skip_rows();
-                    }
-                } else {
-                    status = reader.parse(&mut parser)?;
-                }
-            }
-            if fill {
-                parser.visitor.fill_rows();
-            }
-            if parser.visitor.batch.is_empty() {
+            reader.read_batch(BATCH_ROWS)?;
+            if reader.batch().is_empty() {
                 return Ok(batches);
             }
-            batches.push(batch_rows(&parser.visitor.batch, width));
+            batches.push(batch_rows(reader.batch(), width));
         }
     }
 
@@ -401,6 +439,59 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn an_empty_row_element_takes_the_place_of_the_rows_left_out_before_it() {
+        let sheet = format!(
+            "{}<row r=\"4\" ht=\"30\"/>{}<row r=\"9\"/><row r=\"12\"/>{}",
+            number_rows([1]),
+            number_rows([5]),
+            number_rows([13, 16])
+        );
+        let all = collect(&sheet, range(1, 1, u64::MAX, 2), false, false).unwrap();
+        assert_eq!(
+            all.concat(),
+            [
+                "1: \"1\"",
+                "4: NULL",
+                "5: \"5\"",
+                "9: NULL",
+                "12: NULL",
+                "13: \"13\"",
+                "14: NULL",
+                "15: NULL",
+                "16: \"16\""
+            ]
+        );
+        let filled = collect(&sheet, range(1, 1, 7, 2), false, true).unwrap();
+        assert_eq!(
+            filled.concat(),
+            ["1: \"1\"", "4: NULL", "5: \"5\"", "6: NULL"]
+        );
+        let stopped = collect(&sheet, range(1, 1, u64::MAX, 2), true, false).unwrap();
+        assert_eq!(stopped, [vec!["1: \"1\""]]);
+    }
+
+    #[test]
+    fn a_range_that_starts_at_row_zero_has_a_row_before_the_first() {
+        let batches = collect(&number_rows(1..=2), range(0, 1, 3, 2), false, false).unwrap();
+        assert_eq!(batches, [vec!["0: NULL", "1: \"1\"", "2: \"2\""]]);
+    }
+
+    #[test]
+    fn every_batch_has_its_own_size() {
+        let xml = format!(
+            "<worksheet><sheetData>{}</sheetData></worksheet>",
+            number_rows((1..=6).chain(20..=21))
+        );
+        let mut reader = RowReader::new(xml.as_bytes(), range(1, 1, 40, 2), false, true, 0);
+        let mut sizes = Vec::new();
+        for max_rows in [1, 3, 0, 4, 7, 100, 5] {
+            reader.read_batch(max_rows).unwrap();
+            sizes.push(reader.batch().len());
+        }
+        assert_eq!(sizes, [1, 3, 0, 4, 7, 24, 0]);
     }
 
     #[test]

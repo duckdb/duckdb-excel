@@ -1,12 +1,12 @@
 //! The scan of `read_xlsx`: batches, rows the sheet leaves out, ranges past the data, and scans that end early.
 
-mod support;
-
-use support::{Workbook, connect, inline, number, numbered_rows, query, query_error, row, shared};
+use crate::support::{
+    Workbook, connect, inline, number, numbered_rows, query, query_error, row, shared,
+};
 
 const HEADER: &str = r#"<row r="1"><c r="A1" t="inlineStr"><is><t>id</t></is></c><c r="B1" t="inlineStr"><is><t>label</t></is></c></row>"#;
 
-fn write(name: &str, sheet_data: &str) -> support::TempFile {
+fn write(name: &str, sheet_data: &str) -> crate::support::TempFile {
     Workbook::new().sheet("S", sheet_data).write(name)
 }
 
@@ -129,6 +129,63 @@ fn a_row_of_empty_cells_ends_a_scan() {
             "6|label 6",
             "NULL|NULL",
             "8|label 8"
+        ]
+    );
+}
+
+#[test]
+fn an_empty_row_element_stands_for_the_rows_left_out_before_it() {
+    let connection = connect();
+    let sheet = [
+        row(1, &[number("A1", 1)]),
+        r#"<row r="4" ht="30" customHeight="1"/>"#.to_owned(),
+        row(5, &[number("A5", 5)]),
+        r#"<row r="9"/>"#.to_owned(),
+    ]
+    .concat();
+    let book = write("empty_row_element.xlsx", &sheet);
+    let path = book.path();
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', header = false, stop_at_empty = false)")
+        ),
+        ["1.0", "NULL", "5.0", "NULL"]
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', range = 'A1:A7')")
+        ),
+        ["1.0", "NULL", "5.0", "NULL", "NULL"]
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', header = false)")
+        ),
+        ["1.0"]
+    );
+}
+
+#[test]
+fn a_range_whose_first_row_wraps_around_starts_before_the_sheet() {
+    let connection = connect();
+    let path = crate::support::fixture("google_sheets.xlsx");
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "FROM read_xlsx('{path}', range = 'A18446744073709551616:B5', header = false)"
+            )
+        ),
+        [
+            "NULL|NULL",
+            "ABC|HELLO",
+            "123.0|500,60",
+            "456.0|300,40",
+            "NULL|NULL",
+            "NULL|NULL"
         ]
     );
 }

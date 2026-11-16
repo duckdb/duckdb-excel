@@ -1,16 +1,14 @@
 //! The DuckDB file adapters and the archive on top of them.
 
-mod support;
-
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use crate::support::{TempFile, Workbook, connect, fixture, inline, number, row};
 use duckdb_neo::{error::DuckDBError, file::FileSystem};
 use excel_core::{
     file::{FileReader, FileWriter, first_match},
     xlsx::archive::Archive,
 };
 use excel_zip::{ZipReader, ZipWriter};
-use support::{TempFile, Workbook, connect, fixture, inline, number, row};
 
 #[test]
 fn a_reader_reads_and_seeks() {

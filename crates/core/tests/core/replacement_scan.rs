@@ -1,8 +1,6 @@
 //! `SELECT * FROM 'file.xlsx'`.
 
-mod support;
-
-use support::{connect, describe, fixture, query, query_error};
+use crate::support::{connect, describe, fixture, query, query_error};
 
 #[test]
 fn a_path_that_ends_in_xlsx_is_read() {
@@ -72,7 +70,7 @@ fn other_names_are_left_alone() {
 #[test]
 fn tables_win_over_files() {
     let connection = connect();
-    support::execute(
+    crate::support::execute(
         &connection,
         "CREATE TABLE \"data.xlsx\" AS SELECT 42 AS answer",
     );

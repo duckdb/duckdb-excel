@@ -1,12 +1,10 @@
 //! Broken workbooks give errors, never panics.
 
-mod support;
-
-use duckdb_neo::error::DuckDBError;
-use support::{
+use crate::support::{
     CONTENT_TYPES, TempFile, Workbook, connect, inline, number, numbered_rows, query, query_error,
     row, shared, try_query,
 };
+use duckdb_neo::error::DuckDBError;
 
 fn simple() -> Workbook {
     Workbook::new()
@@ -421,7 +419,7 @@ fn corrupted_parts_never_panic() {
             &[
                 number("A2", 1),
                 shared("B2", 1),
-                support::styled("C2", 44197.5, 3),
+                crate::support::styled("C2", 44197.5, 3),
             ],
         ),
         row(
@@ -429,7 +427,7 @@ fn corrupted_parts_never_panic() {
             &[
                 number("A4", 2),
                 inline("B4", "a &amp; b"),
-                support::styled("C4", 1, 1),
+                crate::support::styled("C4", 1, 1),
             ],
         ),
     ]

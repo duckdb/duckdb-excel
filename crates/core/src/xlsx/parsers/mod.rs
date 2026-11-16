@@ -9,5 +9,4 @@ pub mod shared_strings;
 pub mod styles;
 pub mod styles_append;
 pub mod workbook;
-pub mod workbook_append;
 pub mod worksheet;

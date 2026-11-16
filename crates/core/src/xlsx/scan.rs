@@ -14,25 +14,20 @@ use duckdb_neo::{
 };
 
 use crate::{
-    error::{invalid_input, raw_message},
+    error::{internal, invalid_input, raw_message},
     xlsx::{
         archive::Archive,
         cell::{CellPos, CellRange, CellType},
         options::ReadOptions,
         parsers::{
-            row_collector::{CellValue, RowBatch, RowCollector},
+            row_collector::{CellValue, RowBatch, RowReader},
             shared_strings::SharedStringsParser,
-            worksheet::{MAX_EVENT_LEN, WorksheetParser},
         },
         resolve::{SHARED_STRINGS_PATH, SheetLayout},
         serial::{epoch_micros_to_date, epoch_micros_to_time, serial_to_epoch_micros},
         strings::StringTable,
-        xml::{Parsed, XmlReader},
     },
 };
-
-/// The number of rows of a DuckDB vector, which is the most a scan may return at once.
-const BATCH_ROWS: usize = 2048;
 
 /// How the text of the cells of a column becomes values of the column type: a text column takes it as it is,
 /// the numbers of a date or time column are serial numbers, and DuckDB casts everything else.
@@ -138,16 +133,20 @@ impl ScanProgress {
 /// may have been the cast of another cell.
 #[derive(Debug)]
 pub struct SheetScan {
-    xml: XmlReader<Archive>,
-    parser: WorksheetParser<RowCollector>,
+    rows: RowReader<Archive>,
     strings: StringTable,
-    status: Parsed,
     cast_error: Option<String>,
 }
 
 impl SheetScan {
-    /// Opens the workbook, loads its shared strings and opens the sheet.
-    pub fn open(context: &Context, plan: &ScanPlan, progress: &ScanProgress) -> Result<SheetScan> {
+    /// Opens the workbook, loads its shared strings and opens the sheet; `progress` is the state all workers
+    /// of the scan share, as DuckDB hands it over.
+    pub fn open(
+        context: &Context,
+        plan: &ScanPlan,
+        progress: Option<&ScanProgress>,
+    ) -> Result<Option<SheetScan>> {
+        let progress = progress.ok_or_else(missing_state)?;
         let mut archive = Archive::open(&FileSystem::new(context)?, &plan.file_path)?;
         let mut strings = StringTable::new();
         archive.parse_entry(
@@ -164,57 +163,48 @@ impl SheetScan {
             .length
             .store(archive.entry_len(), Ordering::Relaxed);
         progress.position.store(0, Ordering::Relaxed);
-        let collector =
-            RowCollector::new(plan.range, plan.stop_at_empty, strings.len(), BATCH_ROWS);
-        Ok(SheetScan {
-            xml: XmlReader::new(archive, Some(MAX_EVENT_LEN)),
-            parser: WorksheetParser::new(collector),
+        let rows = RowReader::new(
+            archive,
+            plan.range,
+            plan.stop_at_empty,
+            plan.fill_range,
+            strings.len(),
+        );
+        Ok(Some(SheetScan {
+            rows,
             strings,
-            status: Parsed::Paused,
             cast_error: None,
-        })
+        }))
     }
 
-    /// Writes the next rows into `output`, none when the sheet is exhausted.
+    /// Writes the next rows of `scan` into `output`, as many as it holds; none when the sheet is exhausted.
     pub fn exec(
-        &mut self,
         context: &Context,
         plan: &ScanPlan,
-        progress: &ScanProgress,
+        scan: Option<&mut SheetScan>,
+        progress: Option<&ScanProgress>,
         output: DataChunkRef<'_>,
     ) -> Result<()> {
-        self.read_batch(plan)?;
+        let (Some(scan), Some(progress)) = (scan, progress) else {
+            return Err(missing_state());
+        };
+        scan.rows.read_batch(output.capacity()?)?;
         progress
             .position
-            .store(self.xml.bytes_read(), Ordering::Relaxed);
+            .store(scan.rows.bytes_read(), Ordering::Relaxed);
         let emitter = Emitter {
             context,
             plan,
-            batch: &self.parser.visitor.batch,
-            strings: &self.strings,
-            cast_error: &mut self.cast_error,
+            batch: scan.rows.batch(),
+            strings: &scan.strings,
+            cast_error: &mut scan.cast_error,
         };
         emitter.emit(output)
     }
+}
 
-    fn read_batch(&mut self, plan: &ScanPlan) -> Result<()> {
-        self.parser.visitor.batch.clear();
-        while !self.parser.visitor.is_batch_full() && self.status == Parsed::Paused {
-            if self.parser.visitor.found_skipped_row() {
-                if plan.stop_at_empty {
-                    self.status = Parsed::Done;
-                } else {
-                    self.parser.visitor.skip_rows();
-                }
-            } else {
-                self.status = self.xml.parse(&mut self.parser)?;
-            }
-        }
-        if plan.fill_range {
-            self.parser.visitor.fill_rows();
-        }
-        Ok(())
-    }
+fn missing_state() -> duckdb_neo::Error {
+    internal("xlsx: the scan state is missing")
 }
 
 /// A chunk whose vectors a cast can write to and whose cast results can be read back.

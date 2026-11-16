@@ -1,8 +1,6 @@
 //! Shared by the integration tests: an in-process DuckDB with the extension registered, and workbooks made of
 //! hand-written XML parts.
 
-#![allow(dead_code)]
-
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},

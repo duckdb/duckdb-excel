@@ -21,7 +21,7 @@ use crate::{
         parsers::{
             relationships::{Relation, RelationshipsParser},
             styles_append::{NumberFormat, StylesAppendParser},
-            workbook_append::{AppendSheetEntry, WorkbookAppendParser},
+            workbook::{SheetEntry, WorkbookParser},
         },
         write::{
             package::{
@@ -82,7 +82,7 @@ impl AppendPlan {
         let relations_xml = required(WORKBOOK_RELATIONS_PATH)?;
         let styles_xml = required(STYLES_PATH)?;
 
-        let sheets = parsed(&workbook_xml, WorkbookAppendParser::new())?.sheets;
+        let sheets = parsed(&workbook_xml, WorkbookParser::refusing_empty_values())?.sheets;
         let relations = parsed(&relations_xml, RelationshipsParser::new())?.relations;
         let styles_parser = parsed(&styles_xml, StylesAppendParser::new())?;
         let needs = StyleNeeds::resolve(&styles_parser.number_formats, &styles_parser.cell_styles);
@@ -198,7 +198,7 @@ fn parsed<H: XmlHandler>(xml: &[u8], mut parser: H) -> Result<H> {
 }
 
 fn replaced_part(
-    existing: &AppendSheetEntry,
+    existing: &SheetEntry,
     relations: &[Relation],
     sheet_name: &str,
 ) -> Result<(String, String)> {
@@ -226,7 +226,7 @@ fn replaced_part(
     Ok((file.to_owned(), part))
 }
 
-fn next_sheet_id(sheets: &[AppendSheetEntry]) -> u64 {
+fn next_sheet_id(sheets: &[SheetEntry]) -> u64 {
     sheets
         .iter()
         .filter(|sheet| !sheet.sheet_id.is_empty())
@@ -445,8 +445,8 @@ mod tests {
         }
     }
 
-    fn sheet(name: &str, relation_id: &str, sheet_id: &str) -> AppendSheetEntry {
-        AppendSheetEntry {
+    fn sheet(name: &str, relation_id: &str, sheet_id: &str) -> SheetEntry {
+        SheetEntry {
             name: name.to_owned(),
             relation_id: relation_id.to_owned(),
             sheet_id: sheet_id.to_owned(),

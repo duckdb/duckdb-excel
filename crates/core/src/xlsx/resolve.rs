@@ -1,5 +1,7 @@
 //! Finds the sheet to read in a workbook, its range, its column names and its column types.
 
+use std::collections::HashMap;
+
 use duckdb_neo::Result;
 
 use crate::{
@@ -103,18 +105,19 @@ fn find_sheet(archive: &mut Archive, file_path: &str, sheet: &str) -> Result<Str
         return Err(binder("No xl/_rels/workbook.xml.rels found in xlsx file"));
     }
 
-    let sheet_target = |relation_id: &str| {
-        relationships
-            .relations
-            .iter()
-            .rfind(|relation| relation.id == relation_id && relation.kind.ends_with("/worksheet"))
-            .map(|relation| relation.target.as_str())
-    };
-    // Sheets are looked up by their name with entities resolved once more than XML asks for.
-    let mut candidates: Vec<(String, String)> = Vec::new();
+    // Of several relationships with one id the last counts, and so does the last of several sheets with one
+    // name. Sheets are looked up by their name with entities resolved once more than XML asks for.
+    let sheet_targets: HashMap<&str, &str> = relationships
+        .relations
+        .iter()
+        .filter(|relation| relation.kind.ends_with("/worksheet"))
+        .map(|relation| (relation.id.as_str(), relation.target.as_str()))
+        .collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut paths: HashMap<String, String> = HashMap::new();
     let mut primary_sheet = "";
     for entry in &workbook.sheets {
-        let Some(target) = sheet_target(&entry.relation_id) else {
+        let Some(target) = sheet_targets.get(entry.relation_id.as_str()) else {
             continue;
         };
         let path = match target.strip_prefix('/') {
@@ -122,15 +125,14 @@ fn find_sheet(archive: &mut Archive, file_path: &str, sheet: &str) -> Result<Str
             _ => format!("xl/{target}"),
         };
         let name = unescape_xml_entities(&entry.name);
-        match candidates.iter_mut().find(|(known, _)| *known == name) {
-            Some((_, known_path)) => *known_path = path,
-            None => candidates.push((name, path)),
+        if paths.insert(name.clone(), path).is_none() {
+            names.push(name);
         }
         if primary_sheet.is_empty() {
             primary_sheet = &entry.name;
         }
     }
-    if candidates.is_empty() {
+    if names.is_empty() {
         return Err(binder(
             "No sheets found in xlsx file (is the file corrupt?)",
         ));
@@ -141,11 +143,9 @@ fn find_sheet(archive: &mut Archive, file_path: &str, sheet: &str) -> Result<Str
     } else {
         sheet
     };
-    let wanted = unescape_xml_entities(sheet);
-    match candidates.iter().find(|(name, _)| *name == wanted) {
-        Some((_, path)) => Ok(path.clone()),
+    match paths.remove(&unescape_xml_entities(sheet)) {
+        Some(path) => Ok(path),
         None => {
-            let names: Vec<String> = candidates.into_iter().map(|(name, _)| name).collect();
             let suggestions = candidates_error_message(&names, sheet, "Did you mean");
             Err(binder(format!(
                 "Sheet \"{sheet}\" not found in xlsx file \"{file_path}\"{suggestions}"

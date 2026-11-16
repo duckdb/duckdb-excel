@@ -1,9 +1,7 @@
 //! The exact bytes of the workbooks `COPY ... TO` writes. Whoever reads these workbooks, be it a spreadsheet
 //! or a test that compares files, relies on them: the same rows must always give the same parts.
 
-mod support;
-
-use support::{
+use crate::support::{
     STYLES, TempDir, Workbook, connect, execute, inline, row, workbook_part, workbook_parts,
 };
 

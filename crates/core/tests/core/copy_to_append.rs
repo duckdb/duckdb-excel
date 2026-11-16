@@ -1,20 +1,18 @@
 //! `COPY ... TO 'file.xlsx' (FORMAT xlsx, MODE 'append')` and `MODE 'replace'`: a sheet goes into a workbook
 //! that exists, and everything else in the workbook stays as it is.
 
-mod support;
-
 use std::{io::Write, path::Path};
 
+use crate::support::{
+    CONTENT_TYPES, StoredEntry, TempDir, Workbook, archive_entries, connect, execute,
+    execute_error, fixture, inline, number, query, row, sheet_rows, try_query, workbook_part,
+};
 use duckdb_neo::{Result, connection::Connection};
 use excel_core::xlsx::{
     parsers::workbook::WorkbookParser,
     xml::{Attributes, Flow, XmlHandler, XmlReader},
 };
 use excel_zip::ZipWriter;
-use support::{
-    CONTENT_TYPES, StoredEntry, TempDir, Workbook, archive_entries, connect, execute,
-    execute_error, fixture, inline, number, query, row, sheet_rows, try_query, workbook_part,
-};
 
 /// A column of every kind of cell, with empty cells in the last one.
 const TYPED_ROWS: &str = "SELECT i AS n, 'text ' || i AS s, i % 2 = 0 AS flag, DATE '2024-03-15' + i::INTEGER AS day, \
@@ -271,6 +269,46 @@ fn a_sheet_takes_the_place_of_the_one_with_its_name() {
         }
         assert_eq!(directory.file_names(), ["book.xlsx"]);
     }
+}
+
+#[test]
+fn a_workbook_changed_in_place_is_there_all_the_time() {
+    let connection = connect();
+    let directory = TempDir::new("in_place");
+    let path = directory.path("book.xlsx");
+    copy(&connection, "SELECT 0 AS round", &path, ", SHEET 'Start'");
+
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let (looks, misses) = std::thread::scope(|scope| {
+        let watcher = scope.spawn(|| {
+            let (mut looks, mut misses) = (0u64, 0u64);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                looks += 1;
+                misses += u64::from(!Path::new(&path).exists());
+            }
+            (looks, misses)
+        });
+        for round in 1..=40 {
+            let (sheet, mode) = if round % 4 == 0 {
+                ("Start".to_owned(), "replace")
+            } else {
+                (format!("Round {round}"), "append")
+            };
+            copy(
+                &connection,
+                &format!("SELECT {round} AS round"),
+                &path,
+                &format!(", SHEET '{sheet}', MODE '{mode}', USE_TMP_FILE false"),
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        watcher.join().unwrap()
+    });
+    assert!(looks > 1000, "{looks} looks");
+    assert_eq!(misses, 0, "of {looks} looks");
+    assert_eq!(sheet_names(&path).len(), 31);
+    assert_eq!(sheet_as_text(&connection, &path, "Start"), ["40"]);
+    assert_eq!(directory.file_names(), ["book.xlsx"]);
 }
 
 #[test]

@@ -1,10 +1,8 @@
 //! The workbooks of the SQL tests, which come from Excel, LibreOffice, Google Sheets and GDAL.
 
-mod support;
-
 use std::path::Path;
 
-use support::{connect, describe, fixture, query, try_query};
+use crate::support::{connect, describe, fixture, query, try_query};
 
 fn workbooks(directory: &Path, found: &mut Vec<String>) {
     for entry in std::fs::read_dir(directory).unwrap() {

@@ -1,9 +1,7 @@
 //! The keyword list that `normalize_names` uses.
 
-mod support;
-
+use crate::support::{connect, query};
 use excel_core::duckdb_compat::reserved_keywords;
-use support::{connect, query};
 
 #[test]
 fn the_embedded_keywords_are_the_reserved_keywords_of_duckdb() {

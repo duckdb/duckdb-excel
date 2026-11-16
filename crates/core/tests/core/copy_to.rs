@@ -1,8 +1,6 @@
 //! `COPY ... TO 'file.xlsx' (FORMAT xlsx)` into a new workbook.
 
-mod support;
-
-use support::{
+use crate::support::{
     TempDir, connect, describe, execute, execute_error, query, sheet_rows, workbook_part,
     workbook_parts,
 };
@@ -200,6 +198,44 @@ fn options_of_the_wrong_kind_are_binder_errors() {
             "{options}"
         );
     }
+    assert!(directory.file_names().is_empty());
+}
+
+#[test]
+fn of_several_wrong_options_the_first_of_a_fixed_order_is_reported() {
+    let connection = connect();
+    let directory = TempDir::new("option_order");
+    let path = directory.path("out.xlsx");
+    let header = "Binder Error: Header option must be a single boolean value";
+    let sheet = "Binder Error: Sheet name option must be a single string value";
+    let limit = "Binder Error: Sheet row limit option must be a single integer value";
+    for (options, message) in [
+        (", SHEET 5, MODE 'bogus'", sheet),
+        (", MODE 'bogus', SHEET 5", sheet),
+        (", SHEET_ROW_LIMIT 'x', MODE 1", limit),
+        (", MODE 1, SHEET_ROW_LIMIT 'x', SHEET 5", sheet),
+        (
+            ", MODE 1, SHEET 5, SHEET_ROW_LIMIT 'x', HEADER 'maybe'",
+            header,
+        ),
+        (", SHEET_ROW_LIMIT 'x', HEADER 'maybe'", header),
+    ] {
+        assert_eq!(
+            copy_error(&connection, "SELECT 1 AS a", &path, options),
+            message,
+            "{options}"
+        );
+    }
+    // A wrong option is reported before a workbook that cannot be added to.
+    assert_eq!(
+        copy_error(
+            &connection,
+            "SELECT 1",
+            "s3://example-bucket/remote.xlsx",
+            ", MODE 'append', SHEET 5"
+        ),
+        sheet
+    );
     assert!(directory.file_names().is_empty());
 }
 
@@ -666,6 +702,10 @@ fn a_query_without_rows_gives_a_sheet_without_rows() {
     );
 }
 
+/// A table of several row groups, which DuckDB scans on several threads when the rows may go to more than
+/// one file.
+const ROW_GROUPS_ROWS: u64 = 500_000;
+
 #[test]
 fn rows_keep_their_order_over_many_batches() {
     let connection = connect();
@@ -674,25 +714,31 @@ fn rows_keep_their_order_over_many_batches() {
     execute(&connection, "SET threads = 4");
     execute(
         &connection,
-        "CREATE TABLE big AS SELECT i AS n, 'row ' || i AS label, i % 7 = 0 AS flag FROM range(70000) t(i)",
+        &format!(
+            "CREATE TABLE big AS SELECT i AS n, 'row ' || i AS label FROM range({ROW_GROUPS_ROWS}) t(i)"
+        ),
     );
     let rows_in_order = || {
         query(
             &connection,
             &format!(
-                "SELECT count(*), count(*) FILTER \
-                 (A1 <> position OR B1 <> 'row ' || position OR C1 <> (position % 7 = 0)) FROM \
-                 (SELECT A1, B1, C1, row_number() OVER () - 1 AS position FROM read_xlsx('{path}'))"
+                "SELECT count(*), count(*) FILTER (A1 <> position OR B1 <> 'row ' || position) FROM \
+                 (SELECT A1, B1, row_number() OVER () - 1 AS position FROM read_xlsx('{path}'))"
             ),
         )
     };
     copy(&connection, "FROM big", &path, "");
-    assert_eq!(rows_in_order(), ["70000|0"]);
-    copy(&connection, "FROM big", &path, ", BATCH_SIZE 25000");
+    assert_eq!(rows_in_order(), [format!("{ROW_GROUPS_ROWS}|0")]);
+    copy(
+        &connection,
+        "FROM big WHERE n < 70000",
+        &path,
+        ", BATCH_SIZE 25000",
+    );
     assert_eq!(rows_in_order(), ["70000|0"]);
     copy(
         &connection,
-        "FROM big WHERE n % 2 = 1 ORDER BY n DESC",
+        "FROM big WHERE n < 70000 AND n % 2 = 1 ORDER BY n DESC",
         &path,
         "",
     );
@@ -770,59 +816,68 @@ fn constant_and_repeated_values_fill_every_row() {
 }
 
 #[test]
-fn every_output_file_is_a_workbook_of_its_own() {
+fn threads_that_write_at_the_same_time_each_get_their_rows_into_a_workbook() {
     let connection = connect();
     let directory = TempDir::new("many_files");
     execute(&connection, "SET threads = 4");
     execute(
         &connection,
-        "CREATE TABLE grouped AS SELECT i AS n, i % 3 AS part FROM range(60000) t(i)",
+        &format!(
+            "CREATE TABLE grouped AS SELECT i AS n, i % 3 AS part FROM range({ROW_GROUPS_ROWS}) t(i)"
+        ),
     );
-    let partitioned = directory.path("partitioned");
-    execute(
-        &connection,
-        &format!("COPY grouped TO '{partitioned}' (FORMAT xlsx, PARTITION_BY (part), HEADER true)"),
-    );
-    for part in 0..3 {
-        assert_eq!(
-            query(
-                &connection,
-                &format!(
-                    "SELECT count(*), count(DISTINCT n), min(n % 3), max(n % 3) \
-                     FROM read_xlsx('{partitioned}/part={part}/data_0.xlsx')"
-                )
-            ),
-            [format!("20000|20000|{part}.0|{part}.0")]
-        );
-    }
+
+    // Every thread writes a file of its own, with the rows in the order the thread read them.
     let per_thread = directory.path("per_thread");
     execute(
         &connection,
         &format!("COPY grouped TO '{per_thread}' (FORMAT xlsx, PER_THREAD_OUTPUT true)"),
     );
-    assert_eq!(
-        query(
-            &connection,
-            &format!(
-                "SELECT count(*), count(DISTINCT A1), sum(A1) \
-                 FROM read_xlsx('{per_thread}/*.xlsx', header = false)"
-            )
-        )
-        .len(),
-        1
-    );
     let files = std::fs::read_dir(&per_thread).unwrap().count();
+    assert!(files > 1, "{files} file");
     let mut rows = 0;
     for file in 0..files {
-        let count = query(
+        let counts = query(
             &connection,
             &format!(
-                "SELECT count(*) FROM read_xlsx('{per_thread}/data_{file}.xlsx', header = false)"
+                "SELECT count(*), count(*) FILTER (A1 <= before) FROM (SELECT A1, lag(A1) OVER () AS before \
+                 FROM read_xlsx('{per_thread}/data_{file}.xlsx', header = false))"
             ),
         );
-        rows += count[0].parse::<u64>().unwrap();
+        let (count, out_of_order) = counts[0].split_once('|').unwrap();
+        assert_eq!(out_of_order, "0", "file {file}");
+        rows += count.parse::<u64>().unwrap();
     }
-    assert_eq!(rows, 60000);
+    assert_eq!(rows, ROW_GROUPS_ROWS);
+
+    // The threads share the files of the partitions; the batches of a file are written one at a time.
+    let partitioned = directory.path("partitioned");
+    execute(
+        &connection,
+        &format!("COPY grouped TO '{partitioned}' (FORMAT xlsx, PARTITION_BY (part), HEADER true)"),
+    );
+    let mut rows = 0;
+    for part in 0..3 {
+        let path = format!("{partitioned}/part={part}/data_0.xlsx");
+        let counts = query(
+            &connection,
+            &format!(
+                "SELECT count(*), count(DISTINCT n), count(*) FILTER (n % 3 <> {part}) FROM read_xlsx('{path}')"
+            ),
+        );
+        let count: u64 = counts[0].split('|').next().unwrap().parse().unwrap();
+        assert_eq!(counts, [format!("{count}|{count}|0")], "part {part}");
+        let cells = sheet_rows(&path, "sheet1.xml");
+        assert_eq!(
+            cells.matches("<row r=").count() as u64,
+            count + 1,
+            "part {part}"
+        );
+        let last_row = format!("<row r=\"{}\">", count + 1);
+        assert!(cells.contains(&last_row), "part {part}");
+        rows += count;
+    }
+    assert_eq!(rows, ROW_GROUPS_ROWS);
 }
 
 #[test]
