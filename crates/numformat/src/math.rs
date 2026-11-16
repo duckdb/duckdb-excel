@@ -1,7 +1,8 @@
 //! Floating point helpers of the formatter: decimal scaling, rounding and digit generation.
 //!
 //! [`double_to_string`] is not a shortest-round-trip printer: it scales the value into `[1, 10)`,
-//! extracts at most 15 significant digits with small corrective offsets and pads with zeros. Its
+//! extracts at most 15 significant digits with small corrective offsets and pads with zeros. It
+//! writes no sign, uses `.` as separator and gives the exponent three digits (`d.ddE+ddd`). Its
 //! digits are what users see, so every step keeps its exact order of operations, and `log10` and
 //! `pow` come from the platform's C library because their last bit can show in the result.
 //!
@@ -10,7 +11,8 @@
 //! until the end, where such a character could otherwise pass for `0`, `.` or the terminating NUL.
 //!
 //! The integer conversions give what x86-64 gives for NaN and out-of-range values, which reach
-//! the output for NaN and infinite inputs.
+//! the output for NaN and infinite inputs: the smallest integer for the signed types; for `u64`
+//! 2^63 for NaN, wrap-around for negative values and 0 from 2^64 on.
 
 use std::hint::black_box;
 
@@ -30,12 +32,11 @@ const ROUNDING: [f64; 16] = [
     0.5e-10, 0.5e-11, 0.5e-12, 0.5e-13, 0.5e-14,
 ];
 
-/// `base` raised to `exponent`; the opaque base keeps the compiler from substituting the call.
 pub(crate) fn pow(base: f64, exponent: f64) -> f64 {
+    // The opaque base keeps the compiler from substituting another function for the call.
     black_box(base).powf(exponent)
 }
 
-/// 10 raised to `exponent`, exact constants for exponents within ±16.
 pub(crate) fn pow10(exponent: i32) -> f64 {
     let table = if exponent < 0 {
         &NEGATIVE_POWERS_OF_TEN
@@ -49,7 +50,6 @@ pub(crate) fn pow10(exponent: i32) -> f64 {
     }
 }
 
-/// Truncates to an integer; NaN and out-of-range values give `i32::MIN`.
 pub(crate) fn to_i32(value: f64) -> i32 {
     if value > -2147483649.0 && value < 2147483648.0 {
         value as i32
@@ -58,7 +58,6 @@ pub(crate) fn to_i32(value: f64) -> i32 {
     }
 }
 
-/// Truncates to an integer; NaN and out-of-range values give `i64::MIN`.
 pub(crate) fn to_i64(value: f64) -> i64 {
     if (-9223372036854775808.0..9223372036854775808.0).contains(&value) {
         value as i64
@@ -67,7 +66,6 @@ pub(crate) fn to_i64(value: f64) -> i64 {
     }
 }
 
-/// Truncates to an unsigned integer; NaN gives 2^63, negative values wrap, too large ones give 0.
 pub(crate) fn to_u64(value: f64) -> u64 {
     if value >= 9223372036854775808.0 {
         (to_i64(value - 9223372036854775808.0) as u64) ^ (1 << 63)
@@ -76,13 +74,11 @@ pub(crate) fn to_u64(value: f64) -> u64 {
     }
 }
 
-/// Decimal exponent of a positive value: `floor(log10(value))`.
 pub(crate) fn decimal_exponent(value: f64) -> i32 {
     to_i32(value.log10().floor())
 }
 
-/// Rounds half up to `decimals` places, compensating for binary representation errors.
-pub(crate) fn round_corrected(value: f64, decimals: i32) -> f64 {
+pub(crate) fn round_half_up_corrected(value: f64, decimals: i32) -> f64 {
     if value == 0.0 {
         return value;
     }
@@ -112,7 +108,6 @@ pub(crate) fn round_corrected(value: f64, decimals: i32) -> f64 {
     value
 }
 
-/// Number of integer digits of a positive value (zero or negative for values below 1).
 pub(crate) fn integer_digits(value: f64) -> i64 {
     if !(1e-7..=1e7).contains(&value) {
         return to_i64(value.log10().floor()).wrapping_add(1);
@@ -132,13 +127,10 @@ pub(crate) fn integer_digits(value: f64) -> i64 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Notation {
-    /// `d.dddE+ddd` with a three digit exponent.
     Exponential,
-    /// Plain decimal notation.
     Fixed,
 }
 
-/// Decimal digits of `value` with `decimals` places, `.` as separator and no sign.
 pub(crate) fn double_to_string(
     value: f64,
     notation: Notation,
@@ -340,11 +332,11 @@ mod tests {
     }
 
     #[test]
-    fn round_corrected_rounds_half_up() {
-        assert_eq!(round_corrected(2.5, 0), 3.0);
-        assert_eq!(round_corrected(0.125, 2), 0.13);
-        assert_eq!(round_corrected(1.005, 2), 1.01);
-        assert_eq!(round_corrected(1.25, 21), 1.25);
+    fn round_half_up_corrected_compensates_representation_errors() {
+        assert_eq!(round_half_up_corrected(2.5, 0), 3.0);
+        assert_eq!(round_half_up_corrected(0.125, 2), 0.13);
+        assert_eq!(round_half_up_corrected(1.005, 2), 1.01);
+        assert_eq!(round_half_up_corrected(1.25, 21), 1.25);
     }
 
     #[test]

@@ -23,7 +23,6 @@ pub(crate) fn insert_byte(text: &mut Text, position: usize, byte: u8) -> Result<
     insert(text, position, &[byte])
 }
 
-/// Removes up to `count` bytes starting at `position`.
 pub(crate) fn erase(text: &mut Text, position: usize, count: usize) -> Result<(), FormatError> {
     if position > text.len() {
         return Err(FormatError);
@@ -33,13 +32,12 @@ pub(crate) fn erase(text: &mut Text, position: usize, count: usize) -> Result<()
     Ok(())
 }
 
-/// The part of `text` starting at `position`.
 pub(crate) fn tail(text: &[u8], position: usize) -> Result<&[u8], FormatError> {
     text.get(position..).ok_or(FormatError)
 }
 
-/// Removes leading `byte`s but always leaves the last byte of the text in place.
 pub(crate) fn erase_leading(text: &mut Text, byte: u8) {
+    // The last byte stays even if it matches.
     let Some(last) = text.len().checked_sub(1) else {
         return;
     };
@@ -55,16 +53,10 @@ pub(crate) fn erase_all(text: &mut Text, byte: u8) {
     text.retain(|&other| other != byte);
 }
 
-/// Whether `text` starts with `prefix`, ignoring ASCII case in `text`; `prefix` must be upper case.
-pub(crate) fn starts_with_upper(text: &[u8], prefix: &[u8]) -> bool {
-    text.len() >= prefix.len()
+pub(crate) fn starts_with_ignoring_case(text: &[u8], upper_case_prefix: &[u8]) -> bool {
+    text.len() >= upper_case_prefix.len()
         && text
             .iter()
-            .zip(prefix)
+            .zip(upper_case_prefix)
             .all(|(byte, expected)| byte.to_ascii_uppercase() == *expected)
-}
-
-/// A negative count stands for "to the end of the text".
-pub(crate) fn count_from(difference: i32) -> usize {
-    usize::try_from(difference).unwrap_or(usize::MAX)
 }

@@ -1,12 +1,14 @@
 # Regression corpora
 
 Each line of a `.tsv` file is one case: `format<TAB>value<TAB>expected`. There are no comment or header lines.
-The expectations were recorded from the formatter this crate replaced, built for x86-64 Linux, and the crate is
-required to reproduce them byte for byte. They record behaviour, not intent: odd results are expected results.
+The expected values are the required output, byte for byte. They pin behaviour, not intent: odd results are
+expected results.
 
 - `golden.tsv`: holds on every platform.
 - `golden_glibc.tsv`: cases whose digits depend on how the C library rounds `log10` and `pow` (values just below a
-  power of ten, or of very large or small magnitude). They are checked on x86-64 Linux with glibc only.
+  power of ten, or of very large or small magnitude). They are checked on x86-64 Linux with glibc only. The values
+  were taken with glibc 2.39 (Ubuntu 24.04) on a CPU with FMA; another glibc version or CPU variant may round
+  differently.
 
 ## Fields
 

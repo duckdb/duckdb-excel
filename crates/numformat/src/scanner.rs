@@ -4,7 +4,8 @@
 //! format type from them and `final_scan` gives every symbol its final kind for that type and
 //! rebuilds the section text from the symbols.
 //!
-//! The passes report a problem as the position where it was found. Position 0 means "no problem",
+//! The passes, and `scan` as a whole, report a problem as the position where it was found.
+//! Position 0 means "no problem",
 //! so a problem at the very start of a section goes unnoticed and leaves the section half
 //! scanned; such sections still format in a defined way, which is why positions are tracked at
 //! all. The parts of the final scan return `true` for a problem at the current position.
@@ -23,7 +24,7 @@ use crate::text::{self, Text};
 
 const MAX_SYMBOLS: usize = 100;
 
-/// Value of the thousands count that marks a `General` keyword in a number format.
+// A thousands count no format reaches, which marks a `General` keyword in a number format.
 pub(crate) const GENERAL_IN_FORMAT: u16 = 1000;
 
 /// Positions from the right at which group separators go: every third digit.
@@ -49,22 +50,25 @@ impl DigitGrouping {
     }
 }
 
-/// The numbers a scan derives besides the symbols.
+/// The numbers a scan derives besides the symbols. Their meaning depends on the format type.
+///
+/// - `thousand`: group separators are wanted; in time formats: there is an elapsed time part
+///   such as `[h]`.
+/// - `thousand_count`: the number of trailing group separators, each of which divides the value
+///   by 1000, or [`GENERAL_IN_FORMAT`]; in time formats the unit of the elapsed time part
+///   (1 hours, 2 minutes, 3 seconds).
+/// - `count_pre`, `count_post`: digit placeholders before and after the decimal separator.
+/// - `count_exp`: digit placeholders of the exponent or of the denominator; 1 if a time format
+///   has AM/PM.
+/// - `exp_val`: a fixed denominator, 0 if there is none.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScanInfo {
     pub(crate) format_type: FormatType,
-    /// Group separators are wanted; for time formats: has a `[h]`-like elapsed time part.
     pub(crate) thousand: bool,
-    /// Number of trailing group separators that scale the value; for time formats the unit of the
-    /// elapsed time part (1 hours, 2 minutes, 3 seconds); [`GENERAL_IN_FORMAT`] for `General`.
     pub(crate) thousand_count: u16,
-    /// Digits before the decimal separator.
     pub(crate) count_pre: u16,
-    /// Digits after the decimal separator.
     pub(crate) count_post: u16,
-    /// Digits of the exponent or of the denominator; 1 if a time format has AM/PM.
     pub(crate) count_exp: u16,
-    /// A fixed denominator, 0 if none.
     pub(crate) exp_val: u32,
 }
 
@@ -193,7 +197,7 @@ fn next_symbol(format: &[u8], position: &mut usize) -> Result<Symbol, FormatErro
                         state = State::Word;
                         continue;
                     };
-                    let length = keyword.text().len();
+                    let length = keyword.spelling().len();
                     symbol.extend_from_slice(&format[start..start + length]);
                     *position = start + length;
                     // An E is the exponent of a scientific format if a sign or a digit follows.
@@ -283,7 +287,6 @@ impl FormatScanner {
         }
     }
 
-    /// Scans one section and rebuilds `format` from its symbols; anything but 0 is a failure.
     pub(crate) fn scan(&mut self, format: &mut Text) -> Result<u16, FormatError> {
         let mut result = self.divide(format)?;
         if result == 0 {
@@ -295,7 +298,6 @@ impl FormatScanner {
         Ok(result)
     }
 
-    /// Number of symbols the last scan produced, 0 if it did not get to the final scan.
     pub(crate) fn result_count(&self) -> u16 {
         self.result_count
     }
@@ -304,7 +306,6 @@ impl FormatScanner {
         self.info
     }
 
-    /// The first `count` symbols of the last scan that were not merged into others.
     pub(crate) fn take_symbols(&mut self, count: u16) -> Vec<Symbol> {
         let mut symbols = std::mem::take(&mut self.symbols);
         symbols.retain(|symbol| symbol.kind != SymbolKind::Empty);
@@ -1146,7 +1147,7 @@ impl FormatScanner {
                     self.set_kind(index, kind);
                 }
                 SymbolKind::Keyword(keyword) if keyword.is_date() => {
-                    self.set_text(index, keyword.text());
+                    self.set_text(index, keyword.spelling());
                 }
                 _ => self.set_kind(index, SymbolKind::String),
             }
@@ -1248,7 +1249,7 @@ impl FormatScanner {
                         _ => false,
                     };
                     if keeps_kind {
-                        self.set_text(index, keyword.text());
+                        self.set_text(index, keyword.spelling());
                     } else {
                         self.set_kind(index, SymbolKind::String);
                     }

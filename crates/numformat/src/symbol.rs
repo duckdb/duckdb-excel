@@ -1,6 +1,6 @@
 //! The vocabulary of a scanned format code: keywords, symbol kinds and format types.
 
-use crate::text::{Text, starts_with_upper};
+use crate::text::{Text, starts_with_ignoring_case};
 
 /// A keyword of the format code language.
 ///
@@ -10,7 +10,6 @@ use crate::text::{Text, starts_with_upper};
 /// `Month2` by context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Keyword {
-    /// `E` of a scientific format.
     Exponent,
     AmPm,
     AP,
@@ -33,30 +32,20 @@ pub(crate) enum Keyword {
     DayName,
     Year2,
     Year4,
-    /// `NN`, day of week abbreviation.
     WeekdayAbbreviation,
-    /// `NNN`, day of week name.
     WeekdayName,
-    /// `NNNN`, day of week name followed by the long date separator.
     WeekdayNameSeparator,
-    /// `CCC`, currency bank symbol.
     BankSymbol,
     General,
     WeekOfYear,
-    /// `AAA`, day of week abbreviation.
     AltDayAbbreviation,
-    /// `AAAA`, day of week name.
     AltDayName,
-    /// `E`, calendar year without leading zero.
     EraYear,
-    /// `EE`, calendar year.
     EraYear2,
     Era,
     Era2,
     EraName,
-    /// `R`, same as `EE`.
     EraYearShort,
-    /// `RR`, era name and year.
     EraYearLong,
 }
 
@@ -98,8 +87,7 @@ impl Keyword {
         Keyword::AmPm,
     ];
 
-    /// The upper case spelling.
-    pub(crate) fn text(self) -> &'static [u8] {
+    pub(crate) fn spelling(self) -> &'static [u8] {
         match self {
             Keyword::Exponent | Keyword::EraYear => b"E",
             Keyword::AmPm => b"AM/PM",
@@ -138,14 +126,12 @@ impl Keyword {
         }
     }
 
-    /// The keyword `text` starts with, ignoring case.
     pub(crate) fn at_start_of(text: &[u8]) -> Option<Keyword> {
         Keyword::SEARCH_ORDER
             .into_iter()
-            .find(|keyword| starts_with_upper(text, keyword.text()))
+            .find(|keyword| starts_with_ignoring_case(text, keyword.spelling()))
     }
 
-    /// Keywords that make a format a date format and are displayed from the calendar.
     pub(crate) fn is_date(self) -> bool {
         !matches!(
             self,
@@ -165,36 +151,29 @@ impl Keyword {
 }
 
 /// The kind of one symbol of a scanned format code.
+///
+/// `None` is a slot the scanner has not filled, `Empty` a symbol merged into another one and
+/// `Delimiter` a character whose meaning depends on the format type. `Blank` is `_x`, a blank as
+/// wide as `x`, and `Star` is `*x`, fill with `x`. `Digit` is a run of digit placeholders.
+/// `Currency` is the symbol inside `[$...]`, `CurrencyDelimiter` its `[$` or `]` and
+/// `CurrencyExtension` its `-xxx` part. `FractionBlank` separates integer and fraction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SymbolKind {
-    /// A slot the scanner has not filled.
     None,
     Keyword(Keyword),
-    /// Literal text.
     String,
-    /// A character with a meaning that depends on the format type.
     Delimiter,
-    /// `_x`, a blank as wide as `x`.
     Blank,
-    /// `*x`, fill with `x`.
     Star,
-    /// A run of digit placeholders.
     Digit,
     DecimalSeparator,
     ThousandSeparator,
-    /// `E+` or `E-` of a scientific format.
     Exponent,
-    /// `/` of a fraction.
     Fraction,
-    /// A symbol merged into another one.
     Empty,
-    /// The blank between integer and fraction.
     FractionBlank,
-    /// The symbol inside `[$...]`.
     Currency,
-    /// `[$` or `]`.
     CurrencyDelimiter,
-    /// `-xxx` inside `[$...]`.
     CurrencyExtension,
     DateSeparator,
     TimeSeparator,
@@ -216,11 +195,12 @@ pub(crate) struct Symbol {
 }
 
 /// What a format code formats.
+///
+/// `Undefined` is a section in which nothing was recognised; it produces no output. `Defined`
+/// is one with literal text only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FormatType {
-    /// Nothing recognised; such a format produces no output.
     Undefined,
-    /// Literal text only.
     Defined,
     Date,
     Time,

@@ -17,18 +17,19 @@ use crate::FormatError;
 use crate::calendar::{CalendarDate, EPOCH_OFFSET};
 use crate::condition::parse_limit;
 use crate::locale;
-use crate::math::{Notation, double_to_string, integer_digits, pow, round_corrected, to_u64};
+use crate::math::{
+    Notation, double_to_string, integer_digits, pow, round_half_up_corrected, to_u64,
+};
 use crate::scanner::{DigitGrouping, FormatScanner, GENERAL_IN_FORMAT, ScanInfo};
 use crate::symbol::{FormatType, Keyword, Symbol, SymbolKind};
-use crate::text::{self, Text, count_from};
+use crate::text::{self, Text};
 
-/// Largest value of the integer part of fractions and of elapsed seconds.
+// The integer part of fractions and elapsed seconds must not exceed this.
 const MAX_U32: f64 = 4294967295.0;
 
-/// Comparison of a condition.
+/// The comparison of a condition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LimitOp {
-    None,
+enum Comparison {
     Equal,
     NotEqual,
     Less,
@@ -37,29 +38,27 @@ enum LimitOp {
     GreaterEqual,
 }
 
-impl LimitOp {
-    fn check(self, number: f64, limit: f64) -> Option<bool> {
+impl Comparison {
+    fn holds(self, number: f64, limit: f64) -> bool {
         match self {
-            LimitOp::None => None,
-            LimitOp::Equal => Some(number == limit),
-            LimitOp::NotEqual => Some(number != limit),
-            LimitOp::Less => Some(number < limit),
-            LimitOp::LessEqual => Some(number <= limit),
-            LimitOp::Greater => Some(number > limit),
-            LimitOp::GreaterEqual => Some(number >= limit),
+            Comparison::Equal => number == limit,
+            Comparison::NotEqual => number != limit,
+            Comparison::Less => number < limit,
+            Comparison::LessEqual => number <= limit,
+            Comparison::Greater => number > limit,
+            Comparison::GreaterEqual => number >= limit,
         }
     }
 }
 
-/// What the format code holds at the current position.
+/// What the format code holds at the current position: the text of a section (`Format`), a
+/// bracketed prefix without function such as `[Red]` or `[$-409]` (`Prefix`), or a condition.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BracketSymbol {
-    /// The text of a section.
     Format,
-    /// A bracketed prefix without function, such as `[Red]` or `[$-409]`.
     Prefix,
     Error,
-    Condition(LimitOp),
+    Condition(Comparison),
 }
 
 /// One section of a format code.
@@ -98,8 +97,8 @@ pub struct NumberFormat {
     sections: [Section; 3],
     limit1: f64,
     limit2: f64,
-    op1: LimitOp,
-    op2: LimitOp,
+    comparison1: Option<Comparison>,
+    comparison2: Option<Comparison>,
     is_text: bool,
 }
 
@@ -177,9 +176,9 @@ fn next_bracket_symbol(
                     letter = token;
                     state = State::Condition;
                     kind = BracketSymbol::Condition(match token {
-                        b'<' => LimitOp::Less,
-                        b'>' => LimitOp::Greater,
-                        _ => LimitOp::Equal,
+                        b'<' => Comparison::Less,
+                        b'>' => Comparison::Greater,
+                        _ => Comparison::Equal,
                     });
                 }
                 b'$' => {
@@ -235,17 +234,17 @@ fn next_bracket_symbol(
             State::Condition => match (token, letter) {
                 (b'>', b'<') => {
                     symbol.push(token);
-                    return Ok(BracketSymbol::Condition(LimitOp::NotEqual));
+                    return Ok(BracketSymbol::Condition(Comparison::NotEqual));
                 }
                 (b'=', b'<') => {
                     symbol.push(token);
                     letter = b' ';
-                    kind = BracketSymbol::Condition(LimitOp::LessEqual);
+                    kind = BracketSymbol::Condition(Comparison::LessEqual);
                 }
                 (b'=', b'>') => {
                     symbol.push(token);
                     letter = b' ';
-                    kind = BracketSymbol::Condition(LimitOp::GreaterEqual);
+                    kind = BracketSymbol::Condition(Comparison::GreaterEqual);
                 }
                 (b'<' | b'>' | b'=', _) => return Ok(BracketSymbol::Error),
                 _ => {
@@ -293,8 +292,9 @@ fn replace_section(
     position: &mut u16,
     replacement: &[u8],
 ) -> Result<(), FormatError> {
-    let count = count_from(i32::from(*position) - i32::from(start));
-    text::erase(format, usize::from(start), count)?;
+    // A position before the start erases to the end of the format code.
+    let count = usize::from(*position).checked_sub(usize::from(start));
+    text::erase(format, usize::from(start), count.unwrap_or(usize::MAX))?;
     text::insert(format, usize::from(start), replacement)?;
     *position = (usize::from(start) + replacement.len()) as u16;
     Ok(())
@@ -315,8 +315,8 @@ impl NumberFormat {
         let mut scanner = FormatScanner::new();
         let mut sections = [UNSCANNED; 3];
         let mut limits = [0.0; 2];
-        let mut op1 = LimitOp::None;
-        let mut op2 = LimitOp::None;
+        let mut comparison1 = None;
+        let mut comparison2 = None;
         let mut format_type = FormatType::Defined;
         let mut has_condition = false;
         let mut failed = false;
@@ -332,12 +332,12 @@ impl NumberFormat {
             loop {
                 symbol = next_bracket_symbol(&mut format, &mut position, &mut section_text)?;
                 match symbol {
-                    BracketSymbol::Condition(op) => {
+                    BracketSymbol::Condition(comparison) => {
                         if index == 0 && !has_condition {
                             has_condition = true;
-                            op1 = op;
+                            comparison1 = Some(comparison);
                         } else if index == 1 && has_condition {
-                            op2 = op;
+                            comparison2 = Some(comparison);
                         } else {
                             failed = true;
                             break;
@@ -379,10 +379,10 @@ impl NumberFormat {
                 cancel = true;
             } else {
                 // Without conditions the sections are for positive, negative and zero values.
-                if index == 1 && op1 == LimitOp::None {
-                    op1 = LimitOp::Greater;
-                } else if index == 2 && op2 == LimitOp::None {
-                    op2 = LimitOp::Less;
+                if index == 1 && comparison1.is_none() {
+                    comparison1 = Some(Comparison::Greater);
+                } else if index == 2 && comparison2.is_none() {
+                    comparison2 = Some(Comparison::Less);
                 }
                 if !section_text.is_empty() {
                     let result = scanner.scan(&mut section_text)?;
@@ -435,14 +435,14 @@ impl NumberFormat {
                 } else if index == 2
                     && sections[2].symbols.is_empty()
                     && last_byte(&format)? != b';'
-                    && op2 != LimitOp::None
+                    && comparison2.is_some()
                 {
                     Some(2)
                 } else {
                     None
                 };
             if let Some(general) = general {
-                let mut text = Keyword::General.text().to_vec();
+                let mut text = Keyword::General.spelling().to_vec();
                 if scanner.scan(&mut text)? == 0 && scanner.result_count() != 0 {
                     let info = scanner.info();
                     let symbols = scanner.take_symbols(scanner.result_count());
@@ -453,24 +453,25 @@ impl NumberFormat {
 
         let [limit1, limit2] = limits;
         if sections[2].symbols.is_empty()
-            && op1 == LimitOp::Greater
-            && op2 == LimitOp::None
+            && comparison1 == Some(Comparison::Greater)
+            && comparison2.is_none()
             && limit1 == 0.0
             && limit2 == 0.0
         {
-            op1 = LimitOp::GreaterEqual;
+            comparison1 = Some(Comparison::GreaterEqual);
         }
         Ok(NumberFormat {
             sections,
             limit1,
             limit2,
-            op1,
-            op2,
+            comparison1,
+            comparison2,
             is_text: format_type == FormatType::Text,
         })
     }
 
-    /// Formats `value`. Bytes the format cuts out of a multi-byte character come out as U+FFFD.
+    /// Formats `value`. Output that is not valid UTF-8, from a cut multi-byte character or a
+    /// negative number in a text format, comes out as U+FFFD.
     pub fn format(&self, value: f64) -> Result<String, FormatError> {
         let bytes = self.format_bytes(value)?;
         Ok(String::from_utf8(bytes)
@@ -484,12 +485,15 @@ impl NumberFormat {
         if self.is_text {
             return standard(number);
         }
-        let index = match self.op1.check(number, self.limit1) {
-            None | Some(true) => 0,
-            Some(false) => match self.op2.check(number, self.limit2) {
-                None | Some(true) => 1,
-                Some(false) => 2,
-            },
+        let holds = |comparison: Option<Comparison>, limit| {
+            comparison.is_none_or(|comparison| comparison.holds(number, limit))
+        };
+        let index = if holds(self.comparison1, self.limit1) {
+            0
+        } else if holds(self.comparison2, self.limit2) {
+            1
+        } else {
+            2
         };
         // The sign is dropped where the section itself stands for "negative".
         let section_is_negative = match index {
@@ -522,20 +526,21 @@ impl NumberFormat {
     }
 
     fn second_section_is_negative(&self) -> bool {
-        use LimitOp::{Greater, GreaterEqual, Less, None};
+        use Comparison::{Greater, GreaterEqual, Less};
         self.limits_are_zero()
             && matches!(
-                (self.op1, self.op2),
-                (GreaterEqual, None) | (Greater, Less) | (None, None)
+                (self.comparison1, self.comparison2),
+                (Some(GreaterEqual), None) | (Some(Greater), Some(Less)) | (None, None)
             )
     }
 
     fn first_section_is_negative(&self) -> bool {
-        use LimitOp::{Equal, Greater, GreaterEqual, Less, LessEqual, None};
+        use Comparison::{Equal, Greater, GreaterEqual, Less, LessEqual};
         self.limits_are_zero()
             && matches!(
-                (self.op1, self.op2),
-                (Less, Greater | Equal | GreaterEqual | None) | (LessEqual, None | Greater)
+                (self.comparison1, self.comparison2),
+                (Some(Less), None | Some(Greater | Equal | GreaterEqual))
+                    | (Some(LessEqual), None | Some(Greater))
             )
     }
 }
@@ -558,6 +563,12 @@ fn general(number: f64) -> Result<Text, FormatError> {
     Ok(text)
 }
 
+fn append_blank(output: &mut Text) {
+    // The position is a 16-bit quantity: past 65,535 bytes of output it wraps to the front.
+    let end = output.len() as u16;
+    output.insert(usize::from(end), b' ');
+}
+
 fn push_int(text: &mut Text, value: i32) {
     text.extend_from_slice(value.to_string().as_bytes());
 }
@@ -573,7 +584,7 @@ fn literal_output(section: &Section) -> Text {
     let mut output = Text::new();
     for symbol in &section.symbols {
         match symbol.kind {
-            SymbolKind::Blank => output.push(b' '),
+            SymbolKind::Blank => append_blank(&mut output),
             SymbolKind::String | SymbolKind::Currency => output.extend_from_slice(&symbol.text),
             SymbolKind::ThousandSeparator if section.info.thousand_count == 0 => {
                 output.extend_from_slice(&symbol.text);
@@ -589,17 +600,17 @@ fn append_date_keyword(
     keyword: Keyword,
     date: &CalendarDate,
 ) -> Result<(), FormatError> {
-    let month = locale::MONTHS.get(usize::from(date.month));
-    let day = locale::DAYS_OF_WEEK.get(usize::from(date.day_of_week));
-    let quarter = &locale::QUARTERS[usize::from(date.month / 3).min(3)];
+    let month = locale::MONTHS.get(usize::from(date.month_index));
+    let day = locale::DAYS_FROM_SUNDAY.get(usize::from(date.days_since_sunday));
+    let quarter = &locale::QUARTERS[usize::from(date.month_index / 3).min(3)];
     let year = i32::from(date.year as i16);
     let name = |name: Option<&locale::Name>, full: bool| {
         name.map_or("", |name| if full { name.full } else { name.abbreviation })
             .as_bytes()
     };
     match keyword {
-        Keyword::Month => push_int(output, i32::from(date.month) + 1),
-        Keyword::Month2 => push_int2(output, i32::from(date.month) + 1),
+        Keyword::Month => push_int(output, i32::from(date.month_index) + 1),
+        Keyword::Month2 => push_int2(output, i32::from(date.month_index) + 1),
         Keyword::MonthAbbreviation => output.extend_from_slice(name(month, false)),
         Keyword::MonthName => output.extend_from_slice(name(month, true)),
         Keyword::MonthInitial => output.push(text::at(name(month, true), 0)?),
@@ -742,7 +753,7 @@ fn date_output(section: &Section, number: f64) -> Result<Text, FormatError> {
     let mut output = Text::new();
     for symbol in &section.symbols {
         match symbol.kind {
-            SymbolKind::Blank => output.push(b' '),
+            SymbolKind::Blank => append_blank(&mut output),
             SymbolKind::Keyword(keyword) => append_date_keyword(&mut output, keyword, &date)?,
             kind if is_date_time_literal(kind) => output.extend_from_slice(&symbol.text),
             _ => {}
@@ -770,7 +781,7 @@ fn time_output(section: &Section, number: f64, signed: bool) -> Result<Text, For
             number = 1.0 - number;
         }
     }
-    let time = round_corrected(number * 86400.0, i32::from(info.count_post));
+    let time = round_half_up_corrected(number * 86400.0, i32::from(info.count_post));
     if time == 0.0 {
         negative = false;
     }
@@ -781,7 +792,7 @@ fn time_output(section: &Section, number: f64, signed: bool) -> Result<Text, For
     let mut output = Text::new();
     for symbol in &section.symbols {
         match symbol.kind {
-            SymbolKind::Blank => output.push(b' '),
+            SymbolKind::Blank => append_blank(&mut output),
             SymbolKind::Digit => clock.append_fraction(&mut output, &symbol.text)?,
             SymbolKind::Keyword(keyword) => clock.append_keyword(&mut output, keyword),
             kind if is_date_time_literal(kind) => output.extend_from_slice(&symbol.text),
@@ -797,7 +808,7 @@ fn time_output(section: &Section, number: f64, signed: bool) -> Result<Text, For
 fn date_time_output(section: &Section, number: f64) -> Result<Text, FormatError> {
     let info = &section.info;
     let mut number = number + EPOCH_OFFSET;
-    let mut time = round_corrected(
+    let mut time = round_half_up_corrected(
         (number - number.floor()) * 86400.0,
         i32::from(info.count_post),
     );
@@ -811,7 +822,7 @@ fn date_time_output(section: &Section, number: f64) -> Result<Text, FormatError>
     let mut output = Text::new();
     for symbol in &section.symbols {
         match symbol.kind {
-            SymbolKind::Blank => output.push(b' '),
+            SymbolKind::Blank => append_blank(&mut output),
             SymbolKind::Digit => clock.append_fraction(&mut output, &symbol.text)?,
             SymbolKind::Keyword(keyword) => {
                 clock.append_keyword(&mut output, keyword);
@@ -1576,7 +1587,7 @@ mod tests {
 
     #[test]
     fn unusable_sections_show_nothing() {
-        assert_eq!(format("#,##0".to_string().as_str(), 1.0).unwrap(), "1");
+        assert_eq!(format("#,##0", 1.0).unwrap(), "1");
         assert_eq!(
             format(&format!("#,##0{}", "0".repeat(100)), 1.0).unwrap(),
             ""
@@ -1591,6 +1602,26 @@ mod tests {
         assert_eq!(format("0", 1e300).unwrap(), expected);
         let expected = format!("17976931348623200{}.00", "0".repeat(292));
         assert_eq!(format("0.00", f64::MAX).unwrap(), expected);
+    }
+
+    #[test]
+    fn blanks_after_65535_bytes_of_output_wrap_to_the_front() {
+        let blanks = |format_code: &str, value| {
+            let output = format(format_code, value).unwrap();
+            let blanks: Vec<_> = output.match_indices(' ').map(|(index, _)| index).collect();
+            (output.len(), blanks)
+        };
+        let literal = "x".repeat(65300);
+        let days = "dddd".repeat(40);
+
+        let date = format!("\"{literal}\"{days}_-");
+        assert_eq!(blanks(&date, 45000.0), (65661, vec![124]));
+
+        let time = format!("\"{}\"[s]{}_-s_)", "x".repeat(65450), ":s".repeat(20));
+        assert_eq!(blanks(&time, 49000.0), (65670, vec![123, 133]));
+
+        let date_time = format!("\"{literal}\"{days} h:mm_-ss_)");
+        assert_eq!(blanks(&date_time, 45000.25), (65669, vec![129, 132, 65662]));
     }
 
     #[test]

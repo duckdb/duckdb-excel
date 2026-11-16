@@ -49,7 +49,6 @@ enum MonthPosition {
     End,
 }
 
-/// The limit a condition text stands for, `None` if it is not a plain or scientific number.
 pub(crate) fn parse_limit(text: &[u8]) -> Result<Option<f64>, FormatError> {
     if text.is_empty() || text.len() > MAX_INPUT_LENGTH {
         return Ok(None);
@@ -165,6 +164,14 @@ fn skip_name(names: &[locale::Name], text: &[u8], position: &mut usize) -> i32 {
     0
 }
 
+fn skip_month(text: &[u8], position: &mut usize) -> i32 {
+    skip_name(&locale::MONTHS, text, position)
+}
+
+fn skip_currency(text: &[u8], position: &mut usize) -> bool {
+    skip_char(locale::CURRENCY_SYMBOL, text, position)
+}
+
 fn skip_am_pm(text: &[u8], position: &mut usize) -> bool {
     skip_string(locale::TIME_AM, text, position) || skip_string(locale::TIME_PM, text, position)
 }
@@ -205,17 +212,52 @@ fn string_to_double(text: &[u8]) -> f64 {
     }
 }
 
+fn parse_double(text: &[u8]) -> Option<f64> {
+    std::str::from_utf8(text).ok()?.parse().ok()
+}
+
 fn scientific_to_double(text: &[u8]) -> Option<f64> {
-    let value: f64 = std::str::from_utf8(text).ok()?.parse().ok()?;
-    let mantissa_is_zero = text
-        .iter()
-        .take_while(|&&byte| byte != b'E')
-        .all(|&byte| byte == b'0' || byte == b'.');
-    if mantissa_is_zero {
+    let value = parse_double(text)?;
+    let exponent_start = text.iter().position(|&byte| byte == b'E')?;
+    let (mantissa, exponent) = text.split_at(exponent_start);
+    if mantissa.iter().all(|&byte| byte == b'0' || byte == b'.') {
         return Some(0.0);
     }
     // A number that overflows or underflows is not a limit.
-    (value.is_finite() && value >= f64::MIN_POSITIVE).then_some(value)
+    if !value.is_finite() || value < f64::MIN_POSITIVE {
+        return None;
+    }
+    // Underflow is judged before the exponent range limits the rounding, so the smallest normal
+    // number can stand for one that underflows; scaled by a power of two the rounding shows.
+    if value == f64::MIN_POSITIVE {
+        const SCALE: u64 = 1 << 63;
+        let mut scaled = multiply_decimal(mantissa, SCALE);
+        scaled.extend_from_slice(exponent);
+        if parse_double(&scaled)? < f64::MIN_POSITIVE * SCALE as f64 {
+            return None;
+        }
+    }
+    Some(value)
+}
+
+fn multiply_decimal(digits: &[u8], factor: u64) -> Text {
+    let mut product = Text::with_capacity(digits.len() + 20);
+    let mut carry = 0u128;
+    for &byte in digits.iter().rev() {
+        if byte == b'.' {
+            product.push(byte);
+            continue;
+        }
+        let value = u128::from(byte.wrapping_sub(b'0')) * u128::from(factor) + carry;
+        product.push(b'0' + (value % 10) as u8);
+        carry = value / 10;
+    }
+    while carry > 0 {
+        product.push(b'0' + (carry % 10) as u8);
+        carry /= 10;
+    }
+    product.reverse();
+    product
 }
 
 impl InputScan {
@@ -295,14 +337,6 @@ impl InputScan {
         }
     }
 
-    fn skip_month(&self, text: &[u8], position: &mut usize) -> i32 {
-        skip_name(&locale::MONTHS, text, position)
-    }
-
-    fn skip_currency(&self, text: &[u8], position: &mut usize) -> bool {
-        skip_char(locale::CURRENCY_SYMBOL, text, position)
-    }
-
     fn skip_thousand_separator(
         &self,
         text: &[u8],
@@ -344,7 +378,7 @@ impl InputScan {
         if skip_decimal_separator(text, &mut position) {
             self.decimal_position = DecimalPosition::Start;
             skip_blanks(text, &mut position);
-        } else if self.skip_currency(text, &mut position) {
+        } else if skip_currency(text, &mut position) {
             self.scanned_type = InputType::Currency;
             skip_blanks(text, &mut position);
             if self.sign == 0 {
@@ -354,7 +388,7 @@ impl InputScan {
                 }
             }
         } else {
-            self.month = self.skip_month(text, &mut position);
+            self.month = skip_month(text, &mut position);
             if self.month != 0 {
                 self.scanned_type = InputType::Date;
                 self.month_position = MonthPosition::Start;
@@ -363,7 +397,7 @@ impl InputScan {
                 }
                 skip_blanks(text, &mut position);
             } else {
-                let day_of_week = skip_name(&locale::DAYS_OF_WEEK, text, &mut position);
+                let day_of_week = skip_name(&locale::DAYS_FROM_SUNDAY, text, &mut position);
                 if day_of_week != 0 {
                     self.scanned_type = InputType::Date;
                     if position < text.len() {
@@ -378,7 +412,7 @@ impl InputScan {
                             );
                         }
                         skip_blanks(text, &mut position);
-                        self.month = self.skip_month(text, &mut position);
+                        self.month = skip_month(text, &mut position);
                         if self.month != 0 {
                             self.month_position = MonthPosition::Start;
                             if self.month < 0 {
@@ -446,7 +480,7 @@ impl InputScan {
             }
             skip_blanks(text, &mut position);
             self.scanned_type = Date;
-            let month = self.skip_month(text, &mut position);
+            let month = skip_month(text, &mut position);
             if self.month != 0 && month != 0 {
                 return Ok(false);
             }
@@ -462,7 +496,7 @@ impl InputScan {
             }
         }
 
-        let month = self.skip_month(text, &mut position);
+        let month = skip_month(text, &mut position);
         if month != 0 {
             if self.month != 0 || !matches!(self.scanned_type, Undefined | Date) {
                 return Ok(false);
@@ -569,7 +603,7 @@ impl InputScan {
             skip_blanks(text, &mut position);
         }
 
-        if self.skip_currency(text, &mut position) {
+        if skip_currency(text, &mut position) {
             if self.scanned_type != Undefined {
                 return false;
             }
@@ -620,7 +654,7 @@ impl InputScan {
             }
             skip_blanks(text, &mut position);
             self.scanned_type = Date;
-            let month = self.skip_month(text, &mut position);
+            let month = skip_month(text, &mut position);
             if self.month != 0 && month != 0 {
                 return false;
             }
@@ -634,7 +668,7 @@ impl InputScan {
             }
         }
 
-        let month = self.skip_month(text, &mut position);
+        let month = skip_month(text, &mut position);
         if month != 0 {
             if self.month != 0 || !matches!(self.scanned_type, Undefined | Date) {
                 return false;
@@ -680,7 +714,7 @@ impl InputScan {
             if skip_string(locale::LONG_DATE_DAY_OF_WEEK_SEPARATOR, text, &mut position) {
                 skip_blanks(text, &mut position);
             }
-            let day_of_week = skip_name(&locale::DAYS_OF_WEEK, text, &mut position);
+            let day_of_week = skip_name(&locale::DAYS_FROM_SUNDAY, text, &mut position);
             if day_of_week == 0 {
                 position = before_day_name;
             } else if position < text.len() {
@@ -997,6 +1031,25 @@ mod tests {
         ] {
             assert_eq!(limit(text), Ok(None), "{text}");
         }
+    }
+
+    #[test]
+    fn limits_that_round_up_to_the_smallest_normal_number_underflow() {
+        let smallest = Ok(Some(f64::MIN_POSITIVE));
+        assert_eq!(limit("2.2250738585072014E-308"), smallest);
+        assert_eq!(limit("2.2250738585072013E-308"), smallest);
+        assert_eq!(limit("2.22507385850720125958E-308"), smallest);
+        assert_eq!(limit("2.22507385850720125957E-308"), Ok(None));
+        assert_eq!(limit("2.2250738585072012E-308"), Ok(None));
+        assert_eq!(limit("0.00022250738585072012E-304"), Ok(None));
+        assert_eq!(limit("22250738585072013E-324"), smallest);
+    }
+
+    #[test]
+    fn multiply_decimal_keeps_the_decimal_point() {
+        assert_eq!(multiply_decimal(b"12.5", 4), b"50.0");
+        assert_eq!(multiply_decimal(b"0.999", 1000), b"999.000");
+        assert_eq!(multiply_decimal(b"9", u64::MAX), b"166020696663385964535");
     }
 
     #[test]

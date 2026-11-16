@@ -16,7 +16,7 @@ pub(crate) const CURRENCY_BANK_SYMBOL: &[u8] = b"USD";
 pub(crate) const TIME_AM: &[u8] = b"AM";
 pub(crate) const TIME_PM: &[u8] = b"PM";
 
-/// Shown where a value is out of range for its format.
+// Shown where a value is out of range for its format.
 pub(crate) const ERROR_STRING: &[u8] = b"###";
 
 /// Abbreviated and full names.
@@ -44,8 +44,7 @@ pub(crate) const MONTHS: [Name; 12] = [
     name("Dec", "December"),
 ];
 
-/// Starting with Sunday.
-pub(crate) const DAYS_OF_WEEK: [Name; 7] = [
+pub(crate) const DAYS_FROM_SUNDAY: [Name; 7] = [
     name("Sun", "Sunday"),
     name("Mon", "Monday"),
     name("Tue", "Tuesday"),
@@ -62,5 +61,5 @@ pub(crate) const QUARTERS: [Name; 4] = [
     name("Q4", "4th quarter"),
 ];
 
-/// The calendar never leaves its first era, which has an abbreviation but no full name.
+// The calendar never leaves its first era, which has an abbreviation but no full name.
 pub(crate) const ERA: Name = name("BC", "");

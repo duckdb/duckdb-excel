@@ -10,7 +10,7 @@ use crate::math::to_i64;
 const DAYS_IN_MONTH: [u16; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 const MAX_DAYS: i64 = 3636532;
 
-/// Days from the Unix epoch to the serial number origin; date formats add it to their value first.
+// Days from the Unix epoch to the serial number origin; date formats add it to their value first.
 pub(crate) const EPOCH_OFFSET: f64 = -25569.0;
 
 fn is_leap_year(year: u16) -> bool {
@@ -159,27 +159,25 @@ impl Date {
     }
 }
 
-/// The calendar fields of one serial number that date formats can display.
+/// The calendar fields that date formats can display, for the date a number of days after the
+/// Unix epoch: a serial number plus [`EPOCH_OFFSET`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CalendarDate {
     pub(crate) day: u16,
-    /// Zero based month.
-    pub(crate) month: u16,
+    pub(crate) month_index: u16,
     pub(crate) year: u16,
-    /// 0 = Sunday.
-    pub(crate) day_of_week: u16,
+    pub(crate) days_since_sunday: u16,
     pub(crate) week_of_year: u16,
 }
 
 impl CalendarDate {
-    /// Fields of the date `epoch_days` after the Unix epoch: a serial number plus [`EPOCH_OFFSET`].
     pub(crate) fn from_epoch_days(epoch_days: f64) -> CalendarDate {
         let date = add_fractional_days(Date::new(30, 12, 1899), epoch_days - EPOCH_OFFSET);
         CalendarDate {
             day: date.day(),
-            month: date.month().wrapping_sub(1),
+            month_index: date.month().wrapping_sub(1),
             year: date.year(),
-            day_of_week: (date.day_of_week() + 1) % 7,
+            days_since_sunday: (date.day_of_week() + 1) % 7,
             week_of_year: date.week_of_year(),
         }
     }
@@ -214,9 +212,9 @@ mod tests {
         let date = CalendarDate::from_epoch_days(serial + EPOCH_OFFSET);
         (
             date.year,
-            date.month + 1,
+            date.month_index + 1,
             date.day,
-            date.day_of_week,
+            date.days_since_sunday,
             date.week_of_year,
         )
     }
