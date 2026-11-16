@@ -1,0 +1,12 @@
+[package]
+name = "excel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+duckdb-neo = { workspace = true, features = ["build-extension"] }
+excel_core.workspace = true

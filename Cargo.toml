@@ -1,0 +1,23 @@
+[workspace]
+members = ["crates/numformat", "crates/zip", "crates/core", "crates/native", "crates/wasm"]
+default-members = ["crates/native"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+duckdb-neo = "=0.20000.2"
+excel_core = { path = "crates/core" }
+excel_numformat = { path = "crates/numformat" }
+excel_zip = { path = "crates/zip" }
+quick-xml = "0.42"
+flate2 = "1"
+crc32fast = "1"
+unicode-normalization = "0.1"
+
+[profile.release]
+lto = true
+strip = true
