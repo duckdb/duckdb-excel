@@ -1,0 +1,2 @@
+# Trailing blanks are part of the expected values.
+crates/numformat/tests/data/*.tsv -text whitespace=-blank-at-eol

@@ -2,7 +2,7 @@
 name = "excel_core"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT AND Apache-2.0"
 
 [dependencies]
 duckdb-neo.workspace = true

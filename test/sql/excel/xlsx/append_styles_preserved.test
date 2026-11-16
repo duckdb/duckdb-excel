@@ -3,9 +3,6 @@
 
 require excel
 
-require notwindows  # COPY framework MoveTmpFile races with Defender on consecutive same-path writes
-
-
 # Seed a workbook then append a sheet with typed values (date/time/timestamp/boolean)
 # that need style indices. The styles.xml from the fresh-write path uses indices 1..5;
 # the appender must reuse those (or splice new ones) and produce a sheet whose typed

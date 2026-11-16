@@ -38,7 +38,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build
         run: cargo build --workspace --locked
@@ -47,3 +47,7 @@ jobs:
       # which cannot run against an in-process DuckDB.
       - name: Test
         run: cargo test -p excel_numformat -p excel_zip -p excel_core --locked
+
+      # The formatter's digits depend on how calls into libm are compiled, so check the optimized build too.
+      - name: Test the number formatter in release mode
+        run: cargo test -p excel_numformat --release --locked
