@@ -14,7 +14,8 @@ use crate::format::{
 
 const OUTPUT_BUFFER_LEN: usize = 64 * 1024;
 const INPUT_BUFFER_LEN: usize = 32 * 1024;
-const COMPRESSION_LEVEL: u32 = 6;
+// Level 6 takes up to twice the time of level 5 for files of the same size; level 4 gives larger files.
+const COMPRESSION_LEVEL: u32 = 5;
 const ZIP_VERSION: u16 = 20;
 const DOS_DATE_1980_01_01: u16 = (1 << 5) | 1;
 const MAX_ENTRIES: u16 = 0xFFFE;

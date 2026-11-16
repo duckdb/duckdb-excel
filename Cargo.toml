@@ -14,7 +14,7 @@ excel_core = { path = "crates/core" }
 excel_numformat = { path = "crates/numformat" }
 excel_zip = { path = "crates/zip" }
 quick-xml = "0.42"
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 crc32fast = "1"
 unicode-normalization = "0.1"
 
