@@ -1,0 +1,13 @@
+require excel
+
+# File ends halfway through a local file header
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/truncated_local_header.xlsx');
+----
+IO Error: Failed to open zip for reading
+
+# File ends halfway through a data descriptor
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/truncated_data_descriptor.xlsx');
+----
+Binder Error: No xl/workbook.xml found in xlsx file
