@@ -1,0 +1,10 @@
+# name: test/sql/excel/xlsx/zip64_data_descriptor.test
+# description: Issue #110 - entries with 8-byte (Zip64-style) data descriptors but no Zip64 extra field
+# group: [xlsx]
+
+require excel
+
+query IT
+SELECT * FROM read_xlsx('test/data/xlsx/zip64_data_descriptor.xlsx')
+----
+1.0	x
