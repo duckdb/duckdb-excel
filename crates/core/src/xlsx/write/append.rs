@@ -23,6 +23,7 @@ use crate::{
             styles_append::{NumberFormat, StylesAppendParser},
             workbook::{SheetEntry, WorkbookParser},
         },
+        serial::DateSystem,
         write::{
             package::{
                 CONTENT_TYPES_PATH, STYLES_PATH, WORKBOOK_PATH, WORKBOOK_RELATIONS_PATH,
@@ -58,6 +59,8 @@ pub struct AppendPlan {
     /// The file name of the part of the sheet in `xl/worksheets/`.
     pub sheet_file: String,
     pub styles: CellStyles,
+    /// The day the workbook counts its serial numbers from, which those of the sheet must count from too.
+    pub date_system: DateSystem,
     /// The parts that replace those of the workbook, in the order they are written after the sheet.
     pub patched_parts: Vec<(&'static str, Vec<u8>)>,
     replaced_sheet: Option<String>,
@@ -82,7 +85,11 @@ impl AppendPlan {
         let relations_xml = required(WORKBOOK_RELATIONS_PATH)?;
         let styles_xml = required(STYLES_PATH)?;
 
-        let sheets = parsed(&workbook_xml, WorkbookParser::refusing_empty_values())?.sheets;
+        let WorkbookParser {
+            sheets,
+            date_system,
+            ..
+        } = parsed(&workbook_xml, WorkbookParser::for_append())?;
         let relations = parsed(&relations_xml, RelationshipsParser::new())?.relations;
         let styles_parser = parsed(&styles_xml, StylesAppendParser::new())?;
         let needs = StyleNeeds::resolve(&styles_parser.number_formats, &styles_parser.cell_styles);
@@ -145,6 +152,7 @@ impl AppendPlan {
         Ok(AppendPlan {
             sheet_file,
             styles: needs.styles,
+            date_system,
             patched_parts,
             replaced_sheet,
         })

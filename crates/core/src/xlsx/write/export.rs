@@ -21,6 +21,7 @@ use crate::{
     xlsx::{
         archive::Archive,
         cell::MAX_CELL_ROWS,
+        serial::DateSystem,
         write::{
             append::AppendPlan,
             convert::{ConversionPlan, TextConverter},
@@ -430,7 +431,11 @@ impl Export {
             }
             return Ok(());
         }
-        let mut converter = TextConverter::new(context, &plan.conversions)?;
+        let date_system = match &self.completion {
+            Completion::NewWorkbook => DateSystem::Since1900,
+            Completion::Appended { plan, .. } => plan.date_system,
+        };
+        let mut converter = TextConverter::new(context, &plan.conversions, date_system)?;
         let mut scan = input.to_scan(context)?;
         while let Some(chunk) = scan.next_chunk()? {
             converter.convert(&chunk)?;

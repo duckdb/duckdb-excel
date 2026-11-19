@@ -6,6 +6,7 @@ use duckdb_neo::Result;
 
 use crate::xlsx::{
     cell::parse_integer,
+    escape::decode_escaped_units,
     strings::StringTable,
     xml::{Attributes, Flow, XmlHandler},
 };
@@ -28,11 +29,13 @@ enum State {
     Rph,
 }
 
-/// Puts the text runs of each string item together and leaves out phonetic text.
+/// Puts the text runs of each string item together, each with its `_xHHHH_` escapes resolved, and leaves out
+/// phonetic text.
 #[derive(Debug)]
 pub struct SharedStringsParser<S> {
     state: State,
     data: String,
+    run_start: usize,
     pub sink: S,
 }
 
@@ -41,6 +44,7 @@ impl<S: StringSink> SharedStringsParser<S> {
         SharedStringsParser {
             state: State::Start,
             data: String::new(),
+            run_start: 0,
             sink,
         }
     }
@@ -57,7 +61,10 @@ impl<S: StringSink> XmlHandler for SharedStringsParser<S> {
                 }
             }
             State::Sst if name == "si" => self.state = State::Si,
-            State::Si if name == "t" => self.state = State::T,
+            State::Si if name == "t" => {
+                self.state = State::T;
+                self.run_start = self.data.len();
+            }
             State::Si if name == "rPh" => self.state = State::Rph,
             _ => {}
         }
@@ -66,7 +73,10 @@ impl<S: StringSink> XmlHandler for SharedStringsParser<S> {
 
     fn end_element(&mut self, name: &str) -> Result<Flow> {
         match self.state {
-            State::T if name == "t" => self.state = State::Si,
+            State::T if name == "t" => {
+                self.state = State::Si;
+                decode_escaped_units(&mut self.data, self.run_start);
+            }
             State::Si if name == "si" => {
                 self.state = State::Sst;
                 let flow = self.sink.string(&self.data);
@@ -166,6 +176,27 @@ mod tests {
         assert_eq!(
             table(STRINGS),
             ["plain", "rich text", "漢字", " a & b <c> ", "", ""]
+        );
+    }
+
+    #[test]
+    fn escapes_are_resolved_in_every_run_on_its_own() {
+        let xml = r#"<sst><si><t>line_x000D__x000A_break</t></si>
+            <si><r><t>tab_x0009_</t></r><r><t>_x005F_x0041_ _xD83D__xDE00_</t></r></si>
+            <si><r><t>_x00</t></r><r><t>41_</t></r></si>
+            <si><t>a_x0041_<!-- c -->_x0042_&amp;_x0043</t><t>_</t></si>
+            <si><t>x</t><rPh><t>_x0041_</t></rPh></si>
+            <si><t>&#95;x0041_ _x0041&#95; _x00&#52;1_</t></si></sst>"#;
+        assert_eq!(
+            table(xml),
+            [
+                "line\r\nbreak",
+                "tab\t_x0041_ \u{1F600}",
+                "_x0041_",
+                "aAB&_x0043_",
+                "x",
+                "A A A"
+            ]
         );
     }
 

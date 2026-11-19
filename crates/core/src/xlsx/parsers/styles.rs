@@ -23,6 +23,7 @@ pub enum NumberKind {
 
 /// The number formats below this id are built into Excel; the others are defined by the workbook.
 const FIRST_CUSTOM_FORMAT: i64 = 164;
+const GENERAL_FORMAT: i64 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -35,7 +36,8 @@ enum State {
 }
 
 /// Collects the number kind of every cell style, in the order cells refer to them with their `s` attribute.
-/// A style whose custom number format the workbook does not define is left out.
+/// A style without a number format has the general one, and a style whose custom number format the workbook
+/// does not define is left out.
 #[derive(Debug)]
 pub struct StylesParser {
     state: State,
@@ -102,10 +104,8 @@ impl XmlHandler for StylesParser {
             }
             State::CellXfs => {
                 self.state = State::Xf;
-                let [Some(id)] = attributes.get(["numFmtId"])? else {
-                    return Err(invalid_input("Invalid xf entry in styles.xml"));
-                };
-                let id = parse_integer(&id);
+                let [id] = attributes.get(["numFmtId"])?;
+                let id = id.map_or(GENERAL_FORMAT, |id| parse_integer(&id));
                 if id < FIRST_CUSTOM_FORMAT {
                     self.cell_styles.push(builtin_format_kind(id));
                 } else if let Some(kind) = self.number_formats.get(&id) {
@@ -232,12 +232,18 @@ mod tests {
     }
 
     #[test]
-    fn entries_without_a_format_id_are_errors() {
+    fn number_formats_without_an_id_are_errors() {
         let error = parse("<styleSheet><numFmts><numFmt formatCode=\"0\"/></numFmts></styleSheet>")
             .unwrap_err();
         assert_eq!(error.code, DuckDBError::InputInvalid);
         assert_eq!(error.message, "Invalid numFmt entry in styles.xml");
-        let error = parse("<styleSheet><cellXfs><xf/></cellXfs></styleSheet>").unwrap_err();
-        assert_eq!(error.message, "Invalid xf entry in styles.xml");
+    }
+
+    #[test]
+    fn styles_without_a_number_format_have_the_general_one() {
+        use NumberKind::{Date, Double, Time};
+        let xml = r#"<styleSheet><cellXfs><xf/><xf numFmtId="14"/><xf fontId="1" applyFont="1"></xf>
+            <xf numFmtId="20"/></cellXfs></styleSheet>"#;
+        assert_eq!(parse(xml).unwrap(), [Double, Date, Double, Time]);
     }
 }

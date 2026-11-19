@@ -1,16 +1,20 @@
 //! The scan behind `read_xlsx` and `COPY ... FROM`: reads the rows of a sheet as text and lets DuckDB cast them
 //! to the column types.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    fmt,
+    ops::Range,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use duckdb_neo::{
-    DuckDBType, Result,
+    DuckDBType, Error, Result,
     connection::Context,
     data_chunk::{DataChunk, DataChunkRef},
     file::FileSystem,
     logical_type::{LogicalType, LogicalTypeID},
     types::{DateValue, TimeValue, TimestampValue},
-    vector::{Unknown, Vector},
+    vector::{Unknown, Vector, WritableNativeElement},
 };
 
 use crate::{
@@ -24,13 +28,14 @@ use crate::{
             shared_strings::SharedStringsParser,
         },
         resolve::{SHARED_STRINGS_PATH, SheetLayout},
-        serial::{epoch_micros_to_date, epoch_micros_to_time, serial_to_epoch_micros},
+        serial::{DateSystem, SerialError, serial_to_date, serial_to_time, serial_to_timestamp},
         strings::StringTable,
     },
 };
 
 /// How the text of the cells of a column becomes values of the column type: a text column takes it as it is,
-/// the numbers of a date or time column are serial numbers, and DuckDB casts everything else.
+/// the numbers of a date or time column are serial numbers, and DuckDB casts everything else. A serial number
+/// that is no value of the column type is a cell that does not convert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Conversion {
     Text,
@@ -59,6 +64,7 @@ pub struct ScanPlan {
     stop_at_empty: bool,
     fill_range: bool,
     ignore_errors: bool,
+    date_system: DateSystem,
     pub columns: Vec<ScanColumn>,
 }
 
@@ -102,6 +108,7 @@ impl ScanPlan {
             stop_at_empty: options.stop_at_empty,
             fill_range: options.has_explicit_range && !options.stop_at_empty,
             ignore_errors: options.ignore_errors,
+            date_system: layout.date_system,
             columns,
         })
     }
@@ -129,7 +136,7 @@ impl ScanProgress {
 
 /// A scan in progress: the open sheet and the rows read ahead.
 ///
-/// A cell that does not convert is reported with the message of the first cast that failed in the scan, which
+/// A cell DuckDB cannot cast is reported with the message of the first cast that failed in the scan, which
 /// may have been the cast of another cell.
 #[derive(Debug)]
 pub struct SheetScan {
@@ -203,7 +210,7 @@ impl SheetScan {
     }
 }
 
-fn missing_state() -> duckdb_neo::Error {
+fn missing_state() -> Error {
     internal("xlsx: the scan state is missing")
 }
 
@@ -234,6 +241,17 @@ impl CastTarget for DataChunk<'_> {
     }
 }
 
+/// Where the text of the cells of a column goes: into the output, or into a vector that is cast afterwards.
+#[derive(Debug, Clone, Copy)]
+enum TextTarget {
+    Output(usize),
+    Scratch(usize),
+}
+
+/// The cells a block of rows has at most when a batch is written to its vectors, and the rows it has at least.
+const BLOCK_CELLS: usize = 32 * 1024;
+const MIN_BLOCK_ROWS: usize = 32;
+
 /// Turns a batch of rows into the vectors of an output chunk.
 ///
 /// A cell that does not convert becomes NULL when it is empty or errors are ignored, and fails the scan
@@ -259,15 +277,18 @@ impl Emitter<'_> {
         }
 
         let columns = &self.plan.columns;
-        let casts = columns
-            .iter()
-            .filter(|column| column.conversion != Conversion::Text)
-            .count();
-        if casts == 0 {
-            for index in 0..present {
-                self.write_text(output.get_vector_at_mut(index)?, index)?;
+        let mut targets = Vec::with_capacity(columns.len());
+        let mut casts = 0;
+        for (index, column) in columns.iter().enumerate() {
+            if column.conversion != Conversion::Text {
+                targets.push((index, TextTarget::Scratch(casts)));
+                casts += 1;
+            } else if index < present {
+                targets.push((index, TextTarget::Output(index)));
             }
-            return Ok(());
+        }
+        if casts == 0 {
+            return self.write_texts(&targets, &mut output, None);
         }
         let varchar = String::logical_type(self.context)?;
         let mut texts = DataChunk::create(self.context, vec![varchar; casts], true)?;
@@ -284,21 +305,17 @@ impl Emitter<'_> {
         } else {
             Some(DataChunk::create(self.context, unseen_types, true)?)
         };
+        self.write_texts(&targets, &mut output, Some(&mut texts))?;
 
         let mut next_text = 0;
         let mut next_unseen = 0;
         for (index, column) in columns.iter().enumerate() {
-            let is_present = index < present;
             if column.conversion == Conversion::Text {
-                if is_present {
-                    self.write_text(output.get_vector_at_mut(index)?, index)?;
-                }
                 continue;
             }
-            let text_index = next_text;
+            let is_present = index < present;
+            let text = texts.get_vector_at::<String>(next_text)?;
             next_text += 1;
-            self.write_text(texts.get_vector_at_mut(text_index)?, index)?;
-            let text = texts.get_vector_at::<String>(text_index)?;
             match column.conversion {
                 Conversion::Cast if is_present => self.cast(text, &mut output, index, index)?,
                 Conversion::Cast => {
@@ -307,22 +324,70 @@ impl Emitter<'_> {
                         next_unseen += 1;
                     }
                 }
-                conversion => {
+                Conversion::SerialDate => {
+                    let system = self.plan.date_system;
+                    let date = |serial| serial_to_date(serial, system).map(DateValue);
                     self.cast(text, &mut doubles, 0, index)?;
-                    let serials = doubles.get_vector_at::<f64>(0)?;
                     let target = is_present.then_some(&mut output);
-                    write_serials(serials, conversion, target, index)?;
+                    self.write_serials(&doubles, target, index, "DATE", date)?;
                 }
+                Conversion::SerialTime => {
+                    let time = |serial| serial_to_time(serial).map(TimeValue);
+                    self.cast(text, &mut doubles, 0, index)?;
+                    let target = is_present.then_some(&mut output);
+                    self.write_serials(&doubles, target, index, "TIME", time)?;
+                }
+                Conversion::SerialTimestamp => {
+                    let system = self.plan.date_system;
+                    let timestamp =
+                        |serial| serial_to_timestamp(serial, system).map(TimestampValue);
+                    self.cast(text, &mut doubles, 0, index)?;
+                    let target = is_present.then_some(&mut output);
+                    self.write_serials(&doubles, target, index, "TIMESTAMP", timestamp)?;
+                }
+                Conversion::Text => {}
             }
         }
         Ok(())
     }
 
-    fn write_text(&self, mut vector: Vector<'_, String>, column: usize) -> Result<()> {
+    fn write_texts(
+        &self,
+        targets: &[(usize, TextTarget)],
+        output: &mut DataChunkRef<'_>,
+        mut scratch: Option<&mut DataChunk<'_>>,
+    ) -> Result<()> {
         let rows = self.batch.len();
-        vector.set_size(rows)?;
+        // The cells of a wide sheet are written a block of rows at a time, so that what a block reads and
+        // writes stays in the cache: the batch holds them row by row, the vectors column by column.
+        let block_rows = (BLOCK_CELLS / self.plan.columns.len().max(1)).max(MIN_BLOCK_ROWS);
+        let mut first = 0;
+        while first < rows {
+            let block = first..rows.min(first.saturating_add(block_rows));
+            for (column, target) in targets {
+                let vector = match (target, scratch.as_mut()) {
+                    (TextTarget::Output(index), _) => output.get_vector_at_mut(*index)?,
+                    (TextTarget::Scratch(index), Some(scratch)) => {
+                        scratch.get_vector_at_mut(*index)?
+                    }
+                    (TextTarget::Scratch(_), None) => return Err(missing_state()),
+                };
+                self.write_text(vector, *column, block.clone())?;
+            }
+            first = block.end;
+        }
+        Ok(())
+    }
+
+    fn write_text(
+        &self,
+        mut vector: Vector<'_, String>,
+        column: usize,
+        rows: Range<usize>,
+    ) -> Result<()> {
+        vector.set_size(self.batch.len())?;
         let mut writer = vector.writer()?;
-        for row in 0..rows {
+        for row in rows {
             let text = match self.batch.cell(row, column) {
                 CellValue::Null => None,
                 CellValue::Text(text) => Some(text),
@@ -346,12 +411,12 @@ impl Emitter<'_> {
         let Some(failure) = failure else {
             return Ok(());
         };
-        let message = self
-            .cast_error
+        self.cast_error
             .get_or_insert_with(|| raw_message(&failure).to_owned());
         if self.plan.ignore_errors {
             return Ok(());
         }
+        let message = self.cast_error.as_deref().unwrap_or_default();
         let values = target.result(index)?.reader()?;
         for row in 0..self.batch.len() {
             let text = match self.batch.cell(row, column) {
@@ -360,64 +425,56 @@ impl Emitter<'_> {
                 CellValue::Shared(index) => self.strings.get(index).unwrap_or_default(),
             };
             if !text.is_empty() && values.is_null(row)? {
-                let sheet_row = self.batch.sheet_row(row).unwrap_or_default();
-                let sheet_col = self.plan.range.beg.col.wrapping_add(column as u64);
-                let cell = CellPos::new(sheet_row, sheet_col);
-                return Err(invalid_input(format!(
-                    "read_xlsx: Failed to parse cell '{cell}': {message}"
-                )));
+                return Err(self.cell_error(row, column, message));
             }
         }
         Ok(())
     }
-}
 
-fn write_serials(
-    serials: &Vector<'_, f64>,
-    conversion: Conversion,
-    output: Option<&mut DataChunkRef<'_>>,
-    index: usize,
-) -> Result<()> {
-    let rows = serials.len();
-    let serials = serials.reader()?;
-    let micros = |row: usize| -> Result<Option<i64>> {
-        Ok(serials
-            .get(row)?
-            .map(|serial| serial_to_epoch_micros(*serial)))
-    };
-    match (conversion, output) {
-        (Conversion::SerialTime, None) => {
-            for row in 0..rows {
-                micros(row)?.map(epoch_micros_to_time).transpose()?;
-            }
-        }
-        (Conversion::SerialTime, Some(output)) => {
-            let mut vector = output.get_vector_at_mut::<TimeValue>(index)?;
-            vector.set_size(rows)?;
-            let mut writer = vector.writer()?;
-            for row in 0..rows {
-                let time = micros(row)?.map(epoch_micros_to_time).transpose()?;
-                writer.set_option(row, time.map(TimeValue).as_ref())?;
-            }
-        }
-        (Conversion::SerialDate, Some(output)) => {
-            let mut vector = output.get_vector_at_mut::<DateValue>(index)?;
-            vector.set_size(rows)?;
-            let mut writer = vector.writer()?;
-            for row in 0..rows {
-                let date = micros(row)?.map(epoch_micros_to_date);
-                writer.set_option(row, date.map(DateValue).as_ref())?;
-            }
-        }
-        (Conversion::SerialTimestamp, Some(output)) => {
-            let mut vector = output.get_vector_at_mut::<TimestampValue>(index)?;
-            vector.set_size(rows)?;
-            let mut writer = vector.writer()?;
-            for row in 0..rows {
-                writer.set_option(row, micros(row)?.map(TimestampValue).as_ref())?;
-            }
-        }
-        _ => {}
+    fn cell_error(&self, row: usize, column: usize, reason: impl fmt::Display) -> Error {
+        let sheet_row = self.batch.sheet_row(row).unwrap_or_default();
+        let sheet_col = self.plan.range.beg.col.wrapping_add(column as u64);
+        let cell = CellPos::new(sheet_row, sheet_col);
+        invalid_input(format!(
+            "read_xlsx: Failed to parse cell '{cell}': {reason}"
+        ))
     }
-    Ok(())
+
+    fn write_serials<T: WritableNativeElement<Write = T>>(
+        &self,
+        doubles: &DataChunk<'_>,
+        output: Option<&mut DataChunkRef<'_>>,
+        column: usize,
+        type_name: &str,
+        convert: impl Fn(f64) -> std::result::Result<T, SerialError>,
+    ) -> Result<()> {
+        let serials = doubles.get_vector_at::<f64>(0)?;
+        let rows = serials.len();
+        let serials = serials.reader()?;
+        let mut vector = match output {
+            Some(output) => Some(output.get_vector_at_mut::<T>(column)?),
+            None => None,
+        };
+        if let Some(vector) = vector.as_mut() {
+            vector.set_size(rows)?;
+        }
+        let mut writer = vector.as_mut().map(Vector::writer).transpose()?;
+        for row in 0..rows {
+            let value = match serials.get(row)?.map(|serial| (*serial, convert(*serial))) {
+                None => None,
+                Some((_, Ok(value))) => Some(value),
+                Some((_, Err(_))) if self.plan.ignore_errors => None,
+                Some((serial, Err(reason))) => {
+                    let reason = format!(
+                        "Could not convert the serial number {serial:?} to {type_name}: {reason}"
+                    );
+                    return Err(self.cell_error(row, column, reason));
+                }
+            };
+            if let Some(writer) = writer.as_mut() {
+                writer.set_option(row, value.as_ref())?;
+            }
+        }
+        Ok(())
+    }
 }

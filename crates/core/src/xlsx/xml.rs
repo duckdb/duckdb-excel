@@ -2,7 +2,8 @@
 //!
 //! Handlers see what a non-validating SAX parser without namespace support would show them: element names
 //! without their prefix, attribute names as written, and attribute values and character data with entities and
-//! line ends resolved. Only UTF-8 documents are read, and entities a document declares itself are not known.
+//! line ends resolved. Documents are in UTF-8, UTF-16 or ISO-8859-1; the latter two are converted to UTF-8 as
+//! they are read. Entities a document declares itself are not known.
 
 use std::{
     borrow::Cow,
@@ -17,7 +18,10 @@ use quick_xml::{
     events::{BytesStart, Event},
 };
 
-use crate::error;
+use crate::{
+    error,
+    xlsx::encoding::{Declared, Encoding, MalformedText, Transcoder},
+};
 
 const SOURCE_BUFFER_LEN: usize = 32 * 1024;
 
@@ -94,6 +98,22 @@ impl<'a> Attributes<'a> {
             return Ok(values);
         }
         let mut values = [const { None }; N];
+        self.for_each(|name, value| {
+            if let Some(index) = names.iter().position(|wanted| *wanted == name) {
+                values[index] = Some(value);
+            }
+        })?;
+        Ok(values)
+    }
+
+    /// Every attribute of the tag in the order they are written, with its value as [`Self::get`] returns it.
+    pub fn all(&self) -> Result<Vec<(&'a str, Cow<'a, str>)>> {
+        let mut attributes = Vec::new();
+        self.for_each(|name, value| attributes.push((name, value)))?;
+        Ok(attributes)
+    }
+
+    fn for_each(&self, mut visit: impl FnMut(&'a str, Cow<'a, str>)) -> Result<()> {
         let mut seen = [""; Self::SMALL_TAG];
         let mut count = 0;
         // The duplicate check of quick-xml allocates for every tag, so tags with few attributes, which is
@@ -116,9 +136,7 @@ impl<'a> Attributes<'a> {
             let value = attribute
                 .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|error| self.error(error))?;
-            if let Some(index) = names.iter().position(|wanted| *wanted == name) {
-                values[index] = Some(value);
-            }
+            visit(name, value);
         }
         if count > Self::SMALL_TAG {
             for attribute in self.tag.attributes() {
@@ -126,7 +144,7 @@ impl<'a> Attributes<'a> {
             }
         }
         self.checked.set(true);
-        Ok(values)
+        Ok(())
     }
 
     fn get_plain<const N: usize>(&self, names: [&str; N]) -> Option<[Option<Cow<'a, str>>; N]> {
@@ -196,18 +214,33 @@ impl fmt::Display for Oversized {
 
 impl std::error::Error for Oversized {}
 
-/// Buffers the document and watches what quick-xml does not: it refuses to feed a single event more than
-/// `limit` bytes, which keeps a document that never closes a tag or a text from being held in memory as a whole,
-/// and it notes where the first control character that XML forbids is, which is cheaper to find in whole
-/// buffers than in every event. `event_start` is where in the document the event being read begins.
+/// Where the bytes of a document come from once its encoding is known.
+#[derive(Debug)]
+enum Input {
+    Unread,
+    Utf8,
+    Transcoded(Box<Transcoder>),
+}
+
+/// Buffers the document as UTF-8 and watches what quick-xml does not: it refuses to feed a single event more
+/// than `limit` bytes, which keeps a document that never closes a tag or a text from being held in memory as a
+/// whole, and it notes where the first control character that XML forbids is, which is cheaper to find in whole
+/// buffers than in every event. For the same reason it notes whether the document has had a carriage return
+/// or a `]` yet: without them no text has a line end to normalize or a `]]>` to refuse. `event_start` is where
+/// in the document the event being read begins.
 #[derive(Debug)]
 struct Source<R> {
     inner: R,
+    input: Input,
+    encoding: Encoding,
     buffer: Box<[u8]>,
     start: usize,
     end: usize,
     bytes_read: u64,
+    source_bytes_before: u64,
     first_control: Option<u64>,
+    has_carriage_return: bool,
+    has_closing_bracket: bool,
     event_start: u64,
     limit: usize,
 }
@@ -231,23 +264,79 @@ impl<R: Read> Source<R> {
         if self.bytes_read - self.event_start > self.limit as u64 {
             return Err(io::Error::other(Oversized));
         }
-        let count = loop {
-            match self.inner.read(&mut self.buffer) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                result => break result?,
+        let count = match &mut self.input {
+            Input::Unread => None,
+            Input::Utf8 => Some(read_some(&mut self.inner, &mut self.buffer)?),
+            Input::Transcoded(transcoder) => {
+                Some(transcoder.read(&mut self.inner, &mut self.buffer)?)
             }
+        };
+        let count = match count {
+            Some(count) => count,
+            None => self.read_start()?,
         };
         self.start = 0;
         self.end = count.min(self.buffer.len());
         let fresh = self.buffer.get(..self.end).unwrap_or_default();
-        if self.first_control.is_none() && has_control_character(fresh) {
-            self.first_control = fresh
-                .iter()
-                .position(|byte| is_control_character(*byte))
-                .map(|index| self.bytes_read + index as u64);
+        // Nearly every buffer has none of these bytes, which a single pass over it tells.
+        if has_unusual_byte(fresh) {
+            self.has_carriage_return |= fresh.contains(&b'\r');
+            self.has_closing_bracket |= fresh.contains(&b']');
+            if self.first_control.is_none() {
+                self.first_control = fresh
+                    .iter()
+                    .position(|byte| is_control_character(*byte))
+                    .map(|index| self.bytes_read + index as u64);
+            }
         }
         self.bytes_read += self.end as u64;
         Ok(())
+    }
+
+    fn read_start(&mut self) -> io::Result<usize> {
+        let mut filled = 0;
+        let (encoding, skipped) = loop {
+            let room = self
+                .buffer
+                .get_mut(filled..Encoding::DETECTION_LEN)
+                .unwrap_or_default();
+            let count = read_some(&mut self.inner, room)?;
+            filled += count;
+            let start = self.buffer.get(..filled).unwrap_or_default();
+            if let Some(found) = Encoding::of_document(start, count == 0) {
+                break found;
+            }
+        };
+        self.encoding = encoding;
+        let start = self.buffer.get(skipped..filled).unwrap_or_default();
+        match Transcoder::new(encoding, start) {
+            None => {
+                self.input = Input::Utf8;
+                Ok(filled)
+            }
+            Some(mut transcoder) => {
+                let count = transcoder.read(&mut self.inner, &mut self.buffer)?;
+                self.source_bytes_before = filled as u64;
+                self.input = Input::Transcoded(Box::new(transcoder));
+                Ok(count)
+            }
+        }
+    }
+
+    fn source_bytes_read(&self) -> u64 {
+        match &self.input {
+            Input::Transcoded(transcoder) => self.source_bytes_before + transcoder.raw_bytes_read(),
+            Input::Unread | Input::Utf8 => self.bytes_read,
+        }
+    }
+}
+
+fn read_some<R: Read>(source: &mut R, target: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match source.read(target) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return Ok(result?.min(target.len())),
+        }
     }
 }
 
@@ -275,7 +364,6 @@ pub struct XmlReader<R: Read> {
     buffer: Vec<u8>,
     depth: usize,
     has_root: bool,
-    started: bool,
     at_start: bool,
     done: bool,
 }
@@ -295,11 +383,16 @@ impl<R: Read> XmlReader<R> {
     pub fn new(source: R, limit: Option<usize>) -> XmlReader<R> {
         let mut reader = quick_xml::Reader::from_reader(Source {
             inner: source,
+            input: Input::Unread,
+            encoding: Encoding::Utf8,
             buffer: vec![0; SOURCE_BUFFER_LEN].into_boxed_slice(),
             start: 0,
             end: 0,
             bytes_read: 0,
+            source_bytes_before: 0,
             first_control: None,
+            has_carriage_return: false,
+            has_closing_bracket: false,
             event_start: 0,
             limit: limit.unwrap_or(usize::MAX),
         });
@@ -309,7 +402,6 @@ impl<R: Read> XmlReader<R> {
             buffer: Vec::new(),
             depth: 0,
             has_root: false,
-            started: false,
             at_start: true,
             done: false,
         }
@@ -317,7 +409,7 @@ impl<R: Read> XmlReader<R> {
 
     /// The number of bytes taken from the source so far.
     pub fn bytes_read(&self) -> u64 {
-        self.reader.get_ref().bytes_read
+        self.reader.get_ref().source_bytes_read()
     }
 
     /// Feeds `handler` until it pauses or stops the reader, or until the document ends.
@@ -332,10 +424,6 @@ impl<R: Read> XmlReader<R> {
     }
 
     fn parse_events<H: XmlHandler>(&mut self, handler: &mut H) -> Result<Parsed> {
-        if !self.started {
-            self.started = true;
-            self.reject_utf16()?;
-        }
         let mut flow = Flow::Continue;
         loop {
             match flow {
@@ -354,10 +442,15 @@ impl<R: Read> XmlReader<R> {
                 }
             };
             let position = self.reader.buffer_position();
-            let first_control = self.reader.get_ref().first_control;
-            if first_control.is_some_and(|control| control < position) {
+            let source = self.reader.get_ref();
+            if source
+                .first_control
+                .is_some_and(|control| control < position)
+            {
                 return Err(parse_error(position, "invalid character"));
             }
+            let (has_carriage_return, has_closing_bracket) =
+                (source.has_carriage_return, source.has_closing_bracket);
             let at_start = std::mem::take(&mut self.at_start);
             flow = match event {
                 Event::Start(tag) => {
@@ -380,10 +473,17 @@ impl<R: Read> XmlReader<R> {
                         if !text.bytes().all(is_xml_whitespace) {
                             return Err(parse_error(position, "text outside the document element"));
                         }
-                    } else if text.as_bytes().contains(&b'>') && text.contains("]]>") {
+                    } else if has_closing_bracket
+                        && text.as_bytes().contains(&b'>')
+                        && text.contains("]]>")
+                    {
                         return Err(parse_error(position, "']]>' in text"));
                     } else if handler.collects_text() {
-                        handler.text(&text.xml10_content())?;
+                        if has_carriage_return {
+                            handler.text(&text.xml10_content())?;
+                        } else {
+                            handler.text(&text)?;
+                        }
                     }
                     Flow::Continue
                 }
@@ -418,13 +518,19 @@ impl<R: Read> XmlReader<R> {
                     declaration
                         .version()
                         .map_err(|error| parse_error(position, error))?;
-                    if let Some(encoding) = declaration.encoding() {
-                        let encoding = encoding.map_err(|error| parse_error(position, error))?;
-                        if !["utf-8", "us-ascii"]
-                            .iter()
-                            .any(|supported| encoding.eq_ignore_ascii_case(supported))
-                        {
-                            return Err(unsupported_encoding(&encoding));
+                    if let Some(declared) = declaration.encoding() {
+                        let declared = declared.map_err(|error| parse_error(position, error))?;
+                        match self.reader.get_ref().encoding.accepts(&declared) {
+                            Declared::Fits => {}
+                            Declared::Differs => {
+                                return Err(parse_error(
+                                    position,
+                                    format_args!(
+                                        "the document is not in the encoding '{declared}' it declares"
+                                    ),
+                                ));
+                            }
+                            Declared::Unknown => return Err(unsupported_encoding(&declared)),
                         }
                     }
                     Flow::Continue
@@ -448,20 +554,6 @@ impl<R: Read> XmlReader<R> {
     pub fn parse_all<H: XmlHandler>(&mut self, handler: &mut H) -> Result<()> {
         while self.parse(handler)? == Parsed::Paused {}
         Ok(())
-    }
-
-    fn reject_utf16(&mut self) -> Result<()> {
-        let start = self
-            .reader
-            .get_mut()
-            .fill_buf()
-            .map_err(|error| error::from_io(&error))?;
-        match start {
-            [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..] | [b'<', 0, ..] | [0, b'<', ..] => {
-                Err(unsupported_encoding("UTF-16"))
-            }
-            _ => Ok(()),
-        }
     }
 }
 
@@ -507,7 +599,7 @@ fn empty_element<H: XmlHandler>(
 
 fn unsupported_encoding(encoding: &str) -> Error {
     error::io(format!(
-        "XML parse error: unsupported encoding '{encoding}', only UTF-8 is supported"
+        "XML parse error: unsupported encoding '{encoding}', only UTF-8, UTF-16 and ISO-8859-1 are supported"
     ))
 }
 
@@ -519,11 +611,13 @@ fn read_error<H: XmlHandler>(
 ) -> Error {
     match &error {
         quick_xml::Error::Io(io_error) => {
-            let oversized = io_error
-                .get_ref()
-                .is_some_and(|inner| inner.is::<Oversized>());
-            if oversized {
+            let inner = io_error.get_ref();
+            if inner.is_some_and(|inner| inner.is::<Oversized>()) {
                 handler.oversized(limit)
+            } else if let Some(malformed) =
+                inner.and_then(|inner| inner.downcast_ref::<MalformedText>())
+            {
+                parse_error(position, malformed)
             } else {
                 error::from_io(io_error)
             }
@@ -543,10 +637,14 @@ fn is_xml_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
 }
 
-fn has_control_character(bytes: &[u8]) -> bool {
+fn has_unusual_byte(bytes: &[u8]) -> bool {
     bytes
         .iter()
-        .fold(false, |found, byte| found | is_control_character(*byte))
+        .fold(false, |found, byte| found | is_unusual_byte(*byte))
+}
+
+fn is_unusual_byte(byte: u8) -> bool {
+    ((byte < b' ') & (byte != b'\t') & (byte != b'\n')) | (byte == b']')
 }
 
 fn is_control_character(byte: u8) -> bool {
@@ -830,6 +928,46 @@ mod tests {
     }
 
     #[test]
+    fn line_ends_and_brackets_are_found_wherever_in_a_document_they_come() {
+        let filler = "<a>text</a>".repeat(10_000);
+        assert!(filler.len() > 3 * SOURCE_BUFFER_LEN);
+        let late = format!("<r>{filler}<b>one\r\ntwo\rthree</b><c>] ]> ]]</c></r>");
+        let found = events(&late);
+        assert_eq!(
+            found.get(found.len() - 7..).unwrap_or_default(),
+            [
+                "<b",
+                "\"one\\ntwo\\nthree\"",
+                "</b",
+                "<c",
+                "\"] ]> ]]\"",
+                "</c",
+                "</r"
+            ]
+        );
+        let early = format!("<r><b>one\rtwo</b>{filler}<b>three\r\n</b></r>");
+        let found = events(&early);
+        assert_eq!(found.get(2).map(String::as_str), Some("\"one\\ntwo\""));
+        assert_eq!(
+            found.get(found.len() - 3).map(String::as_str),
+            Some("\"three\\n\"")
+        );
+        for xml in [
+            format!("<r>{filler}<b>a ]]> b</b></r>"),
+            format!("<r><b>]</b>{filler}<b>a ]]> b</b></r>"),
+            format!("<r><b>a ]]> b</b>{filler}</r>"),
+        ] {
+            assert!(error(&xml).ends_with("']]>' in text"));
+        }
+        let wide = utf16(&format!("<r>{filler}<b>one\r\ntwo</b></r>"), true);
+        let found = record_bytes(&wide).unwrap();
+        assert_eq!(
+            found.get(found.len() - 3).map(String::as_str),
+            Some("\"one\\ntwo\"")
+        );
+    }
+
+    #[test]
     fn text_is_only_delivered_when_collected() {
         let quiet = record("<r>text<a>more</a></r>", Recorder::default()).unwrap();
         assert_eq!(quiet, ["<r", "<a", "</a", "</r"]);
@@ -1003,8 +1141,43 @@ mod tests {
         assert!(parse(&format!("<r{many} a39=\"again\"/>")).is_err());
     }
 
+    fn utf16(text: &str, is_big_endian: bool) -> Vec<u8> {
+        text.encode_utf16()
+            .flat_map(|unit| {
+                if is_big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                }
+            })
+            .collect()
+    }
+
+    fn latin1(text: &str) -> Vec<u8> {
+        text.chars()
+            .map(|character| u8::try_from(u32::from(character)).expect("a Latin-1 character"))
+            .collect()
+    }
+
+    fn record_bytes(xml: &[u8]) -> Result<Vec<String>> {
+        let mut recorder = Recorder::collecting();
+        XmlReader::new(xml, None).parse_all(&mut recorder)?;
+        Ok(recorder.events)
+    }
+
+    fn error_of_bytes(xml: &[u8]) -> String {
+        let error = record_bytes(xml).unwrap_err();
+        assert_eq!(error.code, DuckDBError::IoGeneral);
+        assert!(
+            error.message.starts_with("XML parse error"),
+            "{}",
+            error.message
+        );
+        error.message
+    }
+
     #[test]
-    fn only_utf8_is_read() {
+    fn utf8_documents_may_say_so() {
         for declaration in ["UTF-8", "utf-8", "US-ASCII"] {
             let xml = format!("<?xml version=\"1.0\" encoding=\"{declaration}\"?><r/>");
             assert_eq!(events(&xml), ["<r", "</r"]);
@@ -1013,30 +1186,159 @@ mod tests {
             events("\u{feff}<?xml version=\"1.0\"?><r>é</r>"),
             ["<r", "\"é\"", "</r"]
         );
-        for declaration in ["ISO-8859-1", "UTF-16", "windows-1252", "utf8"] {
-            let xml = format!("<?xml version=\"1.0\" encoding=\"{declaration}\"?><r/>");
+    }
+
+    #[test]
+    fn utf16_documents_are_read() {
+        let document = "<r a=\"ż\">é \u{1F600} 漢字<b r:id=\"ß\"/>&#228;&amp;</r>";
+        let expected = events(document);
+        assert_eq!(expected.len(), 7);
+        for is_big_endian in [false, true] {
+            for declaration in [
+                "",
+                "<?xml version=\"1.0\"?>",
+                "<?xml version=\"1.0\" encoding=\"UTF-16\"?>",
+                "<?xml version=\"1.0\" encoding=\"utf-16\" standalone=\"yes\"?>\r\n",
+                if is_big_endian {
+                    "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?>"
+                } else {
+                    "<?xml version=\"1.0\" encoding=\"UTF-16LE\"?>"
+                },
+            ] {
+                for mark in ["", "\u{feff}"] {
+                    let bytes = utf16(&format!("{mark}{declaration}{document}"), is_big_endian);
+                    assert_eq!(
+                        record_bytes(&bytes).unwrap(),
+                        expected,
+                        "{is_big_endian} {declaration:?} {mark:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn latin1_documents_are_read() {
+        let document = "<r a=\"\u{e4}\">caf\u{e9} \u{a0}\u{ff}\u{80}<b/></r>";
+        let expected = events(document);
+        for declaration in [
+            "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>",
+            "<?xml version='1.0' encoding='iso-8859-1' standalone='yes'?>\n",
+        ] {
+            let bytes = latin1(&format!("{declaration}{document}"));
+            assert_eq!(record_bytes(&bytes).unwrap(), expected, "{declaration}");
+            let with_mark = [b"\xEF\xBB\xBF".as_slice(), &bytes].concat();
+            assert_eq!(record_bytes(&with_mark).unwrap(), expected, "{declaration}");
+        }
+        // Without the declaration the bytes are not UTF-8.
+        let bytes = latin1(document);
+        assert!(record_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn long_documents_in_other_encodings_are_read() {
+        let item = "<i n=\"\u{e9}\">\u{e4}\u{f6}\u{fc} text</i>";
+        let document = format!("<r>{}</r>", item.repeat(20_000));
+        let expected = events(&document);
+        assert_eq!(expected.len(), 2 + 3 * 20_000);
+        let declared = format!("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>{document}");
+        assert_eq!(record_bytes(&latin1(&declared)).unwrap(), expected);
+        for is_big_endian in [false, true] {
+            let bytes = utf16(&format!("\u{feff}{document}"), is_big_endian);
+            let mut recorder = Recorder::collecting();
+            let mut reader = XmlReader::new(bytes.as_slice(), None);
+            reader.parse_all(&mut recorder).unwrap();
+            assert_eq!(recorder.events, expected);
+            assert_eq!(reader.bytes_read(), bytes.len() as u64);
+        }
+    }
+
+    #[test]
+    fn a_document_must_be_in_the_encoding_it_declares() {
+        for declared in ["ISO-8859-1", "UTF-8", "US-ASCII", "UTF-16LE"] {
+            let xml = format!("<?xml version=\"1.0\" encoding=\"{declared}\"?><r/>");
+            let message = error_of_bytes(&utf16(&xml, true));
             assert!(
-                error(&xml).contains("unsupported encoding"),
-                "{declaration}"
+                message.ends_with(&format!(
+                    "the document is not in the encoding '{declared}' it declares"
+                )),
+                "{message}"
             );
         }
-        let utf16: Vec<u8> = "\u{feff}<r/>"
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        let utf16_be: Vec<u8> = "<r/>".encode_utf16().flat_map(u16::to_be_bytes).collect();
-        for bytes in [utf16, utf16_be] {
-            let result = XmlReader::new(bytes.as_slice(), None).parse_all(&mut Recorder::default());
-            assert!(
-                result
-                    .unwrap_err()
-                    .message
-                    .contains("unsupported encoding 'UTF-16'")
-            );
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-16BE\"?><r/>";
+        assert!(error_of_bytes(&utf16(xml, false)).contains("it declares"));
+        for declared in ["UTF-16", "UTF-16LE", "utf-16be"] {
+            let xml = format!("<?xml version=\"1.0\" encoding=\"{declared}\"?><r/>");
+            assert!(error(&xml).contains("it declares"), "{declared}");
         }
-        let latin1 = b"<r>caf\xe9</r>";
-        let result = XmlReader::new(latin1.as_slice(), None).parse_all(&mut Recorder::collecting());
-        assert!(result.unwrap_err().message.starts_with("XML parse error"));
+    }
+
+    #[test]
+    fn other_encodings_are_refused() {
+        for declared in ["windows-1252", "utf8", "latin1", "ISO-8859-15", "UCS-2", ""] {
+            let xml = format!("<?xml version=\"1.0\" encoding=\"{declared}\"?><r/>");
+            for bytes in [xml.as_bytes().to_vec(), utf16(&xml, false)] {
+                let message = error_of_bytes(&bytes);
+                assert!(
+                    message.contains(&format!("unsupported encoding '{declared}'")),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_that_is_not_in_its_encoding_is_an_error() {
+        let half_pair = [utf16("<r>", false), vec![0x3D, 0xD8], utf16("</r>", false)].concat();
+        assert!(error_of_bytes(&half_pair).ends_with("half a surrogate pair in UTF-16 text"));
+        let odd = [utf16("<r/>", true), vec![0x20]].concat();
+        assert!(error_of_bytes(&odd).ends_with("the document ends in the middle of a character"));
+        let control = utf16("<r>\u{1}</r>", true);
+        assert!(error_of_bytes(&control).ends_with("invalid character"));
+        let not_utf8 = b"<r>caf\xe9</r>";
+        error_of_bytes(not_utf8);
+        // A document that starts with a NUL byte is taken for UTF-16.
+        error_of_bytes(b"\0\0\0<r/>");
+    }
+
+    #[test]
+    fn all_attributes_come_in_the_order_they_are_written() {
+        struct Collect(Vec<Vec<(String, String)>>);
+        impl XmlHandler for Collect {
+            fn start_element(&mut self, _: &str, attributes: &Attributes<'_>) -> Result<Flow> {
+                let all = attributes.all()?;
+                let owned =
+                    |(name, value): &(&str, Cow<'_, str>)| ((*name).to_owned(), value.to_string());
+                self.0.push(all.iter().map(owned).collect());
+                Ok(Flow::Continue)
+            }
+            fn end_element(&mut self, _: &str) -> Result<Flow> {
+                Ok(Flow::Continue)
+            }
+        }
+        let xml = "<r xmlns:a=\"u\" b='x &amp; y' a:c=\"1\n2\"><s/><t z=\"\" y=\"\"/></r>";
+        let mut collect = Collect(Vec::new());
+        XmlReader::new(xml.as_bytes(), None)
+            .parse_all(&mut collect)
+            .unwrap();
+        let pairs = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            collect.0,
+            [
+                pairs(&[("xmlns:a", "u"), ("b", "x & y"), ("a:c", "1 2")]),
+                pairs(&[]),
+                pairs(&[("z", ""), ("y", "")])
+            ]
+        );
+        let mut collect = Collect(Vec::new());
+        let result =
+            XmlReader::new("<r a=\"1\" a=\"2\"/>".as_bytes(), None).parse_all(&mut collect);
+        assert!(result.is_err());
     }
 
     #[test]

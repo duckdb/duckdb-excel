@@ -293,6 +293,172 @@ fn a_sheet_without_rows_cannot_be_read_without_a_range() {
 }
 
 #[test]
+fn a_sheet_whose_rows_hold_nothing_is_like_one_without_rows() {
+    let connection = connect();
+    let sheet = [
+        row(1, &[]),
+        row(2, &[styled("A2", "", 1), styled("B2", "", 4)]),
+        row(
+            3,
+            &[
+                r#"<c r="A3" s="2"/>"#.to_owned(),
+                r#"<c r="B3" t="s"/>"#.to_owned(),
+                r#"<c r="C3" t="s"><v></v></c>"#.to_owned(),
+                inline("D3", ""),
+            ],
+        ),
+    ]
+    .concat();
+    let book = Workbook::new()
+        .sheet("S", &sheet)
+        .shared_strings(&["first"])
+        .write("no_content.xlsx");
+    let path = book.path();
+    for arguments in [
+        "",
+        ", all_varchar = true",
+        ", header = true",
+        ", header = false",
+        ", stop_at_empty = false",
+        ", empty_as_varchar = true",
+    ] {
+        assert_eq!(
+            query_error(&connection, &format!("FROM read_xlsx('{path}'{arguments})")),
+            "Binder Error: No rows found in xlsx file",
+            "{arguments}"
+        );
+    }
+    // A range says what to read.
+    let sql = format!("FROM read_xlsx('{path}', range = 'A1:B3')");
+    assert_eq!(describe(&connection, &sql), ["A DOUBLE", "B DOUBLE"]);
+    assert_eq!(
+        query(&connection, &sql),
+        ["NULL|NULL", "NULL|NULL", "NULL|NULL"]
+    );
+}
+
+#[test]
+fn styles_without_a_number_format_show_numbers_as_numbers() {
+    let connection = connect();
+    let styles = r#"<styleSheet><cellXfs count="4"><xf/><xf numFmtId="14"/><xf fontId="1" applyFont="1"/>
+        <xf numFmtId="21"><alignment horizontal="left"/></xf></cellXfs></styleSheet>"#;
+    let sheet = [
+        row(
+            1,
+            &[
+                inline("A1", "plain"),
+                inline("B1", "day"),
+                inline("C1", "bold"),
+                inline("D1", "time"),
+            ],
+        ),
+        row(
+            2,
+            &[
+                styled("A2", 1.5, 0),
+                styled("B2", 44197, 1),
+                styled("C2", 44197, 2),
+                styled("D2", 0.25, 3),
+            ],
+        ),
+    ]
+    .concat();
+    let book = Workbook::new()
+        .sheet("S", &sheet)
+        .part("xl/styles.xml", styles)
+        .write("xf_without_format.xlsx");
+    let sql = format!("FROM read_xlsx('{}')", book.path());
+    assert_eq!(
+        describe(&connection, &sql),
+        ["plain DOUBLE", "day DATE", "bold DOUBLE", "time TIME"]
+    );
+    assert_eq!(
+        query(&connection, &sql),
+        ["1.5|2021-01-01|44197.0|06:00:00"]
+    );
+}
+
+#[test]
+fn escapes_in_column_names_are_resolved() {
+    let connection = connect();
+    let sheet = [
+        row(
+            1,
+            &[
+                shared("A1", 0),
+                inline("B1", "in_x0020_line"),
+                shared("C1", 1),
+                inline("D1", "_x005F_x0041_"),
+            ],
+        ),
+        row(
+            2,
+            &[
+                number("A2", 1),
+                number("B2", 2),
+                number("C2", 3),
+                number("D2", 4),
+            ],
+        ),
+    ]
+    .concat();
+    let book = Workbook::new()
+        .sheet("S", &sheet)
+        .shared_strings(&["sha_x0072_ed", "snake_x_case_x00e9"])
+        .write("escaped_header.xlsx");
+    let sql = format!("FROM read_xlsx('{}')", book.path());
+    assert_eq!(
+        describe(&connection, &sql),
+        [
+            "shared DOUBLE",
+            "in line DOUBLE",
+            "snake_x_case_x00e9 DOUBLE",
+            "_x0041_ DOUBLE"
+        ]
+    );
+}
+
+#[test]
+fn a_header_cell_without_a_shared_string_has_an_empty_name() {
+    let connection = connect();
+    let sheet = [
+        row(
+            1,
+            &[
+                shared("A1", 1),
+                r#"<c r="B1" t="s"/>"#.to_owned(),
+                r#"<c r="C1" t="s"><v></v></c>"#.to_owned(),
+            ],
+        ),
+        row(2, &[number("A2", 1), number("B2", 2), number("C2", 3)]),
+    ]
+    .concat();
+    let book = Workbook::new()
+        .sheet("S", &sheet)
+        .shared_strings(&["first", "second"])
+        .write("header_without_index.xlsx");
+    let path = book.path();
+    // Such a cell is no text: it ends the range that is found, and its row is a header only when asked for.
+    assert_eq!(
+        describe(&connection, &format!("FROM read_xlsx('{path}')")),
+        ["second DOUBLE"]
+    );
+    let sql = format!("FROM read_xlsx('{path}', range = 'A1:C2')");
+    assert_eq!(
+        describe(&connection, &sql),
+        ["A VARCHAR", "B VARCHAR", "C VARCHAR"]
+    );
+    assert_eq!(query(&connection, &sql), ["second|NULL|NULL", "1|2|3"]);
+    let sql = format!("FROM read_xlsx('{path}', range = 'A1:C2', header = true)");
+    assert_eq!(
+        describe(&connection, &sql),
+        // The names an empty name and its repetition are given.
+        ["second DOUBLE", "C1 DOUBLE", "_1 DOUBLE"]
+    );
+    assert_eq!(query(&connection, &sql), ["1.0|2.0|3.0"]);
+}
+
+#[test]
 fn column_names_are_trimmed_and_made_unique() {
     let connection = connect();
     let names = [

@@ -267,6 +267,65 @@ fn relations_part(relations: &str) -> String {
 }
 
 #[test]
+fn the_relationship_id_of_a_sheet_is_the_id_in_the_relationships_namespace() {
+    let connection = connect();
+    let transitional = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    let strict = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+    let book = |workbook: &str| {
+        Workbook::new()
+            .sheet("One", &row(1, &[number("A1", 1)]))
+            .sheet("Two", &row(1, &[number("A1", 2)]))
+            .part("xl/workbook.xml", workbook)
+            .write("relationship_prefix.xlsx")
+    };
+    let read = |workbook: &str, sheet: &str| {
+        let file = book(workbook);
+        query(
+            &connection,
+            &format!(
+                "FROM read_xlsx('{}', sheet = '{sheet}', header = false)",
+                file.path()
+            ),
+        )
+    };
+    for namespace in [transitional, strict] {
+        let on_the_root = format!(
+            "<x:workbook xmlns:x=\"main\" xmlns:rel=\"{namespace}\"><x:sheets>\
+             <x:sheet name=\"One\" sheetId=\"1\" rel:id=\"rId1\"/><x:sheet name=\"Two\" sheetId=\"2\" rel:id=\"rId2\"/>\
+             </x:sheets></x:workbook>"
+        );
+        assert_eq!(read(&on_the_root, "One"), ["1.0"], "{namespace}");
+        assert_eq!(read(&on_the_root, "Two"), ["2.0"], "{namespace}");
+        let on_every_sheet = format!(
+            "<workbook><sheets><sheet xmlns:a=\"{namespace}\" name=\"One\" a:id=\"rId1\"/>\
+             <sheet name=\"Two\" xmlns:b=\"{namespace}\" b:id=\"rId2\" r:id=\"rId1\"/></sheets></workbook>"
+        );
+        assert_eq!(read(&on_every_sheet, "One"), ["1.0"], "{namespace}");
+        assert_eq!(read(&on_every_sheet, "Two"), ["2.0"], "{namespace}");
+    }
+    // Without a prefix for the namespace, the attribute written `r:id` is the one.
+    let literal = "<workbook xmlns:r=\"other\" xmlns:o=\"other\"><sheets><sheet name=\"One\" o:id=\"rId2\" r:id=\"rId1\"/>\
+                   <sheet name=\"Two\" r:id=\"rId2\" id=\"rId1\"/></sheets></workbook>";
+    assert_eq!(read(literal, "One"), ["1.0"]);
+    assert_eq!(read(literal, "Two"), ["2.0"]);
+    for workbook in [
+        "<workbook xmlns:rel=\"other\"><sheets><sheet name=\"One\" rel:id=\"rId1\"/></sheets></workbook>".to_owned(),
+        "<workbook><sheets><sheet name=\"One\" rel:id=\"rId1\"/></sheets></workbook>".to_owned(),
+        format!(
+            "<workbook><other xmlns:rel=\"{transitional}\"/><sheets><sheet name=\"One\" rel:id=\"rId1\"/></sheets>\
+             </workbook>"
+        ),
+    ] {
+        let file = book(&workbook);
+        assert_eq!(
+            query_error(&connection, &format!("FROM read_xlsx('{}')", file.path())),
+            "Invalid Input Error: Invalid sheet entry in workbook.xml",
+            "{workbook}"
+        );
+    }
+}
+
+#[test]
 fn the_last_of_repeated_sheets_and_relationships_counts() {
     let connection = connect();
     let relation = |id: &str, kind: &str, target: &str| {

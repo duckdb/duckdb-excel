@@ -22,6 +22,7 @@ use crate::{
             workbook::WorkbookParser,
             worksheet::{MAX_EVENT_LEN, WorksheetParser},
         },
+        serial::DateSystem,
     },
 };
 
@@ -70,6 +71,8 @@ pub struct SheetLayout {
     /// The cells of the rows after the header.
     pub range: CellRange,
     pub columns: Vec<SheetColumn>,
+    /// The day the serial numbers of the workbook count from.
+    pub date_system: DateSystem,
 }
 
 /// Finds the sheet `options` ask for in the workbook at `file_path` and looks at its first rows.
@@ -78,21 +81,31 @@ pub fn resolve_sheet(
     file_path: &str,
     options: &ReadOptions,
 ) -> Result<SheetLayout> {
-    let sheet_path = find_sheet(archive, file_path, &options.sheet)?;
+    let (sheet_path, date_system) = find_sheet(archive, file_path, &options.sheet)?;
     let cell_styles = parse_cell_styles(archive)?;
     let range = if options.has_explicit_range {
         options.range
     } else {
         sniff_range(archive, &sheet_path)?
     };
-    sniff_header(archive, sheet_path, range, options, &cell_styles)
+    let (range, columns) = sniff_header(archive, &sheet_path, range, options, &cell_styles)?;
+    Ok(SheetLayout {
+        sheet_path,
+        range,
+        columns,
+        date_system,
+    })
+}
+
+fn no_rows() -> duckdb_neo::Error {
+    binder("No rows found in xlsx file")
 }
 
 fn sheet_not_found(sheet_path: &str) -> duckdb_neo::Error {
     binder(format!("Sheet '{sheet_path}' not found in xlsx file"))
 }
 
-fn find_sheet(archive: &mut Archive, file_path: &str, sheet: &str) -> Result<String> {
+fn find_sheet(archive: &mut Archive, file_path: &str, sheet: &str) -> Result<(String, DateSystem)> {
     if !archive.parse_entry("[Content_Types].xml", &mut ContentTypesParser::new())? {
         return Err(binder("No [Content_Types].xml found in xlsx file"));
     }
@@ -144,7 +157,7 @@ fn find_sheet(archive: &mut Archive, file_path: &str, sheet: &str) -> Result<Str
         sheet
     };
     match paths.remove(&unescape_xml_entities(sheet)) {
-        Some(path) => Ok(path),
+        Some(path) => Ok((path, workbook.date_system)),
         None => {
             let suggestions = candidates_error_message(&names, sheet, "Did you mean");
             Err(binder(format!(
@@ -165,7 +178,8 @@ fn sniff_range(archive: &mut Archive, sheet_path: &str) -> Result<CellRange> {
     if !archive.parse_entry_with_limit(sheet_path, Some(MAX_EVENT_LEN), &mut parser)? {
         return Err(sheet_not_found(sheet_path));
     }
-    let range = parser.visitor.range();
+    // A sheet whose rows hold nothing is like a sheet without rows.
+    let range = parser.visitor.range().ok_or_else(no_rows)?;
     if range.width() > MAX_CELL_COLS {
         return Err(invalid_input(format!(
             "The first row of the sheet spans {} columns, more than the {MAX_CELL_COLS} a sheet can have \
@@ -178,11 +192,11 @@ fn sniff_range(archive: &mut Archive, sheet_path: &str) -> Result<CellRange> {
 
 fn sniff_header(
     archive: &mut Archive,
-    sheet_path: String,
+    sheet_path: &str,
     range: CellRange,
     options: &ReadOptions,
     cell_styles: &[NumberKind],
-) -> Result<SheetLayout> {
+) -> Result<(CellRange, Vec<SheetColumn>)> {
     let default_cell_type = options.default_cell_type;
     let mut parser = WorksheetParser::new(HeaderSniffer::new(
         range,
@@ -190,8 +204,8 @@ fn sniff_header(
         options.has_explicit_range,
         default_cell_type,
     ));
-    if !archive.parse_entry_with_limit(&sheet_path, Some(MAX_EVENT_LEN), &mut parser)? {
-        return Err(sheet_not_found(&sheet_path));
+    if !archive.parse_entry_with_limit(sheet_path, Some(MAX_EVENT_LEN), &mut parser)? {
+        return Err(sheet_not_found(sheet_path));
     }
     let HeaderSniffer {
         mut header_cells,
@@ -203,7 +217,7 @@ fn sniff_header(
     if column_cells.is_empty() {
         if header_cells.is_empty() {
             if !options.has_explicit_range {
-                return Err(binder("No rows found in xlsx file"));
+                return Err(no_rows());
             }
             // A range without any row still has columns, named after the cells of its first row.
             header_cells = (range.beg.col..range.end.col)
@@ -247,18 +261,15 @@ fn sniff_header(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(SheetLayout {
-        sheet_path,
-        range,
-        columns,
-    })
+    Ok((range, columns))
 }
 
 fn resolve_shared_strings(header_cells: &mut [SniffedCell], archive: &mut Archive) -> Result<()> {
     let shared: Vec<(usize, i64)> = header_cells
         .iter()
         .enumerate()
-        .filter(|(_, cell)| cell.cell_type == CellType::SharedString)
+        // A cell without an index has no string: its column has an empty name.
+        .filter(|(_, cell)| cell.cell_type == CellType::SharedString && !cell.data.is_empty())
         .map(|(position, cell)| (position, parse_integer(&cell.data)))
         .collect();
     if shared.is_empty() {

@@ -82,7 +82,7 @@ SELECT * FROM read_xlsx('__TEST_DIR__/types_things.xlsx');
 ----
 a<b>&"c'	\xAA\x00<	0110	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11	1 year 2 days 00:00:03.5	happy	[1, NULL, 3]	{'a': 1, 'b': x<y}	{k=v&w}	[1, 2, 3]	5
 
-# Empty cells are left out, and NUL cannot be written
+# Empty cells are left out, and NUL comes back
 statement ok
 COPY (
     SELECT CASE WHEN i % 2 = 0 THEN i END AS a, CASE WHEN i % 3 = 0 THEN 's' || chr(0) || i END AS b,
@@ -93,10 +93,10 @@ COPY (
 query TTTT
 SELECT * FROM read_xlsx('__TEST_DIR__/types_nulls.xlsx', all_varchar = true, header = false, range = 'A1:D5');
 ----
-0	s0	NULL	NULL
+0	s\00	NULL	NULL
 NULL	NULL	45292.0	NULL
 2	NULL	NULL	NULL
-NULL	s3	NULL	NULL
+NULL	s\03	NULL	NULL
 4	NULL	NULL	NULL
 
 # Rows keep their order over many batches

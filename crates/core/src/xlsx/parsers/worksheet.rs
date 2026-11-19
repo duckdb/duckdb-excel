@@ -6,6 +6,7 @@ use crate::{
     error::{self, invalid_input},
     xlsx::{
         cell::{CellPos, CellType, MAX_CELL_SIZE, parse_integer},
+        escape::decode_escaped_units,
         xml::{Attributes, Flow, XmlHandler},
     },
 };
@@ -41,13 +42,15 @@ enum State {
 /// Walks the `sheetData` of a worksheet and stops after it.
 ///
 /// Rows and cells without a reference follow the one before them. The text of a cell is what its `v` element
-/// and the `t` elements of its inline string hold, formatting runs put together.
+/// and the `t` elements of its inline string hold, formatting runs put together. The `_xHHHH_` escapes of
+/// each `t` element and of the value of a formula string are resolved.
 #[derive(Debug)]
 pub struct WorksheetParser<V> {
     state: State,
     cell_pos: CellPos,
     cell_type: CellType,
     cell_data: String,
+    text_start: usize,
     cell_style: u64,
     pub visitor: V,
 }
@@ -59,6 +62,7 @@ impl<V: SheetVisitor> WorksheetParser<V> {
             cell_pos: CellPos::new(0, 0),
             cell_type: CellType::Number,
             cell_data: String::new(),
+            text_start: 0,
             cell_style: 0,
             visitor,
         }
@@ -108,9 +112,15 @@ impl<V: SheetVisitor> XmlHandler for WorksheetParser<V> {
                     }
                 }
             }
-            State::Cell if name == "v" => self.state = State::V,
+            State::Cell if name == "v" => {
+                self.state = State::V;
+                self.text_start = self.cell_data.len();
+            }
             State::Cell if name == "is" => self.state = State::Is,
-            State::Is if name == "t" => self.state = State::T,
+            State::Is if name == "t" => {
+                self.state = State::T;
+                self.text_start = self.cell_data.len();
+            }
             _ => {}
         }
         Ok(Flow::Continue)
@@ -132,9 +142,17 @@ impl<V: SheetVisitor> XmlHandler for WorksheetParser<V> {
                     self.cell_style,
                 )?;
             }
-            State::V if name == "v" => self.state = State::Cell,
+            State::V if name == "v" => {
+                self.state = State::Cell;
+                if self.cell_type == CellType::FormulaString {
+                    decode_escaped_units(&mut self.cell_data, self.text_start);
+                }
+            }
             State::Is if name == "is" => self.state = State::Cell,
-            State::T if name == "t" => self.state = State::Is,
+            State::T if name == "t" => {
+                self.state = State::Is;
+                decode_escaped_units(&mut self.cell_data, self.text_start);
+            }
             _ => {}
         }
         Ok(Flow::Continue)
@@ -273,6 +291,33 @@ mod tests {
                 "E1 Number \"\" s0",
                 "F1 Number \"1234\" s0",
                 "G1 InlineString \"\" s0",
+                "end 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn escapes_are_resolved_in_strings_and_nowhere_else() {
+        let events = parse(
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>cr_x000D_lf</t></is></c>
+               <c r="B1" t="inlineStr"><is><r><t>_x005F_x0041_</t></r><r><t>_x0042_</t></r><r><t>_x00</t></r><r><t>43_</t></r></is></c>
+               <c r="C1" t="str"><f>A1</f><v>tab_x0009_bed</v></c><c r="D1" t="str"><v>_x00</v><v>41_ _x0041_</v></c>
+               <c r="E1" t="s"><v>_x0031_</v></c><c r="F1"><v>_x0031_</v></c><c r="G1" t="e"><v>_x0031_</v></c>
+               <c r="H1" t="inlineStr"><v>_x0031_</v></c><c r="I1" t="str"><is><t>_x0031_</t></is></c></row>"#,
+        );
+        assert_eq!(
+            events.unwrap(),
+            [
+                "row 1",
+                "A1 InlineString \"cr\\rlf\" s0",
+                "B1 InlineString \"_x0041_B_x0043_\" s0",
+                "C1 FormulaString \"tab\\tbed\" s0",
+                "D1 FormulaString \"_x0041_ A\" s0",
+                "E1 SharedString \"_x0031_\" s0",
+                "F1 Number \"_x0031_\" s0",
+                "G1 Error \"_x0031_\" s0",
+                "H1 InlineString \"_x0031_\" s0",
+                "I1 FormulaString \"1\" s0",
                 "end 1"
             ]
         );

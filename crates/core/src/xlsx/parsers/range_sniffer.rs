@@ -35,15 +35,15 @@ impl RangeSniffer {
         }
     }
 
-    /// The range found, or the whole sheet when no row has content.
-    pub fn range(&self) -> CellRange {
+    /// The range found, or `None` when no row has content.
+    pub fn range(&self) -> Option<CellRange> {
         if self.beg_row == 0 {
-            return CellRange::WHOLE_SHEET;
+            return None;
         }
-        CellRange {
+        Some(CellRange {
             beg: CellPos::new(self.beg_row, self.beg_col),
             end: CellPos::new(u64::MAX, self.end_col.wrapping_add(1)),
-        }
+        })
     }
 }
 
@@ -88,7 +88,7 @@ mod tests {
     use super::*;
     use crate::xlsx::{parsers::worksheet::WorksheetParser, xml::XmlReader};
 
-    fn sniff(sheet_data: &str) -> CellRange {
+    fn sniff(sheet_data: &str) -> Option<CellRange> {
         let xml = format!("<worksheet><sheetData>{sheet_data}</sheetData></worksheet>");
         let mut parser = WorksheetParser::new(RangeSniffer::new());
         XmlReader::new(xml.as_bytes(), None)
@@ -97,11 +97,11 @@ mod tests {
         parser.visitor.range()
     }
 
-    fn range(beg_row: u64, beg_col: u64, end_col: u64) -> CellRange {
-        CellRange {
+    fn range(beg_row: u64, beg_col: u64, end_col: u64) -> Option<CellRange> {
+        Some(CellRange {
             beg: CellPos::new(beg_row, beg_col),
             end: CellPos::new(u64::MAX, end_col),
-        }
+        })
     }
 
     #[test]
@@ -119,16 +119,16 @@ mod tests {
     }
 
     #[test]
-    fn a_sheet_without_content_is_read_whole() {
-        assert_eq!(sniff(""), CellRange::WHOLE_SHEET);
+    fn a_sheet_without_content_has_no_range() {
+        assert_eq!(sniff(""), None);
+        assert_eq!(sniff(r#"<row r="1"><c r="A1"/></row><row r="2"/>"#), None);
         assert_eq!(
-            sniff(r#"<row r="1"><c r="A1"/></row><row r="2"/>"#),
-            CellRange::WHOLE_SHEET
+            sniff(
+                r#"<row r="1"><c r="A1" s="3"/><c r="B1" t="s"/><c r="C1" t="s"><v></v></c></row>"#
+            ),
+            None
         );
-        assert_eq!(
-            sniff(r#"<row r="0"><c><v>1</v></c></row>"#),
-            CellRange::WHOLE_SHEET
-        );
+        assert_eq!(sniff(r#"<row r="0"><c><v>1</v></c></row>"#), None);
     }
 
     #[test]

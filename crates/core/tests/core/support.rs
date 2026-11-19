@@ -102,6 +102,33 @@ pub fn fixture(name: &str) -> String {
         .to_owned()
 }
 
+/// The directory, among the fixtures, of the workbooks that `handmade.rs` makes.
+pub const HANDMADE: &str = "handmade";
+
+fn collect_workbooks(directory: &Path, found: &mut Vec<String>) {
+    for entry in std::fs::read_dir(directory).expect("a readable directory") {
+        let path = entry.expect("a directory entry").path();
+        if path.is_dir() {
+            if !path.ends_with(HANDMADE) {
+                collect_workbooks(&path, found);
+            }
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "xlsx")
+        {
+            found.push(path.to_str().expect("a UTF-8 path").to_owned());
+        }
+    }
+}
+
+/// The fixtures that spreadsheet programs and other libraries wrote, sorted.
+pub fn produced_fixtures() -> Vec<String> {
+    let mut found = Vec::new();
+    collect_workbooks(Path::new(&fixture("")), &mut found);
+    found.sort();
+    found
+}
+
 /// A file in the temporary directory that is removed when the value is dropped.
 pub struct TempFile(PathBuf);
 
@@ -265,6 +292,7 @@ pub const STYLES: &str = r#"<styleSheet xmlns="http://schemas.openxmlformats.org
 pub struct Workbook {
     sheets: Vec<(String, String)>,
     shared_strings: Option<String>,
+    workbook_properties: String,
     parts: Vec<(String, Vec<u8>)>,
     without: Vec<String>,
 }
@@ -300,6 +328,12 @@ impl Workbook {
         self
     }
 
+    /// Gives the workbook a `workbookPr` element with `attributes`, e.g. `date1904="1"`.
+    pub fn properties(mut self, attributes: &str) -> Workbook {
+        self.workbook_properties = format!("<workbookPr {attributes}/>");
+        self
+    }
+
     /// Adds a part, or replaces the one the workbook would write under `name`.
     pub fn part(mut self, name: &str, content: impl AsRef<[u8]>) -> Workbook {
         self.parts
@@ -314,6 +348,11 @@ impl Workbook {
     }
 
     pub fn bytes(&self) -> Vec<u8> {
+        self.bytes_with(|_, content| content.to_vec())
+    }
+
+    /// The workbook with every part as `encode` returns it for the name and the content of the part.
+    pub fn bytes_with(&self, encode: impl Fn(&str, &[u8]) -> Vec<u8>) -> Vec<u8> {
         let mut sheets = String::new();
         let mut relations = String::new();
         for (index, (name, _)) in self.sheets.iter().enumerate() {
@@ -329,8 +368,9 @@ impl Workbook {
                 r#"<Relationship Id="rId{id}" Type="{RELATIONSHIP_TYPES}/worksheet" Target="worksheets/sheet{id}.xml"/>"#
             ));
         }
+        let properties = &self.workbook_properties;
         let workbook = format!(
-            r#"<workbook xmlns="{MAIN_NAMESPACE}" xmlns:r="{RELATIONSHIP_TYPES}"><sheets>{sheets}</sheets></workbook>"#
+            r#"<workbook xmlns="{MAIN_NAMESPACE}" xmlns:r="{RELATIONSHIP_TYPES}">{properties}<sheets>{sheets}</sheets></workbook>"#
         );
         let workbook_relations = format!(
             r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{relations}</Relationships>"#
@@ -368,7 +408,8 @@ impl Workbook {
         let mut zip = ZipWriter::new(Vec::new());
         for (name, content) in &parts {
             zip.begin_file(name).expect("a new ZIP entry");
-            zip.write_all(content).expect("ZIP entry data");
+            zip.write_all(&encode(name, content))
+                .expect("ZIP entry data");
             zip.end_file().expect("the end of a ZIP entry");
         }
         zip.finish().expect("a finished ZIP archive")
@@ -376,10 +417,49 @@ impl Workbook {
 
     /// Writes the workbook to a temporary file.
     pub fn write(&self, name: &str) -> TempFile {
+        self.write_with(name, |_, content| content.to_vec())
+    }
+
+    /// Writes the workbook of [`Self::bytes_with`] to a temporary file.
+    pub fn write_with(&self, name: &str, encode: impl Fn(&str, &[u8]) -> Vec<u8>) -> TempFile {
         let file = TempFile::new(name);
-        std::fs::write(file.path(), self.bytes()).expect("a writable temporary directory");
+        std::fs::write(file.path(), self.bytes_with(encode))
+            .expect("a writable temporary directory");
         file
     }
+}
+
+/// `text` in UTF-16, with a byte order mark when `with_mark`.
+pub fn utf16(text: &str, is_big_endian: bool, with_mark: bool) -> Vec<u8> {
+    let mark = if with_mark { "\u{feff}" } else { "" };
+    mark.encode_utf16()
+        .chain(text.encode_utf16())
+        .flat_map(|unit| {
+            if is_big_endian {
+                unit.to_be_bytes()
+            } else {
+                unit.to_le_bytes()
+            }
+        })
+        .collect()
+}
+
+/// `text`, which must have no character above U+00FF, in ISO-8859-1.
+pub fn latin1(text: &str) -> Vec<u8> {
+    text.chars()
+        .map(|character| u8::try_from(u32::from(character)).expect("a Latin-1 character"))
+        .collect()
+}
+
+/// The letters of column `index`, counted from 0: `A`, `B`, ... `Z`, `AA`, ...
+pub fn column_letters(index: usize) -> String {
+    let mut letters = Vec::new();
+    let mut rest = index + 1;
+    while rest > 0 {
+        letters.push(char::from(b'A' + ((rest - 1) % 26) as u8));
+        rest = (rest - 1) / 26;
+    }
+    letters.iter().rev().collect()
 }
 
 /// A `row` element with the cells `cells`.

@@ -501,6 +501,201 @@ fn booleans_dates_and_times_come_back_as_what_they_were() {
 }
 
 #[test]
+fn every_date_time_and_timestamp_comes_back_exactly() {
+    let connection = connect();
+    let directory = TempDir::new("temporal_exact");
+    let path = directory.path("out.xlsx");
+    // Days around the start of the 1900 date system and all over the calendar, and timestamps to the
+    // microsecond over the four centuries in which a serial number holds one.
+    execute(
+        &connection,
+        "CREATE TABLE exact AS SELECT
+            CASE WHEN i < 500 THEN DATE '1899-07-01' + i::INTEGER
+                 ELSE DATE '0001-01-01' + (hash(i) % 3652000)::INTEGER END AS day,
+            CASE WHEN i = 0 THEN TIME '24:00:00' ELSE TIME '00:00:00' + to_microseconds((hash(i + 1) % 86400000000)::BIGINT) END AS tod,
+            CASE WHEN i < 500 THEN TIMESTAMP '1899-12-29 00:00:00' + to_microseconds((i * 10800000001)::BIGINT)
+                 ELSE TIMESTAMP '1720-07-26 00:00:00' + to_microseconds((hash(i + 2) % 11323000000000000)::BIGINT) END AS ts,
+            TIMESTAMP '0001-01-01 00:00:00' + to_milliseconds((hash(i + 3) % 315537897600000)::BIGINT) AS ts_ms
+         FROM range(4000) t(i)
+         WHERE day <> DATE '1899-12-31'",
+    );
+    execute(
+        &connection,
+        "DELETE FROM exact WHERE ts::DATE = DATE '1899-12-31'",
+    );
+    copy(
+        &connection,
+        "SELECT day, tod, ts, ts_ms::TIMESTAMP_MS AS ts_ms, ts::TIMESTAMP_NS AS ts_ns, ts::TIMESTAMPTZ AS ts_tz,
+                date_trunc('second', ts)::TIMESTAMP_S AS ts_s, tod::TIMETZ AS tod_tz FROM exact",
+        &path,
+        ", HEADER true",
+    );
+    let written = query(
+        &connection,
+        "SELECT day, tod, ts, ts_ms::TIMESTAMP_MS::TIMESTAMP, ts, ts, date_trunc('second', ts), tod FROM exact",
+    );
+    assert!(written.len() > 3900, "{}", written.len());
+    assert_eq!(
+        describe(&connection, &format!("FROM read_xlsx('{path}')")),
+        [
+            "day DATE",
+            "tod TIME",
+            "ts TIMESTAMP",
+            "ts_ms TIMESTAMP",
+            "ts_ns TIMESTAMP",
+            "ts_tz TIMESTAMP",
+            "ts_s TIMESTAMP",
+            "tod_tz TIME"
+        ]
+    );
+    let read = query(&connection, &format!("FROM read_xlsx('{path}')"));
+    assert_eq!(read, written);
+    assert_eq!(
+        read.first().map(String::as_str),
+        Some(
+            "1899-07-01|24:00:00|1899-12-29 00:00:00|2429-04-16 16:28:38.982|1899-12-29 00:00:00|\
+             1899-12-29 00:00:00|1899-12-29 00:00:00|24:00:00"
+        )
+    );
+}
+
+#[test]
+fn days_of_early_1900_are_written_as_a_spreadsheet_counts_them() {
+    let connection = connect();
+    let directory = TempDir::new("early_1900");
+    let path = directory.path("out.xlsx");
+    let days = "FROM (VALUES (DATE '1899-12-30'), ('1899-12-31'), ('1900-01-01'), ('1900-02-28'), ('1900-03-01')) t(day)";
+    copy(
+        &connection,
+        &format!("SELECT day, day + TIME '18:00:00' AS ts {days}"),
+        &path,
+        "",
+    );
+    assert_eq!(
+        sheet_rows(&path, "sheet1.xml"),
+        concat!(
+            r#"<row r="1"><c r="A1" s="1"><v>0.0</v></c><c r="B1" s="4"><v>0.75</v></c></row>"#,
+            r#"<row r="2"><c r="A2" s="1"><v>1.0</v></c><c r="B2" s="4"><v>1.75</v></c></row>"#,
+            r#"<row r="3"><c r="A3" s="1"><v>1.0</v></c><c r="B3" s="4"><v>1.75</v></c></row>"#,
+            r#"<row r="4"><c r="A4" s="1"><v>59.0</v></c><c r="B4" s="4"><v>59.75</v></c></row>"#,
+            r#"<row r="5"><c r="A5" s="1"><v>61.0</v></c><c r="B5" s="4"><v>61.75</v></c></row>"#
+        )
+    );
+    // The last day of 1899 has no number of its own.
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', header = false)")
+        ),
+        [
+            "1899-12-30|1899-12-30 18:00:00",
+            "1900-01-01|1900-01-01 18:00:00",
+            "1900-01-01|1900-01-01 18:00:00",
+            "1900-02-28|1900-02-28 18:00:00",
+            "1900-03-01|1900-03-01 18:00:00"
+        ]
+    );
+}
+
+#[test]
+fn any_text_comes_back_as_it_was() {
+    let connection = connect();
+    let directory = TempDir::new("any_text");
+    let path = directory.path("out.xlsx");
+    // Every character below U+0100 but the carriage return, the characters XML cannot hold, and text that
+    // looks like the escapes those are written as.
+    execute(
+        &connection,
+        "CREATE TABLE pieces AS
+         SELECT chr(i::INTEGER) AS piece FROM range(0, 256) t(i) WHERE i <> 13
+         UNION ALL SELECT unnest(['_', 'x', '_x', '0', '00', '005F', '000D', 'D83D', 'DE00', 'd83d', 'FFFF', '41', 'g',
+            '_x005F_', '_x000D_', '_xD83D_', '_xDE00_', '_x0041', 'x0041_', chr(65534), chr(65535), chr(65533),
+            chr(61440), chr(128512), '漢', '&amp;', '&#13;', ']]>', '<t>'])",
+    );
+    execute(
+        &connection,
+        "CREATE TABLE numbered AS SELECT piece, row_number() OVER () - 1 AS n FROM pieces",
+    );
+    execute(
+        &connection,
+        "CREATE TABLE texts AS
+         SELECT i AS id,
+                (SELECT string_agg(piece, '' ORDER BY k) FROM range(8) r(k)
+                 JOIN numbered ON n = hash(i * 8 + k) % (SELECT count(*) FROM pieces)) AS a,
+                '_x' || printf('%04X', i % 65536) || '_'
+                    || chr(CASE WHEN i % 55000 IN (0, 13) THEN 1 ELSE i % 55000 END::INTEGER) AS b
+         FROM range(3000) t(i)",
+    );
+    assert_eq!(
+        query(
+            &connection,
+            "SELECT count(DISTINCT a) > 2990, count(a) FROM texts"
+        ),
+        ["true|3000"]
+    );
+    execute(
+        &connection,
+        "INSERT INTO texts VALUES
+            (-1, '_x000D_', '_x005F_x000D_'), (-2, chr(0), 'a' || chr(0) || 'b' || chr(0)),
+            (-3, '_xD83D__xDE00_', '_xD83D_'), (-4, '_x0041' || chr(1), '__x0041__'),
+            (-5, repeat(chr(1) || '_x0041_', 3000), ' lead and trail ' || chr(9)),
+            (-6, 'line' || chr(10) || 'feed', chr(11) || chr(12) || chr(27) || chr(127) || chr(65535))",
+    );
+    copy(
+        &connection,
+        "SELECT a AS \"_x0041_ he\x01ader\", b AS \"b_x005F_\" FROM texts ORDER BY id",
+        &path,
+        ", HEADER true",
+    );
+    let sql = format!("FROM read_xlsx('{path}', stop_at_empty = false)");
+    assert_eq!(
+        describe(&connection, &sql),
+        ["_x0041_ he\u{1}ader VARCHAR", "b_x005F_ VARCHAR"]
+    );
+    let hex = "SELECT hex(COLUMNS(*))";
+    let read = query(&connection, &format!("{hex} {sql}"));
+    let written = query(
+        &connection,
+        &format!("{hex} FROM (SELECT a, b FROM texts ORDER BY id)"),
+    );
+    assert_eq!(written.len(), 3006);
+    assert_eq!(read, written);
+
+    // No part holds a character XML cannot hold.
+    let sheet = workbook_part(&path, "xl/worksheets/sheet1.xml");
+    assert!(
+        !sheet
+            .chars()
+            .any(|character| matches!(character, '\0'..='\u{8}' | '\u{b}' | '\u{c}' | '\u{e}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}'))
+    );
+    assert!(sheet.contains(concat!(
+        r#"<row r="1"><c r="A1" t="inlineStr"><is><t>_x005F_x0041_ he_x0001_ader</t></is></c>"#,
+        r#"<c r="B1" t="inlineStr"><is><t>b_x005F_x005F_</t></is></c></row>"#
+    )));
+}
+
+#[test]
+fn a_carriage_return_comes_back_as_a_line_feed() {
+    let connection = connect();
+    let directory = TempDir::new("carriage_return");
+    let path = directory.path("out.xlsx");
+    copy(
+        &connection,
+        "SELECT 'a' || chr(13) || 'b' || chr(13) || chr(10) || 'c' AS s",
+        &path,
+        "",
+    );
+    assert!(sheet_rows(&path, "sheet1.xml").contains("<t>a\rb\r\nc</t>"));
+    assert_eq!(
+        query(
+            &connection,
+            &format!("SELECT hex(A1) FROM read_xlsx('{path}', header = false)")
+        ),
+        ["610A620A63"]
+    );
+}
+
+#[test]
 fn timestamps_with_a_time_zone_are_written_as_utc() {
     let connection = connect();
     let directory = TempDir::new("zones");
@@ -594,10 +789,10 @@ fn every_type_there_is_can_be_written() {
             &connection,
             &format!("FROM read_xlsx('{path}', all_varchar = true, header = false)"),
         );
-        // NUL cannot be written, and a sheet ends at the last row that has a cell.
+        // A sheet ends at the last row that has a cell.
         let mut written = query(
             &connection,
-            &format!("SELECT replace(\"{name}\"::VARCHAR, chr(0), '') FROM test_all_types()"),
+            &format!("SELECT \"{name}\"::VARCHAR FROM test_all_types()"),
         );
         while written.last().is_some_and(|row| row == "NULL") {
             written.pop();
@@ -609,7 +804,7 @@ fn every_type_there_is_can_be_written() {
 }
 
 #[test]
-fn text_is_escaped_and_nul_is_dropped() {
+fn text_is_escaped_and_comes_back_as_it_was() {
     let connection = connect();
     let directory = TempDir::new("escapes");
     let path = directory.path("out.xlsx");
@@ -631,7 +826,7 @@ fn text_is_escaped_and_nul_is_dropped() {
         "<row r=\"4\"><c r=\"A4\" t=\"inlineStr\"><is><t>\t lead and trail  </t></is></c></row>",
         r#"<row r="5"><c r="A5" t="inlineStr"><is><t></t></is></c></row>"#,
         r#"<row r="6"><c r="A6" t="inlineStr"><is><t>Ünïcödé 日本語 🦆</t></is></c></row>"#,
-        r#"<row r="7"><c r="A7" t="inlineStr"><is><t>nulbyte</t></is></c></row>"#,
+        r#"<row r="7"><c r="A7" t="inlineStr"><is><t>nul_x0000_byte_x0000_</t></is></c></row>"#,
         r#"<row r="8"></row><row r="9"><c r="A9" t="inlineStr"><is><t>long long "#
     )));
     assert_eq!(
@@ -639,10 +834,7 @@ fn text_is_escaped_and_nul_is_dropped() {
             &connection,
             &format!("SELECT A1 FROM read_xlsx('{path}', header = false, stop_at_empty = false)")
         ),
-        query(
-            &connection,
-            "SELECT replace(s, chr(0), '') FROM texts ORDER BY id"
-        )
+        query(&connection, "SELECT s FROM texts ORDER BY id")
     );
 }
 

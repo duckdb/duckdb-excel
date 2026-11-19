@@ -43,7 +43,7 @@ const NEW_WORKBOOK: [(&str, &str); 9] = [
             "nothing</t></is></c></row><row r=\"2\"><c r=\"A2\"><v>42</v></c><c r=\"B2\"><v>1.5</v></c>",
             "<c r=\"C2\" t=\"inlineStr\"><is><t>a&lt;b&gt;&amp;&quot;c&apos;</t></is></c>",
             "<c r=\"D2\" t=\"b\" s=\"5\"><v>1</v></c><c r=\"E2\" s=\"1\"><v>45366.0</v></c>",
-            "<c r=\"F2\" s=\"3\"><v>0.34375</v></c><c r=\"G2\" s=\"4\"><v>45366.521355590274</v></c>",
+            "<c r=\"F2\" s=\"3\"><v>0.34375</v></c><c r=\"G2\" s=\"4\"><v>45366.52135559028</v></c>",
             "<c r=\"H2\" s=\"2\"><v>45366.52135416667</v></c></row><row r=\"3\">",
             "<c r=\"D3\" t=\"b\" s=\"5\"><v>0</v></c><c r=\"I3\"><v>7</v></c></row></sheetData>",
             "</worksheet>",
@@ -409,7 +409,7 @@ fn a_sheet_appended_to_a_workbook_with_other_styles() {
     assert!(
         sheet.ends_with(concat!(
             r#"<row r="1"><c r="A1" s="5"><v>45367.0</v></c><c r="B1" s="7"><v>0.041666666666666664</v></c>"#,
-            r#"<c r="C1" s="8"><v>45367.04166666667</v></c><c r="D1" s="6"><v>45367.04166666667</v></c>"#,
+            r#"<c r="C1" s="8"><v>45367.041666666664</v></c><c r="D1" s="6"><v>45367.041666666664</v></c>"#,
             r#"<c r="E1" t="b" s="9"><v>0</v></c></row></sheetData></worksheet>"#
         )),
         "{sheet}"

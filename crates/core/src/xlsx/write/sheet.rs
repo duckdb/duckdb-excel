@@ -8,7 +8,7 @@ use crate::{
     error::{from_io, internal, invalid_input},
     xlsx::{
         cell::{CellPos, MAX_CELL_ROWS},
-        escape::escape_xml_into,
+        escape::escape_text_into,
         write::package::XML_DECLARATION,
     },
 };
@@ -149,7 +149,7 @@ impl<W: Write> SheetWriter<W> {
         self.buffer.extend_from_slice(&self.row_number);
         if cells.is_text {
             self.buffer.extend_from_slice(TEXT_START);
-            escape_xml_into(value, &mut self.buffer);
+            escape_text_into(value, &mut self.buffer);
             self.buffer.extend_from_slice(TEXT_END);
         } else {
             self.buffer.extend_from_slice(&cells.value_start);
@@ -165,7 +165,7 @@ impl<W: Write> SheetWriter<W> {
         self.buffer.extend_from_slice(&cells.reference_start);
         self.buffer.extend_from_slice(&self.row_number);
         self.buffer.extend_from_slice(TEXT_START);
-        escape_xml_into(text.as_bytes(), &mut self.buffer);
+        escape_text_into(text.as_bytes(), &mut self.buffer);
         self.buffer.extend_from_slice(TEXT_END);
         Ok(())
     }
@@ -323,7 +323,7 @@ mod tests {
         }
         let rows = rows_of(sheet);
         assert!(rows.starts_with(concat!(
-            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>a&quot;b&apos;c&amp;d</t></is></c>"#,
+            r#"<row r="1"><c r="A1" t="inlineStr"><is><t>a&quot;b&apos;c&amp;_x0000_d</t></is></c>"#,
             r#"<c r="AB1" t="inlineStr"><is><t>last</t></is></c></row><row r="2"></row>"#
         )));
         assert!(rows.ends_with(concat!(

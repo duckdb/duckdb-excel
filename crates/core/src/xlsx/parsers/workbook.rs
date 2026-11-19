@@ -1,11 +1,22 @@
-//! `xl/workbook.xml`: the sheets of a workbook.
+//! `xl/workbook.xml`: the sheets of a workbook and the day it counts serial numbers from.
+
+use std::collections::HashMap;
 
 use duckdb_neo::Result;
 
 use crate::{
     error::invalid_input,
-    xlsx::xml::{Attributes, Flow, XmlHandler},
+    xlsx::{
+        serial::DateSystem,
+        xml::{Attributes, Flow, XmlHandler},
+    },
 };
+
+/// The namespaces a relationship id is in, in a transitional and in a strict workbook.
+const RELATIONSHIP_NAMESPACES: [&str; 2] = [
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "http://purl.oclc.org/ooxml/officeDocument/relationships",
+];
 
 /// A `sheet` element: the name of a sheet, the id of the relationship that leads to its part, and its
 /// `sheetId`, which is empty when the element has none.
@@ -24,30 +35,79 @@ enum State {
     Sheet,
 }
 
+/// A namespace prefix an element declares, and what the prefix was bound to outside the element.
+#[derive(Debug)]
+struct Declaration {
+    depth: usize,
+    prefix: String,
+    outer: Option<bool>,
+}
+
 /// Collects the sheets of a workbook in the order the workbook shows them. A sheet needs a name and a
-/// relationship id.
+/// relationship id, which is the `id` attribute in the relationships namespace or else the one written `r:id`.
 #[derive(Debug)]
 pub struct WorkbookParser {
     state: State,
-    refuses_empty_values: bool,
+    is_for_append: bool,
+    depth: usize,
+    declarations: Vec<Declaration>,
+    relationship_prefixes: HashMap<String, bool>,
     pub sheets: Vec<SheetEntry>,
+    pub date_system: DateSystem,
 }
 
 impl WorkbookParser {
     pub fn new() -> WorkbookParser {
         WorkbookParser {
             state: State::Start,
-            refuses_empty_values: false,
+            is_for_append: false,
+            depth: 0,
+            declarations: Vec::new(),
+            relationship_prefixes: HashMap::new(),
             sheets: Vec::new(),
+            date_system: DateSystem::Since1900,
         }
     }
 
-    /// A parser for which the name and the relationship id of a sheet must not be empty either.
-    pub fn refusing_empty_values() -> WorkbookParser {
+    /// A parser for a workbook that gets a sheet added: the relationship id of a sheet must be written
+    /// `r:id`, as the one of the new sheet is, and neither it nor the name may be empty.
+    pub fn for_append() -> WorkbookParser {
         WorkbookParser {
-            refuses_empty_values: true,
+            is_for_append: true,
             ..WorkbookParser::new()
         }
+    }
+
+    fn declare(&mut self, prefix: &str, namespace: &str) {
+        let is_relationships = RELATIONSHIP_NAMESPACES.contains(&namespace);
+        let outer = self
+            .relationship_prefixes
+            .insert(prefix.to_owned(), is_relationships);
+        self.declarations.push(Declaration {
+            depth: self.depth,
+            prefix: prefix.to_owned(),
+            outer,
+        });
+    }
+
+    fn leave_element(&mut self) {
+        while let Some(declaration) = self
+            .declarations
+            .pop_if(|declaration| declaration.depth >= self.depth)
+        {
+            match declaration.outer {
+                Some(outer) => self.relationship_prefixes.insert(declaration.prefix, outer),
+                None => self.relationship_prefixes.remove(&declaration.prefix),
+            };
+        }
+        self.depth = self.depth.saturating_sub(1);
+    }
+
+    fn is_relationship_id(&self, attribute: &str) -> bool {
+        attribute
+            .strip_suffix(":id")
+            .and_then(|prefix| self.relationship_prefixes.get(prefix))
+            .is_some_and(|is_relationships| *is_relationships)
     }
 }
 
@@ -59,24 +119,49 @@ impl Default for WorkbookParser {
 
 impl XmlHandler for WorkbookParser {
     fn start_element(&mut self, name: &str, attributes: &Attributes<'_>) -> Result<Flow> {
+        self.depth += 1;
+        let attributes = attributes.all()?;
+        for (attribute, value) in &attributes {
+            if let Some(prefix) = attribute.strip_prefix("xmlns:") {
+                self.declare(prefix, value);
+            }
+        }
         match self.state {
             State::Start if name == "workbook" => self.state = State::Workbook,
             State::Workbook if name == "sheets" => self.state = State::Sheets,
+            State::Workbook if name == "workbookPr" => {
+                let uses_1904 = attributes.iter().any(|(attribute, value)| {
+                    *attribute == "date1904" && matches!(value.as_ref(), "1" | "true" | "on")
+                });
+                if uses_1904 {
+                    self.date_system = DateSystem::Since1904;
+                }
+            }
             State::Sheets if name == "sheet" => {
                 self.state = State::Sheet;
+                let value_of = |wanted: &str| {
+                    let found = attributes
+                        .iter()
+                        .find(|(attribute, _)| *attribute == wanted);
+                    found.map(|(_, value)| value.as_ref())
+                };
+                let namespaced = attributes
+                    .iter()
+                    .find(|(attribute, _)| self.is_relationship_id(attribute))
+                    .map(|(_, value)| value.as_ref())
+                    .filter(|_| !self.is_for_append);
+                let relation_id = namespaced.or_else(|| value_of("r:id"));
                 let invalid = || invalid_input("Invalid sheet entry in workbook.xml");
-                let [Some(name), Some(relation_id), sheet_id] =
-                    attributes.get(["name", "r:id", "sheetId"])?
-                else {
+                let (Some(name), Some(relation_id)) = (value_of("name"), relation_id) else {
                     return Err(invalid());
                 };
-                if self.refuses_empty_values && (name.is_empty() || relation_id.is_empty()) {
+                if self.is_for_append && (name.is_empty() || relation_id.is_empty()) {
                     return Err(invalid());
                 }
                 self.sheets.push(SheetEntry {
-                    name: name.into_owned(),
-                    relation_id: relation_id.into_owned(),
-                    sheet_id: sheet_id.map(|id| id.into_owned()).unwrap_or_default(),
+                    name: name.to_owned(),
+                    relation_id: relation_id.to_owned(),
+                    sheet_id: value_of("sheetId").unwrap_or_default().to_owned(),
                 });
             }
             _ => {}
@@ -85,6 +170,7 @@ impl XmlHandler for WorkbookParser {
     }
 
     fn end_element(&mut self, name: &str) -> Result<Flow> {
+        self.leave_element();
         match self.state {
             State::Sheet if name == "sheet" => self.state = State::Sheets,
             State::Sheets if name == "sheets" => self.state = State::Workbook,
@@ -137,7 +223,7 @@ mod tests {
 
     #[test]
     fn sheets_come_with_their_ids() {
-        let mut parser = WorkbookParser::refusing_empty_values();
+        let mut parser = WorkbookParser::for_append();
         let xml = r#"<workbook><sheets><sheet name="A" sheetId="7" r:id="rId4"/><sheet r:id="rId1" name="B"/>
             <sheet name="C" sheetId="" r:id="rId2"/></sheets></workbook>"#;
         XmlReader::new(xml.as_bytes(), None)
@@ -158,7 +244,7 @@ mod tests {
             r#"<workbook><sheets><sheet name="S" r:id=""/></sheets></workbook>"#,
         ] {
             assert_eq!(parse(xml).unwrap().len(), 1, "{xml}");
-            let error = parse_with(WorkbookParser::refusing_empty_values(), xml).unwrap_err();
+            let error = parse_with(WorkbookParser::for_append(), xml).unwrap_err();
             assert_eq!(error.code, DuckDBError::InputInvalid, "{xml}");
             assert_eq!(error.message, "Invalid sheet entry in workbook.xml");
         }
@@ -167,7 +253,7 @@ mod tests {
             r#"<workbook><sheets><sheet r:id="rId1"/></sheets></workbook>"#,
         ] {
             assert!(parse(xml).is_err(), "{xml}");
-            assert!(parse_with(WorkbookParser::refusing_empty_values(), xml).is_err());
+            assert!(parse_with(WorkbookParser::for_append(), xml).is_err());
         }
     }
 
@@ -179,14 +265,113 @@ mod tests {
         assert_eq!(sheets.unwrap(), pairs(&[("S", "rId1")]));
     }
 
+    const TRANSITIONAL: &str =
+        "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const STRICT: &str = "http://purl.oclc.org/ooxml/officeDocument/relationships";
+
     #[test]
-    fn the_relationship_id_is_found_by_its_written_name() {
-        let error =
-            parse(r#"<workbook><sheets><sheet name="S" rel:id="rId1"/></sheets></workbook>"#)
-                .unwrap_err();
-        assert_eq!(error.code, DuckDBError::InputInvalid);
+    fn the_relationship_id_is_the_id_in_the_relationships_namespace() {
+        for namespace in [TRANSITIONAL, STRICT] {
+            let xml = format!(
+                r#"<workbook xmlns:rel="{namespace}" xmlns:o="other"><sheets>
+                     <sheet name="A" o:id="no" rel:id="rId1" id="no"/>
+                     <sheet name="B" r:id="rId2"/>
+                     <sheet name="C" r:id="no" rel:id="rId3"/>
+                     <sheet xmlns:q="{namespace}" name="D" q:id="rId4"/>
+                     <x:sheet xmlns:x="{namespace}" name="E" x:id="rId5" rel:id="no"/>
+                   </sheets></workbook>"#
+            );
+            assert_eq!(
+                parse(&xml).unwrap(),
+                pairs(&[
+                    ("A", "rId1"),
+                    ("B", "rId2"),
+                    ("C", "rId3"),
+                    ("D", "rId4"),
+                    ("E", "rId5")
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_counts_where_its_declaration_reaches() {
+        let xml = format!(
+            r#"<workbook xmlns:a="{TRANSITIONAL}"><other xmlns:b="{TRANSITIONAL}" xmlns:a="other"><inner/></other>
+                 <sheets xmlns:c="other">
+                   <sheet name="A" a:id="rId1" b:id="no"/>
+                   <sheet xmlns:a="other" xmlns:c="{STRICT}" name="B" a:id="no" c:id="rId2"/>
+                   <sheet name="C" c:id="no" a:id="rId3"/>
+                 </sheets></workbook>"#
+        );
+        assert_eq!(
+            parse(&xml).unwrap(),
+            pairs(&[("A", "rId1"), ("B", "rId2"), ("C", "rId3")])
+        );
+    }
+
+    #[test]
+    fn an_id_under_a_prefix_bound_elsewhere_is_no_relationship_id() {
+        for xml in [
+            r#"<workbook><sheets><sheet name="S" rel:id="rId1"/></sheets></workbook>"#,
+            r#"<workbook xmlns:rel="other"><sheets><sheet name="S" rel:id="rId1"/></sheets></workbook>"#,
+            r#"<workbook><other xmlns:rel="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>
+               <sheets><sheet name="S" rel:id="rId1"/></sheets></workbook>"#,
+            r#"<workbook xmlns="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>
+               <sheet name="S" id="rId1"/></sheets></workbook>"#,
+            r#"<workbook><sheets><sheet r:id="rId1"/></sheets></workbook>"#,
+        ] {
+            let error = parse(xml).unwrap_err();
+            assert_eq!(error.code, DuckDBError::InputInvalid, "{xml}");
+            assert_eq!(error.message, "Invalid sheet entry in workbook.xml");
+        }
+    }
+
+    #[test]
+    fn a_workbook_that_gets_a_sheet_added_must_write_its_ids_as_the_new_sheet_does() {
+        let xml = format!(
+            r#"<workbook xmlns:rel="{TRANSITIONAL}"><sheets><sheet name="S" rel:id="rId1"/></sheets></workbook>"#
+        );
+        assert_eq!(parse(&xml).unwrap(), pairs(&[("S", "rId1")]));
+        let error = parse_with(WorkbookParser::for_append(), &xml).unwrap_err();
         assert_eq!(error.message, "Invalid sheet entry in workbook.xml");
-        assert!(parse(r#"<workbook><sheets><sheet r:id="rId1"/></sheets></workbook>"#).is_err());
+        let xml = xml.replace("rel:id=", "r:id=\"rId9\" rel:id=");
+        assert_eq!(parse(&xml).unwrap(), pairs(&[("S", "rId1")]));
+        assert_eq!(
+            parse_with(WorkbookParser::for_append(), &xml).unwrap(),
+            pairs(&[("S", "rId9")])
+        );
+    }
+
+    fn date_system(workbook: &str) -> DateSystem {
+        let mut parser = WorkbookParser::new();
+        XmlReader::new(workbook.as_bytes(), None)
+            .parse_all(&mut parser)
+            .unwrap();
+        parser.date_system
+    }
+
+    #[test]
+    fn a_workbook_says_when_it_counts_from_1904() {
+        for value in ["1", "true", "on"] {
+            let xml = format!(
+                r#"<workbook><fileVersion/><workbookPr codeName="x" date1904="{value}"/><sheets/></workbook>"#
+            );
+            assert_eq!(date_system(&xml), DateSystem::Since1904, "{value}");
+        }
+        for xml in [
+            r#"<workbook><sheets/></workbook>"#,
+            r#"<workbook><workbookPr/><sheets/></workbook>"#,
+            r#"<workbook><workbookPr date1904="0"/><sheets/></workbook>"#,
+            r#"<workbook><workbookPr date1904="false"/><sheets/></workbook>"#,
+            r#"<workbook><workbookPr date1904="TRUE"/><sheets/></workbook>"#,
+            r#"<workbook><workbookPr x:date1904="1"/><sheets/></workbook>"#,
+            r#"<workbook><sheets><workbookPr date1904="1"/></sheets></workbook>"#,
+            r#"<other><workbookPr date1904="1"/></other>"#,
+            r#"<workbook><sheets/></workbook><workbookPr date1904="1"/>"#,
+        ] {
+            assert_eq!(date_system(xml), DateSystem::Since1900, "{xml}");
+        }
     }
 
     #[test]

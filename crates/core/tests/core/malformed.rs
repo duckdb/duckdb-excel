@@ -130,8 +130,8 @@ fn parts_without_what_they_must_have() {
         ),
         (
             "xl/styles.xml",
-            "<styleSheet><cellXfs><xf/></cellXfs></styleSheet>".to_owned(),
-            "Invalid Input Error: Invalid xf entry in styles.xml",
+            "<styleSheet><numFmts><numFmt formatCode=\"0\"/></numFmts></styleSheet>".to_owned(),
+            "Invalid Input Error: Invalid numFmt entry in styles.xml",
         ),
         (
             "xl/worksheets/sheet1.xml",
@@ -207,7 +207,7 @@ fn malformed_xml_is_an_io_error() {
         ),
         (
             "xl/worksheets/sheet1.xml",
-            "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><worksheet/>".to_owned(),
+            "<?xml version=\"1.0\" encoding=\"UTF-16\"?><worksheet/>".to_owned(),
         ),
     ];
     for (part, content) in cases {
@@ -217,17 +217,17 @@ fn malformed_xml_is_an_io_error() {
             "{part} {content}: {error}"
         );
     }
-    let utf16: Vec<u8> = "\u{feff}<worksheet/>"
-        .encode_utf16()
-        .flat_map(u16::to_le_bytes)
-        .collect();
     let error = read_error(
-        &simple().part("xl/worksheets/sheet1.xml", utf16),
-        "utf16.xlsx",
+        &simple().part(
+            "xl/worksheets/sheet1.xml",
+            "<?xml version=\"1.0\" encoding=\"windows-1252\"?><worksheet/>",
+        ),
+        "other_encoding.xlsx",
     );
     assert_eq!(
         error,
-        "IO Error: XML parse error: unsupported encoding 'UTF-16', only UTF-8 is supported"
+        "IO Error: XML parse error: unsupported encoding 'windows-1252', only UTF-8, UTF-16 and ISO-8859-1 are \
+         supported"
     );
 }
 

@@ -99,7 +99,8 @@ impl RowBatch {
 /// Gathers the cells of the rows of a range into a [`RowBatch`] and pauses the parser when the batch is full
 /// or when the sheet leaves out rows, which a [`RowReader`] then fills in.
 ///
-/// A cell a row leaves out is NULL, and so is a cell that comes after a later cell of its row.
+/// A cell a row leaves out is NULL, and so are a cell that comes after a later cell of its row and a shared
+/// string cell without an index.
 #[derive(Debug)]
 struct RowCollector {
     range: CellRange,
@@ -224,7 +225,7 @@ impl SheetVisitor for RowCollector {
             return Ok(());
         }
         self.set_null_between(self.last_col.wrapping_add(1), pos.col);
-        if cell_type == CellType::SharedString {
+        if cell_type == CellType::SharedString && !data.is_empty() {
             let index = usize::try_from(parse_integer(data))
                 .ok()
                 .filter(|index| *index < self.string_count)
@@ -415,9 +416,19 @@ mod tests {
 
     #[test]
     fn a_shared_string_makes_a_row_non_empty() {
-        let sheet = r#"<row r="1"><c r="A1" t="s"><v></v></c></row><row r="2"><c r="A2" t="inlineStr"><is><t></t></is></c></row><row r="3"><c r="A3"><v>3</v></c></row>"#;
+        let sheet = r#"<row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="2"><c r="A2" t="inlineStr"><is><t></t></is></c></row><row r="3"><c r="A3"><v>3</v></c></row>"#;
         let batches = collect(sheet, range(1, 1, u64::MAX, 2), true, false).unwrap();
         assert_eq!(batches, [vec!["1: #0"]]);
+    }
+
+    #[test]
+    fn a_shared_string_cell_without_an_index_is_null() {
+        let sheet = r#"<row r="1"><c r="A1" t="s"><v>1</v></c><c r="B1" t="s"/></row>
+            <row r="2"><c r="A2" t="s"><v></v></c><c r="B2" t="s"/></row><row r="3"><c r="A3"><v>3</v></c></row>"#;
+        let all = collect(sheet, range(1, 1, u64::MAX, 3), false, false).unwrap();
+        assert_eq!(all, [vec!["1: #1 NULL", "2: NULL NULL", "3: \"3\" NULL"]]);
+        let stopped = collect(sheet, range(1, 1, u64::MAX, 3), true, false).unwrap();
+        assert_eq!(stopped, [vec!["1: #1 NULL"]]);
     }
 
     #[test]

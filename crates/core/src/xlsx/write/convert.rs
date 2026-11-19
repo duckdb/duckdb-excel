@@ -1,7 +1,7 @@
 //! Turns the values of a chunk into the text of their cells.
 //!
 //! DuckDB casts every value to text. Booleans become integers first, and dates, times and timestamps the
-//! serial numbers spreadsheets count time in.
+//! serial numbers spreadsheets count time in, from the day the workbook counts from.
 
 use duckdb_neo::{
     DuckDBType, Result,
@@ -15,7 +15,7 @@ use duckdb_neo::{
 use crate::{
     error::{internal, reraise},
     xlsx::{
-        serial::{epoch_days_to_serial, epoch_micros_to_serial, time_micros_to_serial},
+        serial::{DateSystem, epoch_days_to_serial, epoch_micros_to_serial, time_micros_to_serial},
         write::sheet::CellKind,
     },
 };
@@ -121,12 +121,18 @@ impl ConversionPlan {
 pub struct TextConverter<'a> {
     context: &'a Context,
     plan: &'a ConversionPlan,
+    date_system: DateSystem,
     texts: DataChunk<'a>,
     scratch: Option<DataChunk<'a>>,
 }
 
 impl<'a> TextConverter<'a> {
-    pub fn new(context: &'a Context, plan: &'a ConversionPlan) -> Result<TextConverter<'a>> {
+    /// A converter whose serial numbers count from where the workbook they are written to counts from.
+    pub fn new(
+        context: &'a Context,
+        plan: &'a ConversionPlan,
+        date_system: DateSystem,
+    ) -> Result<TextConverter<'a>> {
         let text = String::logical_type(context)?;
         let texts = DataChunk::create(context, vec![text; plan.conversions.len()], true)?;
         let scratch_types = plan
@@ -147,6 +153,7 @@ impl<'a> TextConverter<'a> {
         Ok(TextConverter {
             context,
             plan,
+            date_system,
             texts,
             scratch,
         })
@@ -154,6 +161,7 @@ impl<'a> TextConverter<'a> {
 
     /// Converts the columns of `chunk`; [`Self::texts`] has the result until the next chunk is converted.
     pub fn convert(&mut self, chunk: &DataChunkRef<'_>) -> Result<()> {
+        let system = self.date_system;
         self.texts.clear()?;
         if let Some(scratch) = self.scratch.as_mut() {
             scratch.clear()?;
@@ -177,7 +185,9 @@ impl<'a> TextConverter<'a> {
                     let dates = source.cast_ref::<DateValue>()?.reader()?;
                     let serials = self.scratch()?.get_vector_at_mut(serial)?;
                     write_serials(serials, dates.len(), |row| {
-                        Ok(dates.get(row)?.map(|date| epoch_days_to_serial(date.0)))
+                        Ok(dates
+                            .get(row)?
+                            .map(|date| epoch_days_to_serial(date.0, system)))
                     })?;
                     serial
                 }
@@ -208,7 +218,7 @@ impl<'a> TextConverter<'a> {
                     let serials = self.scratch()?.get_vector_at_mut(serial)?;
                     write_serials(serials, timestamps.len(), |row| {
                         let timestamp = timestamps.get(row)?;
-                        Ok(timestamp.map(|timestamp| epoch_micros_to_serial(timestamp.0)))
+                        Ok(timestamp.map(|timestamp| epoch_micros_to_serial(timestamp.0, system)))
                     })?;
                     serial
                 }
@@ -224,7 +234,7 @@ impl<'a> TextConverter<'a> {
                     let timestamps = timestamps.reader()?;
                     write_serials(serials.cast()?, timestamps.len(), |row| {
                         let timestamp = timestamps.get(row)?;
-                        Ok(timestamp.map(|timestamp| epoch_micros_to_serial(timestamp.0)))
+                        Ok(timestamp.map(|timestamp| epoch_micros_to_serial(timestamp.0, system)))
                     })?;
                     serial
                 }

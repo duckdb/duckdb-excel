@@ -109,6 +109,109 @@ fn rows_are_cast_to_the_types_of_the_table() {
 }
 
 #[test]
+fn serial_numbers_are_read_as_read_xlsx_reads_them() {
+    let connection = connect();
+    let serial_rows = |serials: &[&str]| -> String {
+        let header = row(
+            1,
+            &[inline("A1", "d"), inline("B1", "t"), inline("C1", "ts")],
+        );
+        let rows: String = (2..)
+            .zip(serials)
+            .map(|(number, serial)| {
+                row(
+                    number,
+                    &[
+                        number_cell("A", number, serial),
+                        number_cell("B", number, serial),
+                        number_cell("C", number, serial),
+                    ],
+                )
+            })
+            .collect();
+        format!("{header}{rows}")
+    };
+    fn number_cell(column: &str, row: u32, serial: &str) -> String {
+        number(&format!("{column}{row}"), serial)
+    }
+    execute(
+        &connection,
+        "CREATE TABLE moments(d DATE, t TIME, ts TIMESTAMP)",
+    );
+
+    // The cells have no date style: the columns of the table say what the numbers are.
+    let book = Workbook::new()
+        .sheet("S", &serial_rows(&["1", "59.75", "60", "45366.5242683912"]))
+        .write("copy_serials.xlsx");
+    execute(
+        &connection,
+        &format!("COPY moments FROM '{}' (FORMAT xlsx)", book.path()),
+    );
+    assert_eq!(
+        query(&connection, "FROM moments"),
+        [
+            "1900-01-01|24:00:00|1900-01-01 00:00:00",
+            "1900-02-28|18:00:00|1900-02-28 18:00:00",
+            "1900-02-28|00:00:00|1900-02-28 00:00:00",
+            "2024-03-15|12:34:56.789|2024-03-15 12:34:56.789"
+        ]
+    );
+
+    execute(&connection, "DELETE FROM moments");
+    let book = Workbook::new()
+        .sheet("S", &serial_rows(&["0", "43538.5"]))
+        .properties("date1904=\"1\"")
+        .write("copy_date1904.xlsx");
+    execute(
+        &connection,
+        &format!("COPY moments FROM '{}' (FORMAT xlsx)", book.path()),
+    );
+    assert_eq!(
+        query(&connection, "FROM moments"),
+        [
+            "1904-01-01|00:00:00|1904-01-01 00:00:00",
+            "2023-03-15|12:00:00|2023-03-15 12:00:00"
+        ]
+    );
+
+    execute(&connection, "DELETE FROM moments");
+    let book = Workbook::new()
+        .sheet(
+            "S",
+            &serial_rows(&["44197.5", "-1e9", "1e300", "inf", "44198"]),
+        )
+        .write("copy_serial_range.xlsx");
+    let path = book.path();
+    assert_eq!(
+        execute_error(
+            &connection,
+            &format!("COPY moments FROM '{path}' (FORMAT xlsx)")
+        ),
+        "Invalid Input Error: read_xlsx: Failed to parse cell 'A4': Could not convert the serial number 1e300 to \
+         DATE: the value is out of range"
+    );
+    assert_eq!(query(&connection, "SELECT count(*) FROM moments"), ["0"]);
+    execute(
+        &connection,
+        &format!("COPY moments FROM '{path}' (FORMAT xlsx, ignore_errors)"),
+    );
+    // What is stored are values DuckDB can work with.
+    assert_eq!(
+        query(
+            &connection,
+            "SELECT d::VARCHAR, t, ts, ts + INTERVAL 1 DAY FROM moments"
+        ),
+        [
+            "2021-01-01|12:00:00|2021-01-01 12:00:00|2021-01-02 12:00:00",
+            "2736009-12-27 (BC)|00:00:00|NULL|NULL",
+            "NULL|NULL|NULL|NULL",
+            "NULL|NULL|NULL|NULL",
+            "2021-01-02|00:00:00|2021-01-02 00:00:00|2021-01-03 00:00:00"
+        ]
+    );
+}
+
+#[test]
 fn the_format_follows_from_the_file_name() {
     let connection = connect();
     execute(

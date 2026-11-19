@@ -1,0 +1,244 @@
+# name: test/sql/excel/xlsx/read_handmade.test
+# description: What read_xlsx and COPY ... FROM make of workbooks that other programs write differently than a
+#              spreadsheet does: styles without a number format, sheets without text, the 1904 date system, serial
+#              numbers at the edges, escaped characters, shared string cells without a string, relationship ids
+#              under another prefix, and parts in UTF-16 and ISO-8859-1. The workbooks are made by
+#              crates/core/tests/core/handmade.rs.
+# group: [xlsx]
+
+require excel
+
+# A cell style without a number format shows a number as a number
+query TTTTTT
+DESCRIBE FROM read_xlsx('test/data/xlsx/handmade/xf_without_numfmtid.xlsx');
+----
+plain	DOUBLE	YES	NULL	NULL	NULL
+day	DATE	YES	NULL	NULL	NULL
+bold	DOUBLE	YES	NULL	NULL	NULL
+
+query RTR
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/xf_without_numfmtid.xlsx');
+----
+1.5	2021-01-01	44197.0
+2.5	2021-01-02	7.0
+
+# A sheet whose rows hold formatted cells without text is like a sheet without rows
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/no_text.xlsx');
+----
+Binder Error: No rows found in xlsx file
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/no_text.xlsx', all_varchar = true, stop_at_empty = false);
+----
+Binder Error: No rows found in xlsx file
+
+# ... unless a range says what to read
+query TT
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/no_text.xlsx', range = 'A1:B3');
+----
+NULL	NULL
+NULL	NULL
+NULL	NULL
+
+# A workbook that counts its days from 1904: serial number 0 is 1904-01-01
+query TTTR
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/date1904.xlsx');
+----
+1904-01-01	00:00:00	1904-01-01 00:00:00	0.0
+1904-04-10	06:00:00	1904-04-10 06:00:00	100.25
+2023-03-15	12:00:00	2023-03-15 12:00:00	43538.5
+1904-01-02	24:00:00	1904-01-02 00:00:00	1.0
+
+query TTTT
+SELECT typeof(d), typeof(t), typeof(ts), typeof(n) FROM read_xlsx('test/data/xlsx/handmade/date1904.xlsx') LIMIT 1;
+----
+DATE	TIME	TIMESTAMP	DOUBLE
+
+# Serial numbers: 1 is 1900-01-01 and 24:00:00, 60 is the day before the 1st of March 1900 as 59 is, numbers below 1
+# count from 1899-12-30, and the time of day is rounded to the microsecond
+query TTTR
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/serials.xlsx');
+----
+1900-01-01	24:00:00	1900-01-01 00:00:00	1.0
+1900-01-02	00:00:00	1900-01-02 00:00:00	2.0
+1900-02-28	00:00:00	1900-02-28 00:00:00	59.0
+1900-02-28	18:00:00	1900-02-28 18:00:00	59.75
+1900-02-28	00:00:00	1900-02-28 00:00:00	60.0
+1900-02-28	12:00:00	1900-02-28 12:00:00	60.5
+1900-03-01	00:00:00	1900-03-01 00:00:00	61.0
+1899-12-30	12:00:00	1899-12-30 12:00:00	0.5
+2023-03-15	00:00:00	2023-03-15 00:00:00	45000.0
+2024-03-15	12:34:56.789	2024-03-15 12:34:56.789	45366.5242683912
+2024-03-15	00:00:00.001	2024-03-15 00:00:00.001	45366.000000011576
+2024-03-15	00:00:00.999	2024-03-15 00:00:00.999	45366.0000115625
+2024-03-15	12:00:00	2024-03-15 12:00:00	45366.49999999999
+1900-02-28	23:59:59.999	1900-02-28 23:59:59.999	59.99999998842593
+
+# A serial number that is no value of the type of its column is a cell that does not convert
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/serial_range.xlsx');
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'A4': Could not convert the serial number 1e300 to DATE: the value is out of range
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/serial_range.xlsx', range = 'C1:C3');
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'C3': Could not convert the serial number -1000000000.0 to TIMESTAMP: the value is out of range
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/serial_range.xlsx', range = 'A5:A5', header = false);
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'A5': Could not convert the serial number NaN to DATE: the value is not a finite number
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/serial_range.xlsx', range = 'B6:B6', header = false);
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'B6': Could not convert the serial number inf to TIME: the value is not a finite number
+
+# A table is never given a value DuckDB cannot work with
+statement error
+CREATE TABLE unusable AS FROM read_xlsx('test/data/xlsx/handmade/serial_range.xlsx', range = 'C1:C7');
+----
+Failed to parse cell 'C3'
+
+# With ignore_errors such a cell is NULL; a billion days back is a day and a time of day but no TIMESTAMP
+query TTTR
+SELECT d::VARCHAR, t, ts, n FROM read_xlsx('test/data/xlsx/handmade/serial_range.xlsx', ignore_errors = true);
+----
+2021-01-01	12:00:00	2021-01-01 12:00:00	44197.5
+2736009-12-27 (BC)	00:00:00	NULL	-1000000000.0
+NULL	NULL	NULL	1e+300
+NULL	NULL	NULL	nan
+NULL	NULL	NULL	inf
+2021-01-02	06:00:00	2021-01-02 06:00:00	44198.25
+
+# COPY ... FROM reads serial numbers the same way
+statement ok
+CREATE TABLE moments (d DATE, t TIME, ts TIMESTAMP, n DOUBLE);
+
+statement error
+COPY moments FROM 'test/data/xlsx/handmade/serial_range.xlsx' (FORMAT xlsx);
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'A4': Could not convert the serial number 1e300 to DATE: the value is out of range
+
+statement ok
+COPY moments FROM 'test/data/xlsx/handmade/serial_range.xlsx' (FORMAT xlsx, ignore_errors);
+
+query IIIT
+SELECT count(*), count(d), count(ts), max(ts + INTERVAL 1 DAY) FROM moments;
+----
+6	3	2	2021-01-03 06:00:00
+
+statement ok
+DELETE FROM moments;
+
+statement ok
+COPY moments FROM 'test/data/xlsx/handmade/date1904.xlsx' (FORMAT xlsx);
+
+statement ok
+COPY moments FROM 'test/data/xlsx/handmade/serials.xlsx' (FORMAT xlsx, range 'A1:D6');
+
+query TTTR
+SELECT * FROM moments ORDER BY ts, n;
+----
+1900-01-01	24:00:00	1900-01-01 00:00:00	1.0
+1900-01-02	00:00:00	1900-01-02 00:00:00	2.0
+1900-02-28	00:00:00	1900-02-28 00:00:00	59.0
+1900-02-28	00:00:00	1900-02-28 00:00:00	60.0
+1900-02-28	18:00:00	1900-02-28 18:00:00	59.75
+1904-01-01	00:00:00	1904-01-01 00:00:00	0.0
+1904-01-02	24:00:00	1904-01-02 00:00:00	1.0
+1904-04-10	06:00:00	1904-04-10 06:00:00	100.25
+2023-03-15	12:00:00	2023-03-15 12:00:00	43538.5
+
+# `_xHHHH_` stands for a character in shared strings, inline strings, the values of formulas and column names;
+# `_x005F_` is an underscore, two halves of a pair are one character, and what is no escape stays
+query TTTTTT
+DESCRIBE FROM read_xlsx('test/data/xlsx/handmade/escapes.xlsx');
+----
+head er	VARCHAR	YES	NULL	NULL	NULL
+kind	VARCHAR	YES	NULL	NULL	NULL
+
+query TT
+SELECT replace(replace(replace("head er", chr(10), '<LF>'), chr(13), '<CR>'), chr(9), '<TAB>'), kind
+FROM read_xlsx('test/data/xlsx/handmade/escapes.xlsx');
+----
+line<LF>break	shared
+under_score _x0041_	shared
+two runs _x0041_	shared
+cr<CR>lf	inline
+tab<TAB>bed	formula
+not_x12_an_escape	inline
+🦆 and _xD83E_	inline
+
+# A shared string cell without a string is NULL, and a row of such cells is an empty row
+query TT
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/empty_shared_string.xlsx');
+----
+zero	NULL
+
+query TT
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/empty_shared_string.xlsx', stop_at_empty = false);
+----
+zero	NULL
+NULL	NULL
+zero	one
+
+# The relationship id of a sheet under another prefix than `r`, in a strict workbook
+query RR
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/relationship_prefix.xlsx', sheet = 'Data', header = false);
+----
+1.0	2.0
+
+query R
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/relationship_prefix.xlsx', sheet = 'Other', header = false);
+----
+3.0
+
+# Parts in UTF-16, with and without a byte order mark
+foreach workbook utf16le utf16be
+
+query TTTTTT
+DESCRIBE FROM read_xlsx('test/data/xlsx/handmade/${workbook}.xlsx', sheet = 'Größe 表');
+----
+wärt 漢字	VARCHAR	YES	NULL	NULL	NULL
+n	DOUBLE	YES	NULL	NULL	NULL
+
+query TR
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/${workbook}.xlsx');
+----
+żółw 🦆	1.0
+naïve & café	2.0
+
+endloop
+
+# Parts in ISO-8859-1
+query TTTTTT
+DESCRIBE FROM read_xlsx('test/data/xlsx/handmade/iso_8859_1.xlsx', sheet = 'Größe');
+----
+wärt	VARCHAR	YES	NULL	NULL	NULL
+n	DOUBLE	YES	NULL	NULL	NULL
+
+query TR
+SELECT * FROM 'test/data/xlsx/handmade/iso_8859_1.xlsx';
+----
+crème brûlée	1.0
+naïve & café	2.0
+
+statement ok
+CREATE TABLE words (word VARCHAR, n INTEGER);
+
+statement ok
+COPY words FROM 'test/data/xlsx/handmade/utf16be.xlsx' (FORMAT xlsx);
+
+statement ok
+COPY words FROM 'test/data/xlsx/handmade/iso_8859_1.xlsx' (FORMAT xlsx);
+
+query TI
+SELECT * FROM words ORDER BY word;
+----
+crème brûlée	1
+naïve & café	2
+naïve & café	2
+żółw 🦆	1

@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod cell;
 pub mod copy;
+pub mod encoding;
 pub mod escape;
 pub mod names;
 pub mod options;

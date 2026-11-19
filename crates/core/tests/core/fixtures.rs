@@ -1,28 +1,11 @@
 //! The workbooks of the SQL tests, which come from Excel, LibreOffice, Google Sheets and GDAL.
 
-use std::path::Path;
-
-use crate::support::{connect, describe, fixture, query, try_query};
-
-fn workbooks(directory: &Path, found: &mut Vec<String>) {
-    for entry in std::fs::read_dir(directory).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            workbooks(&path, found);
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "xlsx")
-        {
-            found.push(path.to_str().unwrap().to_owned());
-        }
-    }
-}
+use crate::support::{connect, describe, fixture, produced_fixtures, query, try_query};
 
 #[test]
 fn every_fixture_reads_in_every_shape() {
     let connection = connect();
-    let mut paths = Vec::new();
-    workbooks(Path::new(&fixture("")), &mut paths);
+    let paths = produced_fixtures();
     assert!(paths.len() >= 25, "{paths:?}");
     for path in paths {
         let text = query(

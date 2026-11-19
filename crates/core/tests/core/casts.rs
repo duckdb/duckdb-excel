@@ -182,56 +182,330 @@ fn numbers_with_a_date_style_are_serial_dates() {
             &format!("FROM read_xlsx('{}', stop_at_empty = false)", book.path())
         ),
         [
-            "2021-01-01|12:00:00|2021-01-01 12:34:56",
+            "2021-01-01|12:00:00|2021-01-01 12:34:55.999978",
             "2021-01-01|06:00:00|1970-01-01 00:00:00",
             "1899-12-29|18:00:00|1899-12-28 12:00:00",
-            "1899-12-30|00:00:01|1899-12-30 00:00:00.00864",
-            "9999-12-31|00:00:00|9999-12-31 23:59:59",
+            "1899-12-30|00:00:00.999994|1899-12-30 00:00:00.00864",
+            "9999-12-31|24:00:00|9999-12-31 23:59:59",
             "NULL|NULL|NULL"
         ]
     );
 }
 
 #[test]
-fn serial_numbers_out_of_range_are_the_ends_of_the_range() {
+fn serial_numbers_that_are_no_value_of_the_column_type_do_not_convert() {
     let connection = connect();
-    let header = row(1, &[inline("A1", "d"), inline("B1", "ts")]);
+    let header = row(
+        1,
+        &[inline("A1", "d"), inline("B1", "t"), inline("C1", "ts")],
+    );
+    let triple = |number: u32, serial: &str| {
+        row(
+            number,
+            &[
+                styled(&format!("A{number}"), serial, 1),
+                styled(&format!("B{number}"), serial, 2),
+                styled(&format!("C{number}"), serial, 3),
+            ],
+        )
+    };
     let rows = [
-        row(2, &[styled("A2", 44197, 1), styled("B2", 44197, 3)]),
-        row(3, &[styled("A3", "1e300", 1), styled("B3", "1e300", 3)]),
-        row(4, &[styled("A4", "inf", 1), styled("B4", "inf", 3)]),
+        triple(2, "44197.5"),
+        triple(3, "-1e9"),
+        triple(4, "1e300"),
+        triple(5, "nan"),
+        triple(6, "inf"),
+        triple(7, "3e9"),
+        triple(8, "44198.25"),
     ];
     let book = write("serial_range.xlsx", &format!("{header}{}", rows.concat()));
-    let rows = query(
-        &connection,
-        &format!(
-            "SELECT d = 'infinity'::DATE, ts = 'infinity'::TIMESTAMP FROM read_xlsx('{}')",
-            book.path()
+    let path = book.path();
+    let failure = |range: &str| {
+        query_error(
+            &connection,
+            &format!("FROM read_xlsx('{path}', range = '{range}', header = false)"),
+        )
+    };
+    let reason = "Invalid Input Error: read_xlsx: Failed to parse cell";
+    for (range, cell_and_reason) in [
+        (
+            "C3:C3",
+            "'C3': Could not convert the serial number -1000000000.0 to TIMESTAMP: the value is out of range",
         ),
+        (
+            "A4:A4",
+            "'A4': Could not convert the serial number 1e300 to DATE: the value is out of range",
+        ),
+        (
+            "B4:B4",
+            "'B4': Could not convert the serial number 1e300 to TIME: the value is out of range",
+        ),
+        (
+            "A5:A5",
+            "'A5': Could not convert the serial number NaN to DATE: the value is not a finite number",
+        ),
+        (
+            "B6:B6",
+            "'B6': Could not convert the serial number inf to TIME: the value is not a finite number",
+        ),
+        (
+            "C6:C6",
+            "'C6': Could not convert the serial number inf to TIMESTAMP: the value is not a finite number",
+        ),
+        (
+            "A7:A7",
+            "'A7': Could not convert the serial number 3000000000.0 to DATE: the value is out of range",
+        ),
+        // The first column with such a cell reports its first one.
+        (
+            "A2:C8",
+            "'A4': Could not convert the serial number 1e300 to DATE: the value is out of range",
+        ),
+        (
+            "B2:C8",
+            "'B4': Could not convert the serial number 1e300 to TIME: the value is out of range",
+        ),
+    ] {
+        assert_eq!(
+            failure(range),
+            format!("{reason} {cell_and_reason}"),
+            "{range}"
+        );
+    }
+    // A billion days back is a day and a time of day, but no TIMESTAMP.
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', ignore_errors = true)")
+        ),
+        [
+            "2021-01-01|12:00:00|2021-01-01 12:00:00",
+            "2736009-12-27 (BC)|00:00:00|NULL",
+            "NULL|NULL|NULL",
+            "NULL|NULL|NULL",
+            "NULL|NULL|NULL",
+            "NULL|00:00:00|NULL",
+            "2021-01-02|06:00:00|2021-01-02 06:00:00"
+        ]
     );
-    assert_eq!(rows, ["false|false", "true|true", "true|true"]);
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "SELECT count(*), count(d), count(t), count(ts) FROM read_xlsx('{path}', ignore_errors = true)"
+            )
+        ),
+        ["7|3|4|2"]
+    );
 }
 
 #[test]
-fn a_time_cannot_be_infinite() {
+fn the_values_a_serial_number_becomes_are_ones_duckdb_accepts() {
     let connection = connect();
     let sheet = [
-        row(1, &[inline("A1", "t")]),
-        row(2, &[styled("A2", 0.5, 2)]),
-        row(3, &[styled("A3", "1e300", 2)]),
+        row(1, &[inline("A1", "d"), inline("B1", "ts")]),
+        row(2, &[styled("A2", 44197, 1), styled("B2", 44197, 3)]),
+        // The last day and the last whole day of the types, and the first ones.
+        row(
+            3,
+            &[styled("A3", 2147509215_i64, 1), styled("B3", 106777560, 3)],
+        ),
+        row(
+            4,
+            &[
+                styled("A4", -2147458077_i64, 1),
+                styled("B4", -106726422, 3),
+            ],
+        ),
     ]
     .concat();
-    let book = write("infinite_time.xlsx", &sheet);
+    let book = write("serial_ends.xlsx", &sheet);
     let path = book.path();
-    for sql in [
-        format!("FROM read_xlsx('{path}')"),
-        format!("SELECT count(*) FROM read_xlsx('{path}')"),
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "SELECT d::VARCHAR, ts::VARCHAR, isfinite(d), isfinite(ts) FROM read_xlsx('{path}')"
+            )
+        ),
+        [
+            "2021-01-01|2021-01-01 00:00:00|true|true",
+            "5881580-07-10|294247-01-10 00:00:00|true|true",
+            "5877642-06-25 (BC)|290309-12-22 (BC) 00:00:00|true|true"
+        ]
+    );
+    for (cell, serial, name) in [
+        ("A3", "2147509216", "DATE"),
+        ("A3", "-2147458078", "DATE"),
+        ("B3", "106777561", "TIMESTAMP"),
+        ("B3", "-106726423", "TIMESTAMP"),
     ] {
+        let column = &cell[..1];
+        let style = if name == "DATE" { 1 } else { 3 };
+        let sheet = [
+            row(1, &[inline(&format!("{column}1"), "x")]),
+            row(2, &[styled(&format!("{column}2"), 44197, style)]),
+            row(3, &[styled(cell, serial, style)]),
+        ]
+        .concat();
+        let book = write("serial_past_the_end.xlsx", &sheet);
+        let error = query_error(&connection, &format!("FROM read_xlsx('{}')", book.path()));
         assert_eq!(
-            query_error(&connection, &sql),
-            "Conversion Error: Can't get TIME of infinite TIMESTAMP"
+            error,
+            format!(
+                "Invalid Input Error: read_xlsx: Failed to parse cell '{cell}': Could not convert the serial number \
+                 {serial}.0 to {name}: the value is out of range"
+            )
         );
     }
+}
+
+fn temporal_header() -> String {
+    row(
+        1,
+        &[inline("A1", "d"), inline("B1", "t"), inline("C1", "ts")],
+    )
+}
+
+fn temporal_row(number: u32, serial: &str) -> String {
+    row(
+        number,
+        &[
+            styled(&format!("A{number}"), serial, 1),
+            styled(&format!("B{number}"), serial, 2),
+            styled(&format!("C{number}"), serial, 3),
+        ],
+    )
+}
+
+fn temporal_sheet(serials: &[&str]) -> String {
+    let rows: String = (2..)
+        .zip(serials)
+        .map(|(number, serial)| temporal_row(number, serial))
+        .collect();
+    format!("{}{rows}", temporal_header())
+}
+
+#[test]
+fn serial_numbers_below_61_are_the_days_a_spreadsheet_shows() {
+    let connection = connect();
+    let serials = [
+        "1", "2", "31.25", "59", "59.75", "60", "60.5", "61", "0.5", "0", "-1.5", "45000",
+    ];
+    let book = write("serials_below_61.xlsx", &temporal_sheet(&serials));
+    assert_eq!(
+        query(&connection, &format!("FROM read_xlsx('{}')", book.path())),
+        [
+            "1900-01-01|24:00:00|1900-01-01 00:00:00",
+            "1900-01-02|00:00:00|1900-01-02 00:00:00",
+            "1900-01-31|06:00:00|1900-01-31 06:00:00",
+            "1900-02-28|00:00:00|1900-02-28 00:00:00",
+            "1900-02-28|18:00:00|1900-02-28 18:00:00",
+            // The 29th of February 1900 that spreadsheets count is the day before it.
+            "1900-02-28|00:00:00|1900-02-28 00:00:00",
+            "1900-02-28|12:00:00|1900-02-28 12:00:00",
+            "1900-03-01|00:00:00|1900-03-01 00:00:00",
+            "1899-12-30|12:00:00|1899-12-30 12:00:00",
+            "1899-12-30|00:00:00|1899-12-30 00:00:00",
+            "1899-12-28|12:00:00|1899-12-28 12:00:00",
+            "2023-03-15|00:00:00|2023-03-15 00:00:00"
+        ]
+    );
+}
+
+#[test]
+fn a_workbook_that_counts_from_1904_has_its_dates_four_years_later() {
+    let connection = connect();
+    let serials = ["0", "1", "59.5", "60", "100.25", "43538.5", "-1"];
+    let sheet = temporal_sheet(&serials);
+    let expected = [
+        "1904-01-01|00:00:00|1904-01-01 00:00:00",
+        "1904-01-02|24:00:00|1904-01-02 00:00:00",
+        "1904-02-29|12:00:00|1904-02-29 12:00:00",
+        "1904-03-01|00:00:00|1904-03-01 00:00:00",
+        "1904-04-10|06:00:00|1904-04-10 06:00:00",
+        "2023-03-15|12:00:00|2023-03-15 12:00:00",
+        "1903-12-31|00:00:00|1903-12-31 00:00:00",
+    ];
+    for value in ["1", "true", "on"] {
+        let book = Workbook::new()
+            .sheet("S", &sheet)
+            .properties(&format!("date1904=\"{value}\""))
+            .write("date1904.xlsx");
+        let path = book.path();
+        assert_eq!(
+            query(&connection, &format!("FROM read_xlsx('{path}')")),
+            expected,
+            "{value}"
+        );
+        // As text the cells are the numbers they hold.
+        assert_eq!(
+            query(
+                &connection,
+                &format!("SELECT d FROM read_xlsx('{path}', all_varchar = true) LIMIT 2")
+            ),
+            ["0", "1"]
+        );
+    }
+    for value in ["0", "false", "off", "TRUE", ""] {
+        let book = Workbook::new()
+            .sheet("S", &sheet)
+            .properties(&format!("date1904=\"{value}\""))
+            .write("date1900.xlsx");
+        assert_eq!(
+            query(
+                &connection,
+                &format!("FROM read_xlsx('{}') LIMIT 2", book.path())
+            ),
+            [
+                "1899-12-30|00:00:00|1899-12-30 00:00:00",
+                "1900-01-01|24:00:00|1900-01-01 00:00:00"
+            ],
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn times_of_day_are_rounded_to_the_microsecond() {
+    let connection = connect();
+    let serials = [
+        // 12:34:56.789 on 2024-03-15, the number next to it, and 12:34:56.789123.
+        "45366.5242683912",
+        "45366.52426839121",
+        "45366.524268392626",
+        // A thousandth of a second after midnight and before the next second.
+        "45366.00000001157407",
+        "45366.00001156250000",
+        // One step of a DOUBLE around noon, and a microsecond around it.
+        "45366.49999999999",
+        "45366.50000000001",
+        "45366.50000000001157",
+        "45366.49999999998843",
+        // The last millisecond of the 28th of February 1900.
+        "59.99999998842593",
+        "0.5242683912037037",
+    ];
+    let book = write("serial_fractions.xlsx", &temporal_sheet(&serials));
+    assert_eq!(
+        query(
+            &connection,
+            &format!("SELECT ts, t FROM read_xlsx('{}')", book.path())
+        ),
+        [
+            "2024-03-15 12:34:56.789|12:34:56.789",
+            "2024-03-15 12:34:56.789|12:34:56.789",
+            "2024-03-15 12:34:56.789123|12:34:56.789123",
+            "2024-03-15 00:00:00.001|00:00:00.001",
+            "2024-03-15 00:00:00.999|00:00:00.999",
+            "2024-03-15 12:00:00|12:00:00",
+            "2024-03-15 12:00:00|12:00:00",
+            "2024-03-15 12:00:00.000001|12:00:00.000001",
+            "2024-03-15 11:59:59.999999|11:59:59.999999",
+            "1900-02-28 23:59:59.999|23:59:59.999",
+            "1899-12-30 12:34:56.789|12:34:56.789"
+        ]
+    );
 }
 
 #[test]
@@ -353,40 +627,38 @@ fn many_text_and_number_columns_convert_side_by_side() {
 #[test]
 fn columns_a_query_does_not_ask_for_are_converted_too() {
     let connection = connect();
-    let sheet = [
-        row(
-            1,
-            &[
-                inline("A1", "label"),
-                inline("B1", "day"),
-                inline("C1", "time"),
-            ],
-        ),
-        row(
-            2,
-            &[
-                inline("A2", "x"),
-                styled("B2", 44197, 1),
-                styled("C2", 0.5, 2),
-            ],
-        ),
-        row(
-            3,
-            &[
-                inline("A3", "y"),
-                inline("B3", "soon"),
-                styled("C3", "1e300", 2),
-            ],
-        ),
-    ]
-    .concat();
-    let book = write("unasked_columns.xlsx", &sheet);
-    let path = book.path();
+    let sheet = |day: String| {
+        [
+            row(
+                1,
+                &[
+                    inline("A1", "label"),
+                    inline("B1", "day"),
+                    inline("C1", "time"),
+                ],
+            ),
+            row(
+                2,
+                &[
+                    inline("A2", "x"),
+                    styled("B2", 44197, 1),
+                    styled("C2", 0.5, 2),
+                ],
+            ),
+            row(3, &[inline("A3", "y"), day, styled("C3", "1e300", 2)]),
+        ]
+        .concat()
+    };
+    let text_for_a_day = write("unasked_columns.xlsx", &sheet(inline("B3", "soon")));
+    let serial_out_of_range = write("unasked_serials.xlsx", &sheet(styled("B3", 44198, 1)));
     for select in ["count(*)", "label", "day", "*"] {
         assert_eq!(
             query_error(
                 &connection,
-                &format!("SELECT {select} FROM read_xlsx('{path}')")
+                &format!(
+                    "SELECT {select} FROM read_xlsx('{}')",
+                    text_for_a_day.path()
+                )
             ),
             "Invalid Input Error: read_xlsx: Failed to parse cell 'B3': Could not convert string 'soon' to DOUBLE",
             "{select}"
@@ -394,12 +666,26 @@ fn columns_a_query_does_not_ask_for_are_converted_too() {
         assert_eq!(
             query_error(
                 &connection,
-                &format!("SELECT {select} FROM read_xlsx('{path}', ignore_errors = true)")
+                &format!(
+                    "SELECT {select} FROM read_xlsx('{}')",
+                    serial_out_of_range.path()
+                )
             ),
-            "Conversion Error: Can't get TIME of infinite TIMESTAMP",
+            "Invalid Input Error: read_xlsx: Failed to parse cell 'C3': Could not convert the serial number 1e300 \
+             to TIME: the value is out of range",
             "{select}"
         );
     }
+    let path = text_for_a_day.path();
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "SELECT count(*), count(day), count(time) FROM read_xlsx('{path}', ignore_errors = true)"
+            )
+        ),
+        ["2|1|1"]
+    );
     assert_eq!(
         query(
             &connection,

@@ -1,7 +1,7 @@
 //! The scan of `read_xlsx`: batches, rows the sheet leaves out, ranges past the data, and scans that end early.
 
 use crate::support::{
-    Workbook, connect, inline, number, numbered_rows, query, query_error, row, shared,
+    Workbook, connect, inline, number, numbered_rows, query, query_error, row, shared, typed,
 };
 
 const HEADER: &str = r#"<row r="1"><c r="A1" t="inlineStr"><is><t>id</t></is></c><c r="B1" t="inlineStr"><is><t>label</t></is></c></row>"#;
@@ -410,6 +410,210 @@ fn shared_and_inline_strings_fill_text_columns() {
             "short|".to_owned(),
             "|NULL".to_owned()
         ]
+    );
+}
+
+#[test]
+fn wide_sheets_come_out_cell_for_cell() {
+    let connection = connect();
+    let (width, height) = (300, 400);
+    let name = |column: usize| crate::support::column_letters(column);
+    let header: Vec<String> = (0..width)
+        .map(|column| inline(&format!("{}1", name(column)), &format!("c{column}")))
+        .collect();
+    let rows: String = (0..height)
+        .map(|index| {
+            let number_of_row = index + 2;
+            let cells: Vec<String> = (0..width)
+                .filter(|column| index == 0 || (index + column) % 7 != 0)
+                .map(|column| {
+                    let reference = format!("{}{number_of_row}", name(column));
+                    match column % 10 {
+                        9 => inline(&reference, &format!("s{index}_{column}")),
+                        8 => shared(&reference, (index + column) % 3),
+                        _ => number(&reference, index * 1000 + column),
+                    }
+                })
+                .collect();
+            row(number_of_row as u32, &cells)
+        })
+        .collect();
+    let book = Workbook::new()
+        .sheet("S", &format!("{}{rows}", row(1, &header)))
+        .shared_strings(&["zero", "one", "two"])
+        .write("wide.xlsx");
+    let path = book.path();
+    for arguments in ["", ", all_varchar = true"] {
+        let source = format!(
+            "(SELECT row_number() OVER () - 1 AS i, * FROM read_xlsx('{path}'{arguments}))"
+        );
+        for column in [0, 8, 9, 299] {
+            let value = match column % 10 {
+                9 => format!("'s' || i || '_{column}'"),
+                8 => format!("['zero', 'one', 'two'][(i + {column}) % 3 + 1]"),
+                _ => format!("i * 1000 + {column}"),
+            };
+            let expected =
+                format!("CASE WHEN i = 0 OR (i + {column}) % 7 <> 0 THEN ({value})::VARCHAR END");
+            assert_eq!(
+                query(
+                    &connection,
+                    &format!(
+                        "SELECT count(*), count(c{column}), count(*) FILTER (TRY_CAST(c{column} AS BIGINT)::VARCHAR \
+                         IS DISTINCT FROM {expected} AND c{column}::VARCHAR IS DISTINCT FROM {expected}) FROM {source}"
+                    )
+                ),
+                [format!(
+                    "{height}|{}|0",
+                    1 + (1..height)
+                        .filter(|index| (index + column) % 7 != 0)
+                        .count()
+                )],
+                "column {column}{arguments}"
+            );
+        }
+    }
+    // Asked for one column, the others are still converted.
+    let sum: usize = (0..height)
+        .filter(|index| index % 7 != 0)
+        .map(|index| index * 1000)
+        .sum();
+    assert_eq!(
+        query(
+            &connection,
+            &format!("SELECT count(*), sum(c0)::BIGINT, max(c299) FROM read_xlsx('{path}')")
+        ),
+        [format!("{height}|{sum}|s99_299")]
+    );
+}
+
+#[test]
+fn a_shared_string_cell_without_an_index_is_null() {
+    let connection = connect();
+    let empty = |reference: &str| format!(r#"<c r="{reference}" t="s"/>"#);
+    let valueless = |reference: &str| format!(r#"<c r="{reference}" t="s"><v></v></c>"#);
+    let sheet = [
+        row(1, &[shared("A1", 0), shared("B1", 1)]),
+        row(2, &[shared("A2", 2), empty("B2")]),
+        row(3, &[valueless("A3"), shared("B3", 2)]),
+        row(4, &[empty("A4"), valueless("B4")]),
+        row(5, &[shared("A5", 2), shared("B5", 2)]),
+    ]
+    .concat();
+    let book = Workbook::new()
+        .sheet("S", &sheet)
+        .shared_strings(&["a", "b", "text"])
+        .write("shared_without_index.xlsx");
+    let path = book.path();
+    // A row of nothing but such cells is an empty row, which ends the scan.
+    assert_eq!(
+        query(&connection, &format!("FROM read_xlsx('{path}')")),
+        ["text|NULL", "NULL|text"]
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', stop_at_empty = false)")
+        ),
+        ["text|NULL", "NULL|text", "NULL|NULL", "text|text"]
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "SELECT count(*), count(a), count(b) FROM read_xlsx('{path}', range = 'A1:B5', all_varchar = true)"
+            )
+        ),
+        ["4|2|2"]
+    );
+}
+
+#[test]
+fn escapes_in_strings_are_resolved() {
+    let connection = connect();
+    let sheet = [
+        row(1, &[inline("A1", "kind"), inline("B1", "text")]),
+        row(2, &[inline("A2", "shared"), shared("B2", 0)]),
+        row(3, &[inline("A3", "shared"), shared("B3", 1)]),
+        row(4, &[inline("A4", "shared"), shared("B4", 2)]),
+        row(5, &[inline("A5", "inline"), inline("B5", "cr_x000D_lf_x000a_")]),
+        row(
+            6,
+            &[
+                inline("A6", "inline"),
+                r#"<c r="B6" t="inlineStr"><is><r><t>_x00</t></r><r><t>41_ _x0041_</t></r></is></c>"#
+                    .to_owned(),
+            ],
+        ),
+        row(
+            7,
+            &[inline("A7", "formula"), typed("B7", "str", "tab_x0009_bed")],
+        ),
+        row(
+            8,
+            &[inline("A8", "inline"), inline("B8", "_xD83D__xDE00_ _xD83D_ _x12G4_ _x0000_")],
+        ),
+        row(
+            9,
+            &[inline("A9", "error"), typed("B9", "e", "#N/A_x0041_")],
+        ),
+    ]
+    .concat();
+    let book = Workbook::new()
+        .sheet("S", &sheet)
+        .part(
+            "xl/sharedStrings.xml",
+            "<sst><si><t>line_x000A_break</t></si><si><t>under_x005F_score _x005F_x000D_</t></si>\
+             <si><r><t>rich_x0021_</t></r><r><t>_x0021_ _x00</t></r><r><t>21_</t></r></si></sst>",
+        )
+        .write("escapes.xlsx");
+    let shown = "replace(replace(replace(replace(text, chr(10), '<LF>'), chr(13), '<CR>'), chr(9), '<TAB>'), \
+                 chr(0), '<NUL>')";
+    for arguments in ["", ", all_varchar = true"] {
+        assert_eq!(
+            query(
+                &connection,
+                &format!(
+                    "SELECT kind, {shown} FROM read_xlsx('{}'{arguments})",
+                    book.path()
+                )
+            ),
+            [
+                "shared|line<LF>break",
+                "shared|under_score _x000D_",
+                "shared|rich!! _x0021_",
+                "inline|cr<CR>lf<LF>",
+                "inline|_x0041_ A",
+                "formula|tab<TAB>bed",
+                "inline|\u{1F600} _xD83D_ _x12G4_ <NUL>",
+                "error|#N/A_x0041_"
+            ],
+            "{arguments}"
+        );
+    }
+}
+
+#[test]
+fn escapes_in_numbers_are_not_resolved() {
+    let connection = connect();
+    let sheet = [
+        row(1, &[inline("A1", "n")]),
+        row(2, &[number("A2", 1)]),
+        row(3, &[number("A3", "_x0031_")]),
+    ]
+    .concat();
+    let book = write("escaped_number.xlsx", &sheet);
+    let path = book.path();
+    assert_eq!(
+        query_error(&connection, &format!("FROM read_xlsx('{path}')")),
+        "Invalid Input Error: read_xlsx: Failed to parse cell 'A3': Could not convert string '_x0031_' to DOUBLE"
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', all_varchar = true)")
+        ),
+        ["1", "_x0031_"]
     );
 }
 

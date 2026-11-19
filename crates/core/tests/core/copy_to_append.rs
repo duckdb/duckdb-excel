@@ -5,7 +5,8 @@ use std::{io::Write, path::Path};
 
 use crate::support::{
     CONTENT_TYPES, StoredEntry, TempDir, Workbook, archive_entries, connect, execute,
-    execute_error, fixture, inline, number, query, row, sheet_rows, try_query, workbook_part,
+    execute_error, inline, number, produced_fixtures, query, row, sheet_rows, styled, try_query,
+    utf16, workbook_part,
 };
 use duckdb_neo::{Result, connection::Connection};
 use excel_core::xlsx::{
@@ -133,21 +134,6 @@ fn assert_kept(before: &[StoredEntry], after: &[StoredEntry], changed: &[&str], 
             assert_well_formed(entry);
         }
     }
-}
-
-fn fixtures(directory: &Path, found: &mut Vec<String>) {
-    for entry in std::fs::read_dir(directory).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            fixtures(&path, found);
-        } else if path
-            .extension()
-            .is_some_and(|extension| extension == "xlsx")
-        {
-            found.push(path.to_str().unwrap().to_owned());
-        }
-    }
-    found.sort();
 }
 
 #[test]
@@ -420,8 +406,7 @@ fn a_failed_append_leaves_the_workbook_as_it_was() {
 fn workbooks_of_other_producers_keep_everything_else() {
     let connection = connect();
     let directory = TempDir::new("third_party");
-    let mut paths = Vec::new();
-    fixtures(Path::new(&fixture("")), &mut paths);
+    let paths = produced_fixtures();
     assert!(paths.len() >= 25, "{paths:?}");
     let mut without_styles = 0;
     for (index, fixture_path) in paths.iter().enumerate() {
@@ -704,6 +689,13 @@ fn workbooks_that_lack_what_a_new_sheet_needs() {
             "<Relationships><Relationship Id=\"rId1\"/></Relationships>",
             "Invalid Input Error: Invalid relationship entry in _rels/.rels",
         ),
+        // A new sheet writes its relationship id as `r:id`, so the sheets that are there must do so as well.
+        (
+            "xl/workbook.xml",
+            "<workbook xmlns:rel=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>\
+             <sheet name=\"Data\" sheetId=\"1\" rel:id=\"rId1\"/></sheets></workbook>",
+            "Invalid Input Error: Invalid sheet entry in workbook.xml",
+        ),
     ] {
         let directory = TempDir::new("append_broken");
         let path = directory.path("book.xlsx");
@@ -740,6 +732,134 @@ fn workbooks_that_lack_what_a_new_sheet_needs() {
             directory.file_names_after_failure(&["book.xlsx"]),
             ["book.xlsx"]
         );
+    }
+}
+
+#[test]
+fn a_sheet_added_to_a_workbook_that_counts_from_1904_counts_from_1904() {
+    let connection = connect();
+    let old_sheet = [
+        row(1, &[inline("A1", "d"), inline("B1", "ts")]),
+        row(2, &[styled("A2", 0, 1), styled("B2", 43538.5, 3)]),
+        row(3, &[styled("A3", 59, 1), styled("B3", -1.25, 3)]),
+    ]
+    .concat();
+    let old_rows = [
+        "1904-01-01|2023-03-15 12:00:00",
+        "1904-02-29|1903-12-30 18:00:00",
+    ];
+    let rows = "SELECT DATE '1899-12-20' + (i * 9)::INTEGER AS day, \
+                TIMESTAMP '1899-12-31 00:00:00.000001' + to_microseconds((i * 7654321987)::BIGINT) AS ts, \
+                TIME '00:00:00' + to_microseconds((i * 4321987)::BIGINT) AS tod, \
+                (TIMESTAMP '2024-03-15 12:34:56.789' + INTERVAL (i) DAY)::TIMESTAMP_MS AS ts_ms \
+                FROM range(400) t(i)";
+    let written = query(&connection, rows);
+    for (mode, sheet) in [("append", "New"), ("replace", "Other")] {
+        for temporary in ["", ", USE_TMP_FILE false"] {
+            let directory = TempDir::new("append_1904");
+            let path = directory.path("book.xlsx");
+            let book = Workbook::new()
+                .sheet("Old", &old_sheet)
+                .sheet("Other", &row(1, &[number("A1", 1)]))
+                .properties("date1904=\"true\"");
+            std::fs::write(&path, book.bytes()).unwrap();
+            assert_eq!(read_sheet(&connection, &path, "Old"), old_rows);
+
+            copy(
+                &connection,
+                rows,
+                &path,
+                &format!(", SHEET '{sheet}', MODE '{mode}', HEADER true{temporary}"),
+            );
+            assert_eq!(
+                read_sheet(&connection, &path, sheet),
+                written,
+                "{mode}{temporary}"
+            );
+            assert_eq!(read_sheet(&connection, &path, "Old"), old_rows);
+            // 1899-12-20 is 1,472 days before the day the workbook counts from.
+            let sheet_file = if mode == "append" {
+                "sheet3.xml"
+            } else {
+                "sheet2.xml"
+            };
+            let cells = sheet_rows(&path, sheet_file);
+            assert!(
+                cells.contains(r#"<row r="2"><c r="A2" s="5"><v>-1472.0</v></c>"#),
+                "{cells:.600}"
+            );
+        }
+    }
+
+    // A workbook that is made anew counts from 1900, whatever was there before.
+    let directory = TempDir::new("create_over_1904");
+    let path = directory.path("book.xlsx");
+    let book = Workbook::new()
+        .sheet("Old", &old_sheet)
+        .properties("date1904=\"1\"");
+    std::fs::write(&path, book.bytes()).unwrap();
+    copy(&connection, "SELECT DATE '2024-03-15' AS day", &path, "");
+    assert!(sheet_rows(&path, "sheet1.xml").contains("<v>45366.0</v>"));
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', header = false)")
+        ),
+        ["2024-03-15"]
+    );
+}
+
+#[test]
+fn parts_in_utf16_are_read_but_not_patched() {
+    let connection = connect();
+    let complete = || Workbook::new().sheet("Data", &row(1, &[number("A1", 1)]));
+    for (part, message) in [
+        (
+            "[Content_Types].xml",
+            "IO Error: Cannot patch [Content_Types].xml: missing </Types>",
+        ),
+        (
+            "xl/workbook.xml",
+            "IO Error: Cannot patch xl/workbook.xml: missing </sheets>",
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            "IO Error: Cannot patch xl/_rels/workbook.xml.rels: missing </Relationships>",
+        ),
+    ] {
+        let directory = TempDir::new("append_utf16");
+        let path = directory.path("book.xlsx");
+        let bytes = complete().bytes_with(|name, content| {
+            if name == part {
+                let text = std::str::from_utf8(content).expect("a part in UTF-8");
+                utf16(
+                    &text.replace("encoding=\"UTF-8\"", "encoding=\"UTF-16\""),
+                    false,
+                    true,
+                )
+            } else {
+                content.to_vec()
+            }
+        });
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            query(
+                &connection,
+                &format!("FROM read_xlsx('{path}', header = false)")
+            ),
+            ["1.0"],
+            "{part}"
+        );
+        assert_eq!(
+            copy_error(
+                &connection,
+                "SELECT 2 AS a",
+                &path,
+                ", SHEET 'New', MODE 'append'"
+            ),
+            message
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "{part}");
     }
 }
 
