@@ -1,5 +1,6 @@
 # name: test/sql/excel/xlsx/roundtrip_exact.test
-# description: What COPY ... TO writes, read_xlsx returns: every date, time and timestamp, and any text
+# description: What COPY ... TO writes, read_xlsx returns: every date, time and timestamp, the infinite ones too,
+#              and any text
 # group: [xlsx]
 
 require excel
@@ -66,6 +67,97 @@ query T
 SELECT tod FROM read_xlsx('__TEST_DIR__/exact_moments.xlsx') LIMIT 1;
 ----
 24:00:00
+
+# Infinite dates and timestamps of every kind, next to finite ones: they are written as text, which is read as the
+# infinite value in a column of dates
+statement ok
+CREATE TABLE ends AS SELECT * FROM (VALUES
+    (1, DATE '2024-03-15', TIMESTAMP '2024-03-15 12:34:56.789', TIMESTAMP_S '2024-03-15 12:34:56', TIMESTAMP_MS '2024-03-15 12:34:56.789',
+        TIMESTAMP_NS '2024-03-15 12:34:56.789123', TIMESTAMPTZ '2024-03-15 12:34:56.789+00'),
+    (2, 'infinity', 'infinity', 'infinity', 'infinity', 'infinity', 'infinity'),
+    (3, '-infinity', '-infinity', '-infinity', '-infinity', '-infinity', '-infinity'),
+    (4, NULL, NULL, NULL, NULL, NULL, NULL),
+    (5, '1999-12-31', '1999-12-31 23:59:59', '1999-12-31 23:59:59', '1999-12-31 23:59:59', '1999-12-31 23:59:59', '1999-12-31 23:59:59+00'))
+    t(n, d, ts, ts_s, ts_ms, ts_ns, ts_tz);
+
+statement ok
+COPY ends TO '__TEST_DIR__/exact_ends.xlsx' (FORMAT xlsx, HEADER true);
+
+query RTTTTTT
+SELECT * FROM read_xlsx('__TEST_DIR__/exact_ends.xlsx', stop_at_empty = false);
+----
+1.0	2024-03-15	2024-03-15 12:34:56.789	2024-03-15 12:34:56	2024-03-15 12:34:56.789	2024-03-15 12:34:56.789123	2024-03-15 12:34:56.789
+2.0	infinity	infinity	infinity	infinity	infinity	infinity
+3.0	-infinity	-infinity	-infinity	-infinity	-infinity	-infinity
+4.0	NULL	NULL	NULL	NULL	NULL	NULL
+5.0	1999-12-31	1999-12-31 23:59:59	1999-12-31 23:59:59	1999-12-31 23:59:59	1999-12-31 23:59:59	1999-12-31 23:59:59
+
+query TTTTTT
+SELECT typeof(d), typeof(ts), typeof(ts_s), typeof(ts_ms), typeof(ts_ns), typeof(ts_tz) FROM read_xlsx('__TEST_DIR__/exact_ends.xlsx') LIMIT 1;
+----
+DATE	TIMESTAMP	TIMESTAMP	TIMESTAMP	TIMESTAMP	TIMESTAMP
+
+query II
+SELECT count(*) FILTER (isinf(d) AND isinf(ts) AND isinf(ts_s) AND isinf(ts_ms) AND isinf(ts_ns) AND isinf(ts_tz)),
+       count(*) FILTER (d > DATE '9999-12-31' AND ts_tz > TIMESTAMP '9999-12-31 00:00:00')
+FROM read_xlsx('__TEST_DIR__/exact_ends.xlsx', stop_at_empty = false);
+----
+2	1
+
+# As text the cells are what was written
+query TT
+SELECT d, ts FROM read_xlsx('__TEST_DIR__/exact_ends.xlsx', all_varchar = true) LIMIT 3;
+----
+45366.0	45366.5242683912
+infinity	infinity
+-infinity	-infinity
+
+# COPY ... FROM reads them into DATE and TIMESTAMP columns
+statement ok
+CREATE TABLE ends_read (n INTEGER, d DATE, ts TIMESTAMP, ts_s TIMESTAMP, ts_ms TIMESTAMP, ts_ns TIMESTAMP, ts_tz TIMESTAMP);
+
+statement ok
+COPY ends_read FROM '__TEST_DIR__/exact_ends.xlsx' (FORMAT xlsx, stop_at_empty false);
+
+query ITTTTTT
+SELECT * FROM ends_read EXCEPT SELECT n, d, ts, ts_s::TIMESTAMP, ts_ms::TIMESTAMP, ts_ns::TIMESTAMP, ts_tz::TIMESTAMP FROM ends;
+----
+
+query II
+SELECT count(*), count(*) FILTER (isinf(d) AND isinf(ts_ns)) FROM ends_read;
+----
+5	2
+
+# A column whose first row of data is infinite gets its type from that text, as any column does
+statement ok
+COPY (SELECT d, ts FROM ends ORDER BY n = 2 DESC, n) TO '__TEST_DIR__/exact_ends_first.xlsx' (FORMAT xlsx, HEADER true);
+
+query TT
+SELECT * FROM read_xlsx('__TEST_DIR__/exact_ends_first.xlsx');
+----
+infinity	infinity
+45366.0	45366.5242683912
+-infinity	-infinity
+
+statement ok
+CREATE TABLE ends_first (d DATE, ts TIMESTAMP);
+
+statement error
+COPY ends_first FROM '__TEST_DIR__/exact_ends_first.xlsx' (FORMAT xlsx);
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'A3': invalid date field format: "45366.0", expected format is (YYYY-MM-DD)
+
+# Infinite FLOAT and DOUBLE values are numbers as before
+statement ok
+COPY (SELECT * FROM (VALUES (1.5::DOUBLE), ('inf'), ('-inf'), ('nan')) t(x)) TO '__TEST_DIR__/exact_floats.xlsx' (FORMAT xlsx);
+
+query R
+SELECT * FROM read_xlsx('__TEST_DIR__/exact_floats.xlsx', header = false);
+----
+1.5
+inf
+-inf
+nan
 
 # Text: every character below U+0100 but the carriage return, characters XML cannot hold, and text that looks like the
 # escapes those are written as

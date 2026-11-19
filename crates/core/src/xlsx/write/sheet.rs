@@ -43,7 +43,8 @@ pub enum CellKind {
     Text,
     /// `1` or `0`.
     Boolean,
-    /// Serial numbers shown as a date, a time of day, or a date and time with or without milliseconds.
+    /// Serial numbers shown as a date, a time of day, or a date and time with or without milliseconds. A date
+    /// or date and time whose serial number is `inf` or `-inf` is written as the text `infinity` or `-infinity`.
     Date,
     Time,
     Timestamp,
@@ -76,6 +77,15 @@ struct ColumnCells {
     reference_start: Vec<u8>,
     value_start: Vec<u8>,
     is_text: bool,
+    is_date: bool,
+}
+
+fn infinity_text(serial: &[u8]) -> Option<&'static [u8]> {
+    match serial {
+        b"inf" => Some(b"infinity"),
+        b"-inf" => Some(b"-infinity"),
+        _ => None,
+    }
 }
 
 /// Writes the rows of a sheet into `output`, which is the worksheet part.
@@ -119,6 +129,10 @@ impl<W: Write> SheetWriter<W> {
                     reference_start: format!("<c r=\"{name}").into_bytes(),
                     value_start: value_start.into_bytes(),
                     is_text: *kind == CellKind::Text,
+                    is_date: matches!(
+                        kind,
+                        CellKind::Date | CellKind::Timestamp | CellKind::TimestampSeconds
+                    ),
                 }
             })
             .collect();
@@ -150,6 +164,13 @@ impl<W: Write> SheetWriter<W> {
         if cells.is_text {
             self.buffer.extend_from_slice(TEXT_START);
             escape_text_into(value, &mut self.buffer);
+            self.buffer.extend_from_slice(TEXT_END);
+        } else if cells.is_date
+            && let Some(infinity) = infinity_text(value)
+        {
+            // No number stands for an infinite date, so it is written as the text DuckDB reads as one.
+            self.buffer.extend_from_slice(TEXT_START);
+            self.buffer.extend_from_slice(infinity);
             self.buffer.extend_from_slice(TEXT_END);
         } else {
             self.buffer.extend_from_slice(&cells.value_start);
@@ -278,6 +299,42 @@ mod tests {
                 r#"<c r="E1" s="3"><v>0.5</v></c>"#,
                 r#"<c r="F1" s="4"><v>45366.25</v></c>"#,
                 r#"<c r="G1" s="2"><v>45366.75</v></c></row>"#,
+            )
+        );
+    }
+
+    #[test]
+    fn infinite_dates_are_text_and_other_infinite_numbers_are_not() {
+        let mut sheet = sheet(&ALL_KINDS, 10);
+        for value in ["inf", "-inf"] {
+            sheet.begin_row();
+            for column in 0..ALL_KINDS.len() {
+                sheet.cell(column, value.as_bytes()).unwrap();
+            }
+            sheet.end_row().unwrap();
+        }
+        sheet.begin_row();
+        sheet.cell(3, b"infinity").unwrap();
+        sheet.cell(5, b"nan").unwrap();
+        sheet.end_row().unwrap();
+        assert_eq!(
+            rows_of(sheet),
+            concat!(
+                r#"<row r="1"><c r="A1"><v>inf</v></c>"#,
+                r#"<c r="B1" t="inlineStr"><is><t>inf</t></is></c>"#,
+                r#"<c r="C1" t="b" s="5"><v>inf</v></c>"#,
+                r#"<c r="D1" t="inlineStr"><is><t>infinity</t></is></c>"#,
+                r#"<c r="E1" s="3"><v>inf</v></c>"#,
+                r#"<c r="F1" t="inlineStr"><is><t>infinity</t></is></c>"#,
+                r#"<c r="G1" t="inlineStr"><is><t>infinity</t></is></c></row>"#,
+                r#"<row r="2"><c r="A2"><v>-inf</v></c>"#,
+                r#"<c r="B2" t="inlineStr"><is><t>-inf</t></is></c>"#,
+                r#"<c r="C2" t="b" s="5"><v>-inf</v></c>"#,
+                r#"<c r="D2" t="inlineStr"><is><t>-infinity</t></is></c>"#,
+                r#"<c r="E2" s="3"><v>-inf</v></c>"#,
+                r#"<c r="F2" t="inlineStr"><is><t>-infinity</t></is></c>"#,
+                r#"<c r="G2" t="inlineStr"><is><t>-infinity</t></is></c></row>"#,
+                r#"<row r="3"><c r="D3" s="1"><v>infinity</v></c><c r="F3" s="4"><v>nan</v></c></row>"#,
             )
         );
     }

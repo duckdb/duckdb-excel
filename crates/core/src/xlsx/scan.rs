@@ -135,14 +135,10 @@ impl ScanProgress {
 }
 
 /// A scan in progress: the open sheet and the rows read ahead.
-///
-/// A cell DuckDB cannot cast is reported with the message of the first cast that failed in the scan, which
-/// may have been the cast of another cell.
 #[derive(Debug)]
 pub struct SheetScan {
     rows: RowReader<Archive>,
     strings: StringTable,
-    cast_error: Option<String>,
 }
 
 impl SheetScan {
@@ -177,11 +173,7 @@ impl SheetScan {
             plan.fill_range,
             strings.len(),
         );
-        Ok(Some(SheetScan {
-            rows,
-            strings,
-            cast_error: None,
-        }))
+        Ok(Some(SheetScan { rows, strings }))
     }
 
     /// Writes the next rows of `scan` into `output`, as many as it holds; none when the sheet is exhausted.
@@ -204,7 +196,6 @@ impl SheetScan {
             plan,
             batch: scan.rows.batch(),
             strings: &scan.strings,
-            cast_error: &mut scan.cast_error,
         };
         emitter.emit(output)
     }
@@ -255,17 +246,17 @@ const MIN_BLOCK_ROWS: usize = 32;
 /// Turns a batch of rows into the vectors of an output chunk.
 ///
 /// A cell that does not convert becomes NULL when it is empty or errors are ignored, and fails the scan
-/// otherwise. Columns the output leaves out are converted all the same, so that their cells are checked.
+/// otherwise, with the reason that this cell does not convert. Columns the output leaves out are converted
+/// all the same, so that their cells are checked.
 struct Emitter<'a> {
     context: &'a Context,
     plan: &'a ScanPlan,
     batch: &'a RowBatch,
     strings: &'a StringTable,
-    cast_error: &'a mut Option<String>,
 }
 
 impl Emitter<'_> {
-    fn emit(mut self, mut output: DataChunkRef<'_>) -> Result<()> {
+    fn emit(self, mut output: DataChunkRef<'_>) -> Result<()> {
         let rows = self.batch.len();
         // A scan that is only asked for its row count gets a chunk with the first column alone.
         let present = output.col_count().min(self.plan.columns.len());
@@ -399,36 +390,58 @@ impl Emitter<'_> {
     }
 
     fn cast(
-        &mut self,
+        &self,
         text: &Vector<'_, String>,
         target: &mut impl CastTarget,
         index: usize,
         column: usize,
     ) -> Result<()> {
-        // SAFETY: a text vector is filled before its cast and not written again, and the target is only read
-        // once the cast is done.
-        let failure = unsafe { target.target(index)?.try_cast_rows(text, self.context)? };
+        let failure = self.try_cast(text, target.target(index)?)?;
         let Some(failure) = failure else {
             return Ok(());
         };
-        self.cast_error
-            .get_or_insert_with(|| raw_message(&failure).to_owned());
         if self.plan.ignore_errors {
             return Ok(());
         }
-        let message = self.cast_error.as_deref().unwrap_or_default();
-        let values = target.result(index)?.reader()?;
+        let values = target.result(index)?;
+        let is_null = values.reader()?;
         for row in 0..self.batch.len() {
             let text = match self.batch.cell(row, column) {
                 CellValue::Null => continue,
                 CellValue::Text(text) => text,
                 CellValue::Shared(index) => self.strings.get(index).unwrap_or_default(),
             };
-            if !text.is_empty() && values.is_null(row)? {
-                return Err(self.cell_error(row, column, message));
+            if !text.is_empty() && is_null.is_null(row)? {
+                // The failure of the batch may be that of another cell, so this one is cast on its own.
+                let own = self.cast_alone(text, values.logical_type())?;
+                let reason = own.as_ref().unwrap_or(&failure);
+                return Err(self.cell_error(row, column, raw_message(reason)));
             }
         }
         Ok(())
+    }
+
+    fn try_cast(
+        &self,
+        text: &Vector<'_, String>,
+        target: Vector<'_, Unknown>,
+    ) -> Result<Option<Error>> {
+        // SAFETY: a text vector is filled before its cast and not written again, and the target is only read
+        // once the cast is done.
+        unsafe { target.try_cast_rows(text, self.context) }
+    }
+
+    fn cast_alone(&self, text: &str, target_type: &LogicalType) -> Result<Option<Error>> {
+        let varchar = String::logical_type(self.context)?;
+        let mut source = DataChunk::create(self.context, [varchar], true)?;
+        let mut vector = source.get_vector_at_mut::<String>(0)?;
+        vector.set_size(1)?;
+        vector.writer()?.set_option(0, Some(text))?;
+        let mut target = DataChunk::create(self.context, [target_type.clone()], true)?;
+        self.try_cast(
+            source.get_vector_at::<String>(0)?,
+            target.get_vector_at_mut(0)?,
+        )
     }
 
     fn cell_error(&self, row: usize, column: usize, reason: impl fmt::Display) -> Error {

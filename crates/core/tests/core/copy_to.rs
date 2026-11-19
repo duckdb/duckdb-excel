@@ -695,6 +695,217 @@ fn a_carriage_return_comes_back_as_a_line_feed() {
     );
 }
 
+const INFINITE_ROWS: &str = "SELECT * FROM (VALUES
+    (1, DATE '2024-03-15', TIMESTAMP '2024-03-15 12:34:56.789', TIMESTAMP_S '2024-03-15 12:34:56',
+        TIMESTAMP_MS '2024-03-15 12:34:56.789', TIMESTAMP_NS '2024-03-15 12:34:56.789123', TIMESTAMPTZ '2024-03-15 12:34:56.789+00',
+        TIME '12:34:56'),
+    (2, 'infinity', 'infinity', 'infinity', 'infinity', 'infinity', 'infinity', '24:00:00'),
+    (3, '-infinity', '-infinity', '-infinity', '-infinity', '-infinity', '-infinity', '00:00:00'),
+    (4, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+    (5, '1999-12-31', '1999-12-31 23:59:59', '1999-12-31 23:59:59', '1999-12-31 23:59:59', '1999-12-31 23:59:59',
+        '1999-12-31 23:59:59+00', '23:59:59.999999'))
+    t(n, d, ts, ts_s, ts_ms, ts_ns, ts_tz, tod)";
+
+const INFINITE_ROWS_READ: [&str; 5] = [
+    "1|2024-03-15|2024-03-15 12:34:56.789|2024-03-15 12:34:56|2024-03-15 12:34:56.789|2024-03-15 12:34:56.789123|2024-03-15 12:34:56.789|12:34:56",
+    "2|infinity|infinity|infinity|infinity|infinity|infinity|24:00:00",
+    "3|-infinity|-infinity|-infinity|-infinity|-infinity|-infinity|00:00:00",
+    "4|NULL|NULL|NULL|NULL|NULL|NULL|NULL",
+    "5|1999-12-31|1999-12-31 23:59:59|1999-12-31 23:59:59|1999-12-31 23:59:59|1999-12-31 23:59:59|1999-12-31 23:59:59|23:59:59.999999",
+];
+
+#[test]
+fn infinite_dates_and_timestamps_come_back() {
+    let connection = connect();
+    let directory = TempDir::new("infinite");
+    let path = directory.path("out.xlsx");
+    copy(&connection, INFINITE_ROWS, &path, ", HEADER true");
+    // No number stands for them, so they are text that DuckDB reads as infinite.
+    let cells = sheet_rows(&path, "sheet1.xml");
+    let row_of = |number: u32, value: &str, time: &str| {
+        let texts: String = "BCDEFG"
+            .chars()
+            .map(|column| {
+                format!(r#"<c r="{column}{number}" t="inlineStr"><is><t>{value}</t></is></c>"#)
+            })
+            .collect();
+        format!(
+            r#"<row r="{number}"><c r="A{number}"><v>{}</v></c>{texts}<c r="H{number}" s="3"><v>{time}</v></c></row>"#,
+            number - 1
+        )
+    };
+    assert!(cells.contains(&row_of(3, "infinity", "1.0")), "{cells}");
+    assert!(cells.contains(&row_of(4, "-infinity", "0.0")), "{cells}");
+    assert!(cells.contains(
+        r#"<c r="B2" s="1"><v>45366.0</v></c><c r="C2" s="4"><v>45366.5242683912</v></c>"#
+    ));
+
+    let sql = format!("FROM read_xlsx('{path}', stop_at_empty = false)");
+    assert_eq!(
+        describe(&connection, &sql),
+        [
+            "n DOUBLE",
+            "d DATE",
+            "ts TIMESTAMP",
+            "ts_s TIMESTAMP",
+            "ts_ms TIMESTAMP",
+            "ts_ns TIMESTAMP",
+            "ts_tz TIMESTAMP",
+            "tod TIME"
+        ]
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("SELECT n::INTEGER, * EXCLUDE (n) {sql}")
+        ),
+        INFINITE_ROWS_READ
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "SELECT count(*) FILTER (isinf(d) AND isinf(ts) AND isinf(ts_s) AND isinf(ts_ms) AND isinf(ts_ns) \
+                 AND isinf(ts_tz)), count(*) FILTER (d = 'infinity'::DATE AND ts = 'infinity'::TIMESTAMP), \
+                 count(*) FILTER (d = '-infinity'::DATE AND ts_tz = '-infinity'::TIMESTAMP) {sql}"
+            )
+        ),
+        ["2|1|1"]
+    );
+
+    // A table with columns of the types takes them as well.
+    execute(
+        &connection,
+        "CREATE TABLE moments(n INTEGER, d DATE, ts TIMESTAMP, ts_s TIMESTAMP, ts_ms TIMESTAMP, ts_ns TIMESTAMP, \
+         ts_tz TIMESTAMP, tod TIME)",
+    );
+    execute(
+        &connection,
+        &format!("COPY moments FROM '{path}' (FORMAT xlsx, stop_at_empty false)"),
+    );
+    assert_eq!(query(&connection, "FROM moments"), INFINITE_ROWS_READ);
+
+    // As text the cells are what was written.
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "SELECT d, ts, ts_tz, tod FROM read_xlsx('{path}', all_varchar = true) LIMIT 3"
+            )
+        ),
+        [
+            "45366.0|45366.5242683912|45366.5242683912|0.5242592592592593",
+            "infinity|infinity|infinity|1.0",
+            "-infinity|-infinity|-infinity|0.0"
+        ]
+    );
+
+    // A sheet that is added to a workbook is written the same way.
+    copy(
+        &connection,
+        INFINITE_ROWS,
+        &path,
+        ", HEADER true, SHEET 'More', MODE 'append'",
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "SELECT n::INTEGER, * EXCLUDE (n) FROM read_xlsx('{path}', sheet = 'More', stop_at_empty = false)"
+            )
+        ),
+        INFINITE_ROWS_READ
+    );
+}
+
+#[test]
+fn a_column_that_starts_with_an_infinite_date_is_text() {
+    let connection = connect();
+    let directory = TempDir::new("infinite_first");
+    let path = directory.path("out.xlsx");
+    copy(
+        &connection,
+        "SELECT * FROM (VALUES (1, 'infinity'::DATE, 'infinity'::TIMESTAMP), (2, '2024-03-15', '2024-03-15 12:00:00'),
+                               (3, '-infinity', '-infinity')) t(n, d, ts)",
+        &path,
+        ", HEADER true",
+    );
+    // The first row of data gives a column its type, and here that is a row of text.
+    let sql = format!("FROM read_xlsx('{path}')");
+    assert_eq!(
+        describe(&connection, &sql),
+        ["n DOUBLE", "d VARCHAR", "ts VARCHAR"]
+    );
+    assert_eq!(
+        query(&connection, &sql),
+        [
+            "1.0|infinity|infinity",
+            "2.0|45366.0|45366.5",
+            "3.0|-infinity|-infinity"
+        ]
+    );
+    execute(
+        &connection,
+        "CREATE TABLE moments(n INTEGER, d DATE, ts TIMESTAMP)",
+    );
+    assert_eq!(
+        execute_error(
+            &connection,
+            &format!("COPY moments FROM '{path}' (FORMAT xlsx)")
+        ),
+        "Invalid Input Error: read_xlsx: Failed to parse cell 'B3': invalid date field format: \"45366.0\", \
+         expected format is (YYYY-MM-DD)"
+    );
+    // With a finite row first the same rows are read as dates.
+    copy(
+        &connection,
+        "SELECT * FROM (VALUES (2, DATE '2024-03-15', TIMESTAMP '2024-03-15 12:00:00'), (1, 'infinity', 'infinity'),
+                               (3, '-infinity', '-infinity')) t(n, d, ts)",
+        &path,
+        ", HEADER true",
+    );
+    execute(
+        &connection,
+        &format!("COPY moments FROM '{path}' (FORMAT xlsx)"),
+    );
+    assert_eq!(
+        query(&connection, "FROM moments ORDER BY n"),
+        [
+            "1|infinity|infinity",
+            "2|2024-03-15|2024-03-15 12:00:00",
+            "3|-infinity|-infinity"
+        ]
+    );
+}
+
+#[test]
+fn infinite_floating_point_numbers_are_still_numbers() {
+    let connection = connect();
+    let directory = TempDir::new("infinite_numbers");
+    let path = directory.path("out.xlsx");
+    copy(
+        &connection,
+        "SELECT * FROM (VALUES (1.5::DOUBLE, 2.5::FLOAT), ('inf', '-inf'), ('nan', 'inf')) t(a, b)",
+        &path,
+        "",
+    );
+    assert_eq!(
+        sheet_rows(&path, "sheet1.xml"),
+        concat!(
+            r#"<row r="1"><c r="A1"><v>1.5</v></c><c r="B1"><v>2.5</v></c></row>"#,
+            r#"<row r="2"><c r="A2"><v>inf</v></c><c r="B2"><v>-inf</v></c></row>"#,
+            r#"<row r="3"><c r="A3"><v>nan</v></c><c r="B3"><v>inf</v></c></row>"#
+        )
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', header = false)")
+        ),
+        ["1.5|2.5", "inf|-inf", "nan|inf"]
+    );
+}
+
 #[test]
 fn timestamps_with_a_time_zone_are_written_as_utc() {
     let connection = connect();

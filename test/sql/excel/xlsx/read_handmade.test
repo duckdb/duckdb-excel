@@ -1,7 +1,7 @@
 # name: test/sql/excel/xlsx/read_handmade.test
 # description: What read_xlsx and COPY ... FROM make of workbooks that other programs write differently than a
 #              spreadsheet does: styles without a number format, sheets without text, the 1904 date system, serial
-#              numbers at the edges, escaped characters, shared string cells without a string, relationship ids
+#              numbers at the edges, cells that do not convert, escaped characters, shared string cells without a string, relationship ids
 #              under another prefix, and parts in UTF-16 and ISO-8859-1. The workbooks are made by
 #              crates/core/tests/core/handmade.rs.
 # group: [xlsx]
@@ -102,7 +102,8 @@ CREATE TABLE unusable AS FROM read_xlsx('test/data/xlsx/handmade/serial_range.xl
 ----
 Failed to parse cell 'C3'
 
-# With ignore_errors such a cell is NULL; a billion days back is a day and a time of day but no TIMESTAMP
+# With ignore_errors such a cell is NULL; a billion days back is a day and a time of day but no TIMESTAMP, and an
+# infinite number is an infinite day and timestamp but no time of day
 query TTTR
 SELECT d::VARCHAR, t, ts, n FROM read_xlsx('test/data/xlsx/handmade/serial_range.xlsx', ignore_errors = true);
 ----
@@ -110,7 +111,7 @@ SELECT d::VARCHAR, t, ts, n FROM read_xlsx('test/data/xlsx/handmade/serial_range
 2736009-12-27 (BC)	00:00:00	NULL	-1000000000.0
 NULL	NULL	NULL	1e+300
 NULL	NULL	NULL	nan
-NULL	NULL	NULL	inf
+infinity	NULL	infinity	inf
 2021-01-02	06:00:00	2021-01-02 06:00:00	44198.25
 
 # COPY ... FROM reads serial numbers the same way
@@ -125,10 +126,10 @@ Invalid Input Error: read_xlsx: Failed to parse cell 'A4': Could not convert the
 statement ok
 COPY moments FROM 'test/data/xlsx/handmade/serial_range.xlsx' (FORMAT xlsx, ignore_errors);
 
-query IIIT
-SELECT count(*), count(d), count(ts), max(ts + INTERVAL 1 DAY) FROM moments;
+query IIITT
+SELECT count(*), count(d), count(ts), max(ts + INTERVAL 1 DAY) FILTER (isfinite(ts)), max(ts) FROM moments;
 ----
-6	3	2	2021-01-03 06:00:00
+6	4	3	2021-01-03 06:00:00	infinity
 
 statement ok
 DELETE FROM moments;
@@ -151,6 +152,38 @@ SELECT * FROM moments ORDER BY ts, n;
 1904-01-02	24:00:00	1904-01-02 00:00:00	1.0
 1904-04-10	06:00:00	1904-04-10 06:00:00	100.25
 2023-03-15	12:00:00	2023-03-15 12:00:00	43538.5
+
+# A cell that does not convert is reported with the reason it does not convert itself, whatever failed before it
+# without a word: here the empty strings in A3 and C3
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/cast_reasons.xlsx');
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'B4': Could not convert string 'maybe' to BOOL
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/handmade/cast_reasons.xlsx', range = 'C1:C2100');
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'C5': Could not convert string 'soon' to DOUBLE
+
+# ... also when that was thousands of rows earlier
+statement error
+SELECT count(*) FROM read_xlsx('test/data/xlsx/handmade/cast_reasons.xlsx', range = 'A1:A2101');
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'A2101': Could not convert string 'late' to DOUBLE
+
+statement ok
+CREATE TABLE numbers (n SMALLINT);
+
+statement error
+COPY numbers FROM 'test/data/xlsx/handmade/cast_reasons.xlsx' (FORMAT xlsx, range 'A1:A2101');
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'A2101': Could not convert string 'late' to INT16
+
+query IIII
+SELECT count(*), count(n), count(flag), count(day)
+FROM read_xlsx('test/data/xlsx/handmade/cast_reasons.xlsx', ignore_errors = true, stop_at_empty = false);
+----
+2100	2098	2098	2097
 
 # `_xHHHH_` stands for a character in shared strings, inline strings, the values of formulas and column names;
 # `_x005F_` is an underscore, two halves of a pair are one character, and what is no escape stays

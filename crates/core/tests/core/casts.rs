@@ -1,8 +1,8 @@
 //! How cell text becomes values of the column types, and what happens to cells that do not convert.
 
 use crate::support::{
-    Workbook, connect, inline, number, numbered_rows, query, query_error, row, shared, styled,
-    typed,
+    Workbook, connect, execute, execute_error, inline, number, numbered_rows, query, query_error,
+    row, shared, styled, typed,
 };
 
 fn write(name: &str, sheet_data: &str) -> crate::support::TempFile {
@@ -104,17 +104,147 @@ fn empty_strings_become_null() {
 }
 
 #[test]
-fn every_failure_is_reported_with_the_first_message_of_the_scan() {
+fn a_failure_is_reported_with_the_reason_of_its_cell() {
     let connection = connect();
+    // An empty string fails to convert without a word, before the cell that is reported.
     let sheet = headed(&[
         row(2, &[number("A2", 1), number("B2", 2)]),
         row(3, &[inline("A3", ""), number("B3", 3)]),
         row(4, &[inline("A4", "bad"), number("B4", 4)]),
+        row(5, &[inline("A5", "worse"), inline("B5", "also bad")]),
     ]);
-    let book = write("first_message.xlsx", &sheet);
+    let book = write("own_reason.xlsx", &sheet);
+    let path = book.path();
     assert_eq!(
-        query_error(&connection, &format!("FROM read_xlsx('{}')", book.path())),
-        "Invalid Input Error: read_xlsx: Failed to parse cell 'A4': Could not convert string '' to DOUBLE"
+        query_error(&connection, &format!("FROM read_xlsx('{path}')")),
+        "Invalid Input Error: read_xlsx: Failed to parse cell 'A4': Could not convert string 'bad' to DOUBLE"
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', range = 'A1:B3')")
+        ),
+        ["1.0|2.0", "NULL|3.0"]
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', ignore_errors = true)")
+        ),
+        ["1.0|2.0", "NULL|3.0", "NULL|4.0", "NULL|NULL"]
+    );
+}
+
+#[test]
+fn the_reason_is_not_that_of_a_cell_in_another_column() {
+    let connection = connect();
+    let sheet = [
+        row(
+            1,
+            &[inline("A1", "n"), inline("B1", "flag"), inline("C1", "day")],
+        ),
+        row(
+            2,
+            &[
+                number("A2", 1),
+                typed("B2", "b", "1"),
+                styled("C2", 44197, 1),
+            ],
+        ),
+        row(
+            3,
+            &[inline("A3", ""), typed("B3", "b", "0"), inline("C3", "")],
+        ),
+        row(
+            4,
+            &[
+                number("A4", 4),
+                inline("B4", "maybe"),
+                styled("C4", 44198, 1),
+            ],
+        ),
+        row(
+            5,
+            &[number("A5", 5), typed("B5", "b", "1"), inline("C5", "soon")],
+        ),
+    ]
+    .concat();
+    let book = write("reason_by_column.xlsx", &sheet);
+    let path = book.path();
+    assert_eq!(
+        query_error(&connection, &format!("FROM read_xlsx('{path}')")),
+        "Invalid Input Error: read_xlsx: Failed to parse cell 'B4': Could not convert string 'maybe' to BOOL"
+    );
+    // A day is a number first, so that is what its text fails to be.
+    assert_eq!(
+        query_error(
+            &connection,
+            &format!("FROM read_xlsx('{path}', range = 'C1:C5')")
+        ),
+        "Invalid Input Error: read_xlsx: Failed to parse cell 'C5': Could not convert string 'soon' to DOUBLE"
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', ignore_errors = true)")
+        ),
+        [
+            "1.0|true|2021-01-01",
+            "NULL|false|NULL",
+            "4.0|NULL|2021-01-02",
+            "5.0|true|NULL"
+        ]
+    );
+}
+
+#[test]
+fn the_reason_is_not_that_of_a_cell_in_an_earlier_batch() {
+    let connection = connect();
+    let sheet = [
+        row(1, &[inline("C1", "id"), inline("D1", "label")]),
+        row(2, &[number("C2", 2), inline("D2", "x")]),
+        row(3, &[inline("C3", ""), inline("D3", "x")]),
+        (4..=7000)
+            .map(|index| {
+                row(
+                    index,
+                    &[
+                        number(&format!("C{index}"), index),
+                        inline(&format!("D{index}"), "x"),
+                    ],
+                )
+            })
+            .collect(),
+        row(7001, &[inline("C7001", "late"), inline("D7001", "x")]),
+    ]
+    .concat();
+    let book = write("reason_by_batch.xlsx", &sheet);
+    let path = book.path();
+    for select in ["*", "count(*)", "label"] {
+        assert_eq!(
+            query_error(
+                &connection,
+                &format!("SELECT {select} FROM read_xlsx('{path}')")
+            ),
+            "Invalid Input Error: read_xlsx: Failed to parse cell 'C7001': Could not convert string 'late' to DOUBLE",
+            "{select}"
+        );
+    }
+    execute(&connection, "CREATE TABLE ids(id SMALLINT, label VARCHAR)");
+    assert_eq!(
+        execute_error(
+            &connection,
+            &format!("COPY ids FROM '{path}' (FORMAT xlsx)")
+        ),
+        "Invalid Input Error: read_xlsx: Failed to parse cell 'C7001': Could not convert string 'late' to INT16"
+    );
+    execute(
+        &connection,
+        &format!("COPY ids FROM '{path}' (FORMAT xlsx, ignore_errors)"),
+    );
+    assert_eq!(
+        query(&connection, "SELECT count(*), count(id), max(id) FROM ids"),
+        ["7000|6998|7000"]
     );
 }
 
@@ -249,8 +379,8 @@ fn serial_numbers_that_are_no_value_of_the_column_type_do_not_convert() {
             "'B6': Could not convert the serial number inf to TIME: the value is not a finite number",
         ),
         (
-            "C6:C6",
-            "'C6': Could not convert the serial number inf to TIMESTAMP: the value is not a finite number",
+            "C5:C5",
+            "'C5': Could not convert the serial number NaN to TIMESTAMP: the value is not a finite number",
         ),
         (
             "A7:A7",
@@ -272,7 +402,8 @@ fn serial_numbers_that_are_no_value_of_the_column_type_do_not_convert() {
             "{range}"
         );
     }
-    // A billion days back is a day and a time of day, but no TIMESTAMP.
+    // A billion days back is a day and a time of day, but no TIMESTAMP; an infinite number is an infinite
+    // day and timestamp, but no time of day.
     assert_eq!(
         query(
             &connection,
@@ -283,7 +414,7 @@ fn serial_numbers_that_are_no_value_of_the_column_type_do_not_convert() {
             "2736009-12-27 (BC)|00:00:00|NULL",
             "NULL|NULL|NULL",
             "NULL|NULL|NULL",
-            "NULL|NULL|NULL",
+            "infinity|NULL|infinity",
             "NULL|00:00:00|NULL",
             "2021-01-02|06:00:00|2021-01-02 06:00:00"
         ]
@@ -295,7 +426,7 @@ fn serial_numbers_that_are_no_value_of_the_column_type_do_not_convert() {
                 "SELECT count(*), count(d), count(t), count(ts) FROM read_xlsx('{path}', ignore_errors = true)"
             )
         ),
-        ["7|3|4|2"]
+        ["7|4|4|3"]
     );
 }
 
@@ -505,6 +636,124 @@ fn times_of_day_are_rounded_to_the_microsecond() {
             "1900-02-28 23:59:59.999|23:59:59.999",
             "1899-12-30 12:34:56.789|12:34:56.789"
         ]
+    );
+}
+
+#[test]
+fn infinite_numbers_in_date_columns_are_infinite_dates() {
+    let connection = connect();
+    let header = row(
+        1,
+        &[inline("A1", "d"), inline("B1", "ts"), inline("C1", "t")],
+    );
+    let first = row(
+        2,
+        &[
+            styled("A2", 44197, 1),
+            styled("B2", 44197.5, 3),
+            styled("C2", 0.5, 2),
+        ],
+    );
+    // As a number cell, a text cell or a formula has it, in the spellings DuckDB reads as infinite.
+    let spellings = [
+        "infinity",
+        "-infinity",
+        "inf",
+        "-inf",
+        "Infinity",
+        "-INF",
+        " inf ",
+    ];
+    let rows: String = (3..)
+        .zip(spellings)
+        .map(|(number, spelling)| {
+            row(
+                number,
+                &[
+                    inline(&format!("A{number}"), spelling),
+                    typed(&format!("B{number}"), "str", spelling),
+                    styled(&format!("C{number}"), 0.25, 2),
+                ],
+            )
+        })
+        .collect();
+    let last = row(
+        10,
+        &[
+            styled("A10", "inf", 1),
+            styled("B10", "-inf", 3),
+            styled("C10", 0.75, 2),
+        ],
+    );
+    let book = write(
+        "infinite_dates.xlsx",
+        &format!("{header}{first}{rows}{last}"),
+    );
+    let path = book.path();
+    let sql = format!("FROM read_xlsx('{path}')");
+    assert_eq!(
+        crate::support::describe(&connection, &sql),
+        ["d DATE", "ts TIMESTAMP", "t TIME"]
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!(
+                "SELECT d, ts, isinf(d), isinf(ts), d > DATE '9999-12-31', ts < TIMESTAMP '0001-01-01' {sql}"
+            )
+        ),
+        [
+            "2021-01-01|2021-01-01 12:00:00|false|false|false|false",
+            "infinity|infinity|true|true|true|false",
+            "-infinity|-infinity|true|true|false|true",
+            "infinity|infinity|true|true|true|false",
+            "-infinity|-infinity|true|true|false|true",
+            "infinity|infinity|true|true|true|false",
+            "-infinity|-infinity|true|true|false|true",
+            "infinity|infinity|true|true|true|false",
+            "infinity|-infinity|true|true|true|true"
+        ]
+    );
+
+    // A time of day is never infinite, and what is not a number is no date.
+    let sheet = [
+        row(1, &[inline("A1", "d"), inline("B1", "t")]),
+        row(2, &[styled("A2", 44197, 1), styled("B2", 0.5, 2)]),
+        row(3, &[inline("A3", "nan"), inline("B3", "infinity")]),
+        row(4, &[inline("A4", "infinite"), inline("B4", "-inf")]),
+    ]
+    .concat();
+    let book = write("not_infinite.xlsx", &sheet);
+    let path = book.path();
+    let failure = |range: &str| {
+        query_error(
+            &connection,
+            &format!("FROM read_xlsx('{path}', range = '{range}', header = false)"),
+        )
+    };
+    let reason = "Invalid Input Error: read_xlsx: Failed to parse cell";
+    assert_eq!(
+        failure("A2:A3"),
+        format!(
+            "{reason} 'A3': Could not convert the serial number NaN to DATE: the value is not a finite number"
+        )
+    );
+    assert_eq!(
+        failure("B2:B3"),
+        format!(
+            "{reason} 'B3': Could not convert the serial number inf to TIME: the value is not a finite number"
+        )
+    );
+    assert_eq!(
+        failure("A2:A4"),
+        format!("{reason} 'A4': Could not convert string 'infinite' to DOUBLE")
+    );
+    assert_eq!(
+        query(
+            &connection,
+            &format!("FROM read_xlsx('{path}', ignore_errors = true)")
+        ),
+        ["2021-01-01|12:00:00", "NULL|NULL", "NULL|NULL"]
     );
 }
 

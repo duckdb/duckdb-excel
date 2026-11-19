@@ -132,6 +132,46 @@ fn serial_range() -> Vec<u8> {
         .bytes()
 }
 
+fn cast_reasons() -> Vec<u8> {
+    let boolean = |reference: &str, value: &str| typed(reference, "b", value);
+    let mut rows = vec![
+        row(
+            1,
+            &[inline("A1", "n"), inline("B1", "flag"), inline("C1", "day")],
+        ),
+        row(
+            2,
+            &[number("A2", 1), boolean("B2", "1"), styled("C2", 44197, 1)],
+        ),
+        // Empty strings do not convert either, without a word.
+        row(3, &[inline("A3", ""), boolean("B3", "0"), inline("C3", "")]),
+        row(
+            4,
+            &[
+                number("A4", 4),
+                inline("B4", "maybe"),
+                styled("C4", 44198, 1),
+            ],
+        ),
+        row(
+            5,
+            &[number("A5", 5), boolean("B5", "1"), inline("C5", "soon")],
+        ),
+    ];
+    rows.extend((6..=2100).map(|index| {
+        row(
+            index,
+            &[
+                number(&format!("A{index}"), index),
+                boolean(&format!("B{index}"), "1"),
+                styled(&format!("C{index}"), 44197 + index, 1),
+            ],
+        )
+    }));
+    rows.push(row(2101, &[inline("A2101", "late")]));
+    Workbook::new().sheet("Sheet1", &rows.concat()).bytes()
+}
+
 fn escapes() -> Vec<u8> {
     let sheet = [
         row(1, &[shared("A1", 0), inline("B1", "ki_x006E_d")]),
@@ -246,7 +286,8 @@ fn iso_8859_1() -> Vec<u8> {
 /// The file name of a fixture and what makes its bytes.
 type Fixture = (&'static str, fn() -> Vec<u8>);
 
-const WORKBOOKS: [Fixture; 11] = [
+const WORKBOOKS: [Fixture; 12] = [
+    ("cast_reasons.xlsx", cast_reasons),
     ("xf_without_numfmtid.xlsx", xf_without_numfmtid),
     ("no_text.xlsx", no_text),
     ("date1904.xlsx", date1904),

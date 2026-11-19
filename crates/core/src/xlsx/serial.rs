@@ -29,6 +29,10 @@ const TIMESTAMP_RANGE: std::ops::RangeInclusive<i128> =
 /// The first DATE DuckDB has, 5877642-06-25 (BC), and the last, 5881580-07-10.
 const DATE_RANGE: std::ops::RangeInclusive<i128> = -(i32::MAX as i128 - 1)..=(i32::MAX as i128 - 1);
 
+/// What DuckDB stores for the DATE and the TIMESTAMP `infinity`; `-infinity` is the negative of it.
+const INFINITE_DATE: i32 = i32::MAX;
+const INFINITE_TIMESTAMP: i64 = i64::MAX;
+
 /// The day a workbook counts its serial numbers from.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DateSystem {
@@ -91,8 +95,16 @@ fn serial_to_micros(serial: f64, system: DateSystem) -> Result<i128, SerialError
 }
 
 /// The TIMESTAMP, in microseconds since 1970-01-01, of a serial number: its day and its time of day rounded
-/// to the microsecond, where a whole second or millisecond within the noise of a DOUBLE is that one.
+/// to the microsecond, where a whole second or millisecond within the noise of a DOUBLE is that one. An
+/// infinite number is the infinite TIMESTAMP of its sign.
 pub fn serial_to_timestamp(serial: f64, system: DateSystem) -> Result<i64, SerialError> {
+    if serial.is_infinite() {
+        return Ok(if serial > 0.0 {
+            INFINITE_TIMESTAMP
+        } else {
+            -INFINITE_TIMESTAMP
+        });
+    }
     let micros = serial_to_micros(serial, system)?;
     if !TIMESTAMP_RANGE.contains(&micros) {
         return Err(SerialError::OutOfRange);
@@ -103,6 +115,13 @@ pub fn serial_to_timestamp(serial: f64, system: DateSystem) -> Result<i64, Seria
 /// The DATE, in days since 1970-01-01, of a serial number: the day of its [`serial_to_timestamp`]. Serial
 /// numbers 59 and 60 of the 1900 system are both 1900-02-28.
 pub fn serial_to_date(serial: f64, system: DateSystem) -> Result<i32, SerialError> {
+    if serial.is_infinite() {
+        return Ok(if serial > 0.0 {
+            INFINITE_DATE
+        } else {
+            -INFINITE_DATE
+        });
+    }
     let days = serial_to_micros(serial, system)?.div_euclid(i128::from(MICROS_PER_DAY));
     if !DATE_RANGE.contains(&days) {
         return Err(SerialError::OutOfRange);
@@ -131,18 +150,24 @@ fn days_from_serial_zero_to_1970(epoch_day: i64, system: DateSystem) -> i64 {
     }
 }
 
-/// The serial number of a TIMESTAMP in microseconds since 1970-01-01. In the 1900 system 1899-12-31 has none
-/// and shares those of 1900-01-01.
+/// The serial number of a TIMESTAMP in microseconds since 1970-01-01, infinite for an infinite TIMESTAMP.
+/// In the 1900 system 1899-12-31 has none and shares those of 1900-01-01.
 pub fn epoch_micros_to_serial(micros: i64, system: DateSystem) -> f64 {
+    if micros.unsigned_abs() == INFINITE_TIMESTAMP.unsigned_abs() {
+        return f64::INFINITY.copysign(micros as f64);
+    }
     let epoch_day = micros.div_euclid(MICROS_PER_DAY);
     let day = epoch_day + days_from_serial_zero_to_1970(epoch_day, system);
     // The whole day is added last, which leaves a single rounding that reading the number back undoes.
     day as f64 + micros.rem_euclid(MICROS_PER_DAY) as f64 / MICROS_PER_DAY as f64
 }
 
-/// The serial number of a DATE in days since 1970-01-01. In the 1900 system 1899-12-31 has none and shares
-/// that of 1900-01-01.
+/// The serial number of a DATE in days since 1970-01-01, infinite for an infinite DATE. In the 1900 system
+/// 1899-12-31 has none and shares that of 1900-01-01.
 pub fn epoch_days_to_serial(days: i32, system: DateSystem) -> f64 {
+    if days.unsigned_abs() == INFINITE_DATE.unsigned_abs() {
+        return f64::INFINITY.copysign(f64::from(days));
+    }
     let epoch_day = i64::from(days);
     (epoch_day + days_from_serial_zero_to_1970(epoch_day, system)) as f64
 }
@@ -187,18 +212,13 @@ mod tests {
         );
         assert_eq!(epoch_micros_to_serial(-DAY / 2, Since1900), 25568.5);
         assert_eq!(
-            epoch_micros_to_serial(i64::MAX, Since1900),
+            epoch_micros_to_serial(i64::MAX - 1, Since1900),
             106777560.16730064
-        );
-        assert_eq!(
-            epoch_micros_to_serial(-i64::MAX, Since1900),
-            -106726422.16730064
         );
         assert_eq!(epoch_days_to_serial(0, Since1900), 25569.0);
         assert_eq!(epoch_days_to_serial(19797, Since1900), 45366.0);
         assert_eq!(epoch_days_to_serial(-25569, Since1900), 0.0);
-        assert_eq!(epoch_days_to_serial(i32::MAX, Since1900), 2147509216.0);
-        assert_eq!(epoch_days_to_serial(-i32::MAX, Since1900), -2147458078.0);
+        assert_eq!(epoch_days_to_serial(i32::MAX - 1, Since1900), 2147509215.0);
         assert_eq!(time_micros_to_serial(0), 0.0);
         assert_eq!(time_micros_to_serial(29_700_000_000), 0.34375);
         assert_eq!(time_micros_to_serial(DAY), 1.0);
@@ -321,15 +341,41 @@ mod tests {
     }
 
     #[test]
+    fn infinite_dates_and_timestamps_are_infinite_serial_numbers() {
+        for system in [Since1900, Since1904] {
+            assert_eq!(epoch_days_to_serial(i32::MAX, system), f64::INFINITY);
+            assert_eq!(epoch_days_to_serial(-i32::MAX, system), f64::NEG_INFINITY);
+            assert_eq!(epoch_micros_to_serial(i64::MAX, system), f64::INFINITY);
+            assert_eq!(epoch_micros_to_serial(-i64::MAX, system), f64::NEG_INFINITY);
+            assert_eq!(serial_to_date(f64::INFINITY, system), Ok(i32::MAX));
+            assert_eq!(serial_to_date(f64::NEG_INFINITY, system), Ok(-i32::MAX));
+            assert_eq!(serial_to_timestamp(f64::INFINITY, system), Ok(i64::MAX));
+            assert_eq!(
+                serial_to_timestamp(f64::NEG_INFINITY, system),
+                Ok(-i64::MAX)
+            );
+        }
+        // The values next to the infinite ones are the ends of the types.
+        assert!(epoch_days_to_serial(-i32::MAX + 1, Since1900).is_finite());
+        assert!(epoch_micros_to_serial(i64::MAX - 1, Since1900).is_finite());
+        assert!(epoch_micros_to_serial(i64::MIN, Since1900).is_finite());
+        assert!(epoch_days_to_serial(i32::MIN, Since1900).is_finite());
+    }
+
+    #[test]
     fn serial_numbers_that_are_no_numbers_are_errors() {
+        for system in [Since1900, Since1904] {
+            assert_eq!(
+                serial_to_timestamp(f64::NAN, system),
+                Err(SerialError::NotFinite)
+            );
+            assert_eq!(
+                serial_to_date(f64::NAN, system),
+                Err(SerialError::NotFinite)
+            );
+        }
+        // A time of day is never infinite.
         for serial in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            for system in [Since1900, Since1904] {
-                assert_eq!(
-                    serial_to_timestamp(serial, system),
-                    Err(SerialError::NotFinite)
-                );
-                assert_eq!(serial_to_date(serial, system), Err(SerialError::NotFinite));
-            }
             assert_eq!(serial_to_time(serial), Err(SerialError::NotFinite));
         }
         assert_eq!(

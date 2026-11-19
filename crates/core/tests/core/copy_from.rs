@@ -205,7 +205,7 @@ fn serial_numbers_are_read_as_read_xlsx_reads_them() {
             "2021-01-01|12:00:00|2021-01-01 12:00:00|2021-01-02 12:00:00",
             "2736009-12-27 (BC)|00:00:00|NULL|NULL",
             "NULL|NULL|NULL|NULL",
-            "NULL|NULL|NULL|NULL",
+            "infinity|NULL|infinity|infinity",
             "2021-01-02|00:00:00|2021-01-02 00:00:00|2021-01-03 00:00:00"
         ]
     );
