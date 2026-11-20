@@ -130,3 +130,36 @@ the types of the resulting columns are inferred based on the first "data" row in
 
 This can sometimes lead to issues if the first "data row" is not representative of the rest of the sheet (e.g. it contains empty cells) in which case the `ignore_errors` or `empty_as_varchar` options can be used to work around this. 
 Alternatively, when the `COPY TO ... FROM '<file>.xlsx'` syntax is used, no type inference is done and the types of the resulting columns are determined by the types of the columns in the table being copied to. All cells will simply be converted by casting from `DOUBLE` or `VARCHAR` to the target column type.
+
+# Building
+
+The extension is written in Rust on [duckdb-neo](https://crates.io/crates/duckdb-neo), a wrapper for DuckDB's v2 C API, and follows the [Rust extension template](https://github.com/duckdb/extension-template-rs). Building it needs the Rust toolchain, Python 3 with `venv`, Make and Git; DuckDB itself is not built.
+
+```shell
+git clone --recurse-submodules <repo>
+make configure   # Python venv with DuckDB and its test runner
+make debug       # build/debug/excel.duckdb_extension
+make test_debug  # SQL tests in test/sql
+```
+
+`make release` and `make test_release` do the same for an optimized build. The extension uses the unstable C API, so a binary only loads into the exact DuckDB version it was built for (`TARGET_DUCKDB_VERSION` in the `Makefile`):
+
+```shell
+duckdb -unsigned -cmd "LOAD '$PWD/build/debug/excel.duckdb_extension';"
+```
+
+The Cargo workspace has five crates:
+
+| Crate | Content |
+| --- | --- |
+| `crates/numformat` (`excel_numformat`) | Excel number formats, behind `text` and `excel_text`. A derivative of Apache OpenOffice's number formatter, licensed under Apache-2.0. |
+| `crates/zip` (`excel_zip`) | ZIP archive reader and writer. |
+| `crates/core` (`excel_core`) | The functions the extension registers: `text`, `excel_text`, `read_xlsx` and the `xlsx` copy format. |
+| `crates/native` (`excel`) | The loadable extension. |
+| `crates/wasm` (`excel_wasm`) | The extension for DuckDB-Wasm (`make wasm_eh`). |
+
+The first three have Rust tests; those of `excel_core` run against an in-process DuckDB:
+
+```shell
+cargo test -p excel_numformat -p excel_zip -p excel_core
+```

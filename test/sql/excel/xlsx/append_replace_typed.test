@@ -1,0 +1,90 @@
+# name: test/sql/excel/xlsx/append_replace_typed.test
+# description: MODE 'append' and MODE 'replace' with every kind of cell, with and without DuckDB's temporary file
+# group: [xlsx]
+
+require excel
+
+foreach temporary true false
+
+statement ok
+COPY (SELECT 1 AS x, 'kept' AS y) TO '__TEST_DIR__/append_typed_${temporary}.xlsx' (FORMAT xlsx, HEADER true, SHEET 'First');
+
+statement ok
+COPY (
+    SELECT i AS n, 'text ' || i AS s, i % 2 = 0 AS flag, DATE '2024-03-15' + i::INTEGER AS day,
+           TIME '08:15:00' + INTERVAL (i) MINUTE AS tod, TIMESTAMP '2024-03-15 12:30:45' + INTERVAL (i) HOUR AS ts,
+           TIMESTAMP_S '2024-03-15 12:30:45' AS ts_s
+    FROM range(3) t(i)
+) TO '__TEST_DIR__/append_typed_${temporary}.xlsx' (FORMAT xlsx, HEADER true, SHEET 'Typed & <more>', MODE 'append', USE_TMP_FILE ${temporary});
+
+query RTTTTTT
+SELECT * FROM read_xlsx('__TEST_DIR__/append_typed_${temporary}.xlsx', sheet = 'Typed & <more>');
+----
+0.0	text 0	true	2024-03-15	08:15:00	2024-03-15 12:30:45	2024-03-15 12:30:45
+1.0	text 1	false	2024-03-16	08:16:00	2024-03-15 13:30:45	2024-03-15 12:30:45
+2.0	text 2	true	2024-03-17	08:17:00	2024-03-15 14:30:45	2024-03-15 12:30:45
+
+query RT
+SELECT * FROM read_xlsx('__TEST_DIR__/append_typed_${temporary}.xlsx', sheet = 'First');
+----
+1.0	kept
+
+# The names of sheets are compared without regard to case
+statement error
+COPY (SELECT 2) TO '__TEST_DIR__/append_typed_${temporary}.xlsx' (FORMAT xlsx, SHEET 'FIRST', MODE 'append', USE_TMP_FILE ${temporary});
+----
+Invalid Input Error: Sheet 'FIRST' already exists in
+
+statement error
+COPY (SELECT 2) TO '__TEST_DIR__/append_typed_${temporary}.xlsx' (FORMAT xlsx, SHEET 'Third', MODE 'replace', USE_TMP_FILE ${temporary});
+----
+Invalid Input Error: Sheet 'Third' not found in
+
+# A sheet that takes too many rows is not added
+statement error
+COPY (SELECT * FROM range(5000)) TO '__TEST_DIR__/append_typed_${temporary}.xlsx' (FORMAT xlsx, SHEET 'Third', MODE 'append', SHEET_ROW_LIMIT 3000, USE_TMP_FILE ${temporary});
+----
+Invalid Input Error: XLSX: Sheet row limit of '3000' rows exceeded!
+
+statement error
+SELECT * FROM read_xlsx('__TEST_DIR__/append_typed_${temporary}.xlsx', sheet = 'Third');
+----
+Binder Error: Sheet "Third" not found in xlsx file
+
+# A sheet is replaced in its place; the other sheets stay
+statement ok
+COPY (SELECT DATE '2000-01-01' AS d, false AS b) TO '__TEST_DIR__/append_typed_${temporary}.xlsx' (FORMAT xlsx, HEADER true, SHEET 'first', MODE 'replace', USE_TMP_FILE ${temporary});
+
+query TT
+SELECT * FROM read_xlsx('__TEST_DIR__/append_typed_${temporary}.xlsx');
+----
+2000-01-01	false
+
+query I
+SELECT count(*) FROM read_xlsx('__TEST_DIR__/append_typed_${temporary}.xlsx', sheet = 'Typed & <more>');
+----
+3
+
+statement ok
+COPY (SELECT 'last' AS word) TO '__TEST_DIR__/append_typed_${temporary}.xlsx' (FORMAT xlsx, SHEET 'Third', MODE 'append', USE_TMP_FILE ${temporary});
+
+query T
+SELECT * FROM read_xlsx('__TEST_DIR__/append_typed_${temporary}.xlsx', sheet = 'Third', header = false);
+----
+last
+
+endloop
+
+# A file that is not a workbook cannot be added to, and stays as it is
+statement ok
+COPY (SELECT 'not a workbook' AS line) TO '__TEST_DIR__/append_not_a_workbook.xlsx' (FORMAT csv, HEADER false);
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/append_not_a_workbook.xlsx' (FORMAT xlsx, MODE 'append');
+----
+IO Error
+
+query T
+SELECT * FROM read_csv('__TEST_DIR__/append_not_a_workbook.xlsx', header = false, columns = {'line': 'VARCHAR'});
+----
+not a workbook

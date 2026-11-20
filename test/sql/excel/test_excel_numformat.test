@@ -2,18 +2,10 @@
 # description: Test number format
 # group: [excel]
 
-mode skip
-
 require excel
 
 statement ok
 PRAGMA enable_verification
-
-statement ok
-SET autoinstall_known_extensions=1;
-
-statement ok
-SET autoload_known_extensions=1;
 
 # Hours, minutes, seconds
 query T

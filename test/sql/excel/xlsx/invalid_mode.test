@@ -3,13 +3,6 @@
 
 require excel
 
-require httpfs
-
-statement ok
-LOAD httpfs;
-
-require no_extension_autoloading "FIXME: make copy to functions autoloadable"
-
 # Invalid MODE value must error at bind time
 statement error
 COPY (SELECT 1) TO '__TEST_DIR__/invalid_mode.xlsx' (FORMAT 'XLSX', SHEET 'X', MODE 'bogus');

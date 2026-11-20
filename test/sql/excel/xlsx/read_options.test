@@ -1,0 +1,152 @@
+# name: test/sql/excel/xlsx/read_options.test
+# description: how the options of read_xlsx are passed, cast and checked
+# group: [xlsx]
+
+require excel
+
+# Options are passed by name, in any order and letter case
+query RT
+SELECT ABC, WORLD FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', HEADER := true, sheet = 'Sheet1', all_varchar = false);
+----
+123.0	ABC
+456.0	some text
+
+query RTT
+SELECT * FROM read_xlsx(file_path = 'test/data/xlsx/google_sheets.xlsx');
+----
+123.0	500,60	ABC
+456.0	300,40	some text
+
+# Options are cast to their type
+query TTT
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', header = 0);
+----
+ABC	HELLO	WORLD
+123.0	500,60	ABC
+456.0	300,40	some text
+
+query TTT
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', header = 'false', all_varchar = 1);
+----
+ABC	HELLO	WORLD
+123.0	500,60	ABC
+456.0	300,40	some text
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', header = 'abc');
+----
+Invalid Input Error: Could not cast value 'abc' to named parameter "header" of type BOOLEAN: Could not convert string 'abc' to BOOL
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', all_varchar = DATE '2020-01-01');
+----
+Invalid Input Error: Could not cast value '2020-01-01'::DATE to named parameter "all_varchar" of type BOOLEAN
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', sheet = 42);
+----
+Binder Error: Sheet "42" not found in xlsx file "test/data/xlsx/google_sheets.xlsx"
+
+# Unknown and misplaced arguments
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', hader = true);
+----
+Binder Error: Invalid named parameter "hader" for function read_xlsx
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', header = true, header = false);
+----
+Binder Error: Duplicate named argument "header" for function read_xlsx
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', true);
+----
+Binder Error: No function matches the given name and argument types
+
+statement error
+SELECT * FROM read_xlsx(42);
+----
+Binder Error: No function matches the given name and argument types
+
+# The file is found by glob
+query RTT
+SELECT * FROM read_xlsx('test/data/xlsx/google_*.xlsx');
+----
+123.0	500,60	ABC
+456.0	300,40	some text
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/does_not_exist*.xlsx');
+----
+IO Error: Cannot open file "test/data/xlsx/does_not_exist*.xlsx": No such file or directory
+
+# A missing file is reported before a bad range, a bad option type before both
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/does_not_exist.xlsx', range = 'bad');
+----
+IO Error: Cannot open file
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/does_not_exist.xlsx', header = 'bad');
+----
+Invalid Input Error: Could not cast value 'bad' to named parameter "header"
+
+# Ranges may leave out rows or columns, and what follows a range is ignored
+query RT
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = 'A1:B2 and more');
+----
+123.0	500,60
+
+query II
+SELECT count(*), count(A) FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = 'A2:A');
+----
+1048575	2
+
+query I
+SELECT count(*) FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = 'A2:A', stop_at_empty = true);
+----
+2
+
+query I
+SELECT count(*) FROM (DESCRIBE FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = '1:2'));
+----
+16384
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = 'A1:XFF1');
+----
+Binder Error: Invalid range 'A1:XFF1' specified
+
+statement error
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = 'a1:b2');
+----
+Binder Error: Invalid range 'a1:b2' specified
+
+# A range without rows still has columns
+query TT
+SELECT column_name, column_type FROM (DESCRIBE FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = 'E10:F11'));
+----
+E10	DOUBLE
+F10	DOUBLE
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = 'E10:F11', empty_as_varchar = true));
+----
+E10	VARCHAR
+F10	VARCHAR
+
+query II
+SELECT * FROM read_xlsx('test/data/xlsx/google_sheets.xlsx', range = 'E10:F11');
+----
+NULL	NULL
+NULL	NULL
+
+# Prepared statements
+statement ok
+PREPARE read AS SELECT * FROM read_xlsx($1, header = $2, range = $3);
+
+query TT
+EXECUTE read('test/data/xlsx/google_sheets.xlsx', false, 'A1:B2');
+----
+ABC	HELLO
+123.0	500,60

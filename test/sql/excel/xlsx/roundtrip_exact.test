@@ -1,0 +1,216 @@
+# name: test/sql/excel/xlsx/roundtrip_exact.test
+# description: What COPY ... TO writes, read_xlsx returns: every date, time and timestamp, the infinite ones too,
+#              and any text
+# group: [xlsx]
+
+require excel
+
+# Dates all over the calendar and day by day around the start of 1900; the last day of 1899 is the one day that
+# has no serial number
+statement ok
+CREATE TABLE days AS
+SELECT DATE '1899-06-01' + i::INTEGER AS day FROM range(500) t(i)
+UNION ALL SELECT DATE '0001-01-01' + (hash(i) % 3652000)::INTEGER FROM range(2000) t(i);
+
+statement ok
+COPY (SELECT day, day + TIME '18:00:00' AS ts FROM days) TO '__TEST_DIR__/exact_days.xlsx' (FORMAT xlsx, HEADER true);
+
+query II
+SELECT count(*), count(*) FILTER (read.day IS DISTINCT FROM written.day OR read.ts IS DISTINCT FROM written.day + TIME '18:00:00')
+FROM (SELECT row_number() OVER () AS position, * FROM read_xlsx('__TEST_DIR__/exact_days.xlsx')) read
+JOIN (SELECT row_number() OVER () AS position, * FROM days) written USING (position)
+WHERE written.day <> DATE '1899-12-31';
+----
+2499	0
+
+query TT
+SELECT * FROM read_xlsx('__TEST_DIR__/exact_days.xlsx') WHERE day BETWEEN '1899-12-29' AND '1900-01-02' ORDER BY ALL;
+----
+1899-12-29	1899-12-29 18:00:00
+1899-12-30	1899-12-30 18:00:00
+1900-01-01	1900-01-01 18:00:00
+1900-01-01	1900-01-01 18:00:00
+1900-01-02	1900-01-02 18:00:00
+
+query TT
+SELECT * FROM read_xlsx('__TEST_DIR__/exact_days.xlsx') WHERE day BETWEEN '1900-02-27' AND '1900-03-02' ORDER BY ALL;
+----
+1900-02-27	1900-02-27 18:00:00
+1900-02-28	1900-02-28 18:00:00
+1900-03-01	1900-03-01 18:00:00
+1900-03-02	1900-03-02 18:00:00
+
+# Times of day to the microsecond, with the end of the day; timestamps to the microsecond from 1720 to 2079, and to the
+# millisecond in any year
+statement ok
+CREATE TABLE moments AS
+SELECT CASE WHEN i = 0 THEN TIME '24:00:00' ELSE TIME '00:00:00' + to_microseconds((hash(i) % 86400000000)::BIGINT) END AS tod,
+       TIMESTAMP '1720-07-26 00:00:00' + to_microseconds((hash(i + 1) % 11323000000000000)::BIGINT) AS ts,
+       (TIMESTAMP '0001-01-01 00:00:00' + to_milliseconds((hash(i + 2) % 315537897600000)::BIGINT))::TIMESTAMP_MS AS ts_ms
+FROM range(5000) t(i);
+
+statement ok
+COPY (SELECT tod, ts, ts_ms, ts::TIMESTAMP_NS AS ts_ns, ts::TIMESTAMPTZ AS ts_tz, tod::TIMETZ AS tod_tz FROM moments)
+TO '__TEST_DIR__/exact_moments.xlsx' (FORMAT xlsx, HEADER true);
+
+query II
+SELECT count(*), count(*) FILTER (
+    read.tod IS DISTINCT FROM written.tod OR read.ts IS DISTINCT FROM written.ts
+    OR read.ts_ms IS DISTINCT FROM written.ts_ms::TIMESTAMP OR read.ts_ns IS DISTINCT FROM written.ts
+    OR read.ts_tz IS DISTINCT FROM written.ts OR read.tod_tz IS DISTINCT FROM written.tod)
+FROM (SELECT row_number() OVER () AS position, * FROM read_xlsx('__TEST_DIR__/exact_moments.xlsx')) read
+JOIN (SELECT row_number() OVER () AS position, * FROM moments) written USING (position);
+----
+5000	0
+
+query T
+SELECT tod FROM read_xlsx('__TEST_DIR__/exact_moments.xlsx') LIMIT 1;
+----
+24:00:00
+
+# Infinite dates and timestamps of every kind, next to finite ones: they are written as text, which is read as the
+# infinite value in a column of dates
+statement ok
+CREATE TABLE ends AS SELECT * FROM (VALUES
+    (1, DATE '2024-03-15', TIMESTAMP '2024-03-15 12:34:56.789', TIMESTAMP_S '2024-03-15 12:34:56', TIMESTAMP_MS '2024-03-15 12:34:56.789',
+        TIMESTAMP_NS '2024-03-15 12:34:56.789123', TIMESTAMPTZ '2024-03-15 12:34:56.789+00'),
+    (2, 'infinity', 'infinity', 'infinity', 'infinity', 'infinity', 'infinity'),
+    (3, '-infinity', '-infinity', '-infinity', '-infinity', '-infinity', '-infinity'),
+    (4, NULL, NULL, NULL, NULL, NULL, NULL),
+    (5, '1999-12-31', '1999-12-31 23:59:59', '1999-12-31 23:59:59', '1999-12-31 23:59:59', '1999-12-31 23:59:59', '1999-12-31 23:59:59+00'))
+    t(n, d, ts, ts_s, ts_ms, ts_ns, ts_tz);
+
+statement ok
+COPY ends TO '__TEST_DIR__/exact_ends.xlsx' (FORMAT xlsx, HEADER true);
+
+query RTTTTTT
+SELECT * FROM read_xlsx('__TEST_DIR__/exact_ends.xlsx', stop_at_empty = false);
+----
+1.0	2024-03-15	2024-03-15 12:34:56.789	2024-03-15 12:34:56	2024-03-15 12:34:56.789	2024-03-15 12:34:56.789123	2024-03-15 12:34:56.789
+2.0	infinity	infinity	infinity	infinity	infinity	infinity
+3.0	-infinity	-infinity	-infinity	-infinity	-infinity	-infinity
+4.0	NULL	NULL	NULL	NULL	NULL	NULL
+5.0	1999-12-31	1999-12-31 23:59:59	1999-12-31 23:59:59	1999-12-31 23:59:59	1999-12-31 23:59:59	1999-12-31 23:59:59
+
+query TTTTTT
+SELECT typeof(d), typeof(ts), typeof(ts_s), typeof(ts_ms), typeof(ts_ns), typeof(ts_tz) FROM read_xlsx('__TEST_DIR__/exact_ends.xlsx') LIMIT 1;
+----
+DATE	TIMESTAMP	TIMESTAMP	TIMESTAMP	TIMESTAMP	TIMESTAMP
+
+query II
+SELECT count(*) FILTER (isinf(d) AND isinf(ts) AND isinf(ts_s) AND isinf(ts_ms) AND isinf(ts_ns) AND isinf(ts_tz)),
+       count(*) FILTER (d > DATE '9999-12-31' AND ts_tz > TIMESTAMP '9999-12-31 00:00:00')
+FROM read_xlsx('__TEST_DIR__/exact_ends.xlsx', stop_at_empty = false);
+----
+2	1
+
+# As text the cells are what was written
+query TT
+SELECT d, ts FROM read_xlsx('__TEST_DIR__/exact_ends.xlsx', all_varchar = true) LIMIT 3;
+----
+45366.0	45366.5242683912
+infinity	infinity
+-infinity	-infinity
+
+# COPY ... FROM reads them into DATE and TIMESTAMP columns
+statement ok
+CREATE TABLE ends_read (n INTEGER, d DATE, ts TIMESTAMP, ts_s TIMESTAMP, ts_ms TIMESTAMP, ts_ns TIMESTAMP, ts_tz TIMESTAMP);
+
+statement ok
+COPY ends_read FROM '__TEST_DIR__/exact_ends.xlsx' (FORMAT xlsx, stop_at_empty false);
+
+query ITTTTTT
+SELECT * FROM ends_read EXCEPT SELECT n, d, ts, ts_s::TIMESTAMP, ts_ms::TIMESTAMP, ts_ns::TIMESTAMP, ts_tz::TIMESTAMP FROM ends;
+----
+
+query II
+SELECT count(*), count(*) FILTER (isinf(d) AND isinf(ts_ns)) FROM ends_read;
+----
+5	2
+
+# A column whose first row of data is infinite gets its type from that text, as any column does
+statement ok
+COPY (SELECT d, ts FROM ends ORDER BY n = 2 DESC, n) TO '__TEST_DIR__/exact_ends_first.xlsx' (FORMAT xlsx, HEADER true);
+
+query TT
+SELECT * FROM read_xlsx('__TEST_DIR__/exact_ends_first.xlsx');
+----
+infinity	infinity
+45366.0	45366.5242683912
+-infinity	-infinity
+
+statement ok
+CREATE TABLE ends_first (d DATE, ts TIMESTAMP);
+
+statement error
+COPY ends_first FROM '__TEST_DIR__/exact_ends_first.xlsx' (FORMAT xlsx);
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'A3': invalid date field format: "45366.0", expected format is (YYYY-MM-DD)
+
+# Infinite FLOAT and DOUBLE values are numbers as before
+statement ok
+COPY (SELECT * FROM (VALUES (1.5::DOUBLE), ('inf'), ('-inf'), ('nan')) t(x)) TO '__TEST_DIR__/exact_floats.xlsx' (FORMAT xlsx);
+
+query R
+SELECT * FROM read_xlsx('__TEST_DIR__/exact_floats.xlsx', header = false);
+----
+1.5
+inf
+-inf
+nan
+
+# Text: every character below U+0100 but the carriage return, characters XML cannot hold, and text that looks like the
+# escapes those are written as
+statement ok
+CREATE TABLE pieces AS
+SELECT row_number() OVER () - 1 AS n, piece FROM (
+    SELECT chr(i::INTEGER) AS piece FROM range(0, 256) t(i) WHERE i <> 13
+    UNION ALL SELECT unnest(['_', 'x', '_x', '0', '00', '005F', '000D', 'D83D', 'DE00', 'FFFF', '41', 'g', '_x005F_',
+        '_x000D_', '_xD83D_', '_xDE00_', '_x0041', 'x0041_', chr(65534), chr(65535), chr(65533), chr(128512), '漢']));
+
+statement ok
+CREATE TABLE texts AS
+SELECT i AS id,
+       (SELECT string_agg(piece, '' ORDER BY k) FROM range(8) r(k)
+        JOIN pieces ON n = hash(i * 8 + k) % (SELECT count(*) FROM pieces)) AS a,
+       '_x' || printf('%04X', i % 65536) || '_' || chr(CASE WHEN i % 55000 IN (0, 13) THEN 1 ELSE i % 55000 END::INTEGER) AS b
+FROM range(5000) t(i);
+
+statement ok
+INSERT INTO texts VALUES
+    (-1, '_x000D_', '_x005F_x000D_'), (-2, chr(0), 'a' || chr(0) || 'b' || chr(0)), (-3, '_xD83D__xDE00_', '_xD83D_'),
+    (-4, '_x0041' || chr(1), '__x0041__'), (-5, ' lead and trail ' || chr(9), 'line' || chr(10) || 'feed');
+
+statement ok
+COPY (SELECT a AS "_x0041_ header", b FROM texts ORDER BY id) TO '__TEST_DIR__/exact_texts.xlsx' (FORMAT xlsx, HEADER true);
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE FROM read_xlsx('__TEST_DIR__/exact_texts.xlsx'));
+----
+_x0041_ header	VARCHAR
+b	VARCHAR
+
+query II
+SELECT count(*), count(*) FILTER (read.a IS DISTINCT FROM written.a OR read.b IS DISTINCT FROM written.b)
+FROM (SELECT row_number() OVER () AS position, "_x0041_ header" AS a, b
+      FROM read_xlsx('__TEST_DIR__/exact_texts.xlsx', stop_at_empty = false)) read
+JOIN (SELECT row_number() OVER (ORDER BY id) AS position, * FROM texts) written USING (position);
+----
+5005	0
+
+query TT
+SELECT hex("_x0041_ header"), hex(b) FROM read_xlsx('__TEST_DIR__/exact_texts.xlsx') LIMIT 4 OFFSET 1;
+----
+5F783030343101	5F5F78303034315F5F
+5F78443833445F5F78444530305F	5F78443833445F
+00	61006200
+5F78303030445F	5F78303035465F78303030445F
+
+# A carriage return is the one character that does not come back: it is read as a line feed
+statement ok
+COPY (SELECT 'a' || chr(13) || 'b' || chr(13) || chr(10) || 'c' AS s) TO '__TEST_DIR__/exact_cr.xlsx' (FORMAT xlsx);
+
+query T
+SELECT hex(A1) FROM read_xlsx('__TEST_DIR__/exact_cr.xlsx', header = false);
+----
+610A620A63

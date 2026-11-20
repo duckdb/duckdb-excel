@@ -1,12 +1,10 @@
 require excel
 
-require no_extension_autoloading "FIXME: make copy to functions autoloadable"
-
 statement ok
-COPY (SELECT 1 as xxx) TO 'test_header.xlsx' (FORMAT 'XLSX', HEADER true);
+COPY (SELECT 1 as xxx) TO '__TEST_DIR__/test_header.xlsx' (FORMAT 'XLSX', HEADER true);
 
 query I
-SELECT xxx FROM read_xlsx('test_header.xlsx');
+SELECT xxx FROM read_xlsx('__TEST_DIR__/test_header.xlsx');
 ----
 1
 

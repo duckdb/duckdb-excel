@@ -1,0 +1,130 @@
+# name: test/sql/excel/xlsx/copy_from.test
+# description: COPY ... FROM xlsx files written by other programs
+# group: [xlsx]
+
+require excel
+
+statement ok
+CREATE TABLE google (abc DOUBLE, hello VARCHAR, world VARCHAR);
+
+statement ok
+COPY google FROM 'test/data/xlsx/google_sheets.xlsx' (FORMAT xlsx);
+
+query RTT
+SELECT * FROM google;
+----
+123.0	500,60	ABC
+456.0	300,40	some text
+
+# The format follows from the file name
+statement ok
+COPY google FROM 'test/data/xlsx/google_sheets.xlsx';
+
+query I
+SELECT count(*) FROM google;
+----
+4
+
+# The cells are cast to the column types of the table
+statement ok
+CREATE TABLE google_text (abc VARCHAR, hello VARCHAR, world VARCHAR);
+
+statement ok
+COPY google_text FROM 'test/data/xlsx/google_sheets.xlsx' (FORMAT xlsx, header false);
+
+query TTT
+SELECT * FROM google_text;
+----
+ABC	HELLO	WORLD
+123.0	500,60	ABC
+456.0	300,40	some text
+
+statement ok
+CREATE TABLE google_ints (abc INTEGER, hello INTEGER, world VARCHAR);
+
+statement error
+COPY google_ints FROM 'test/data/xlsx/google_sheets.xlsx' (FORMAT xlsx);
+----
+Invalid Input Error: read_xlsx: Failed to parse cell 'B2': Could not convert string '500,60' to INT32
+
+statement ok
+COPY google_ints FROM 'test/data/xlsx/google_sheets.xlsx' (FORMAT xlsx, ignore_errors);
+
+query IIT
+SELECT * FROM google_ints;
+----
+123	NULL	ABC
+456	NULL	some text
+
+# Sheets and ranges
+statement ok
+CREATE TABLE sheet (x VARCHAR, y VARCHAR);
+
+statement ok
+COPY sheet FROM 'test/data/xlsx/two_sheets.xlsx' (FORMAT xlsx, sheet 'My Sheet');
+
+query TT
+SELECT * FROM sheet;
+----
+foo	bar
+
+statement ok
+CREATE TABLE big (col1 BIGINT, col2 VARCHAR);
+
+statement ok
+COPY big FROM 'test/data/xlsx/2x3000.xlsx' (FORMAT xlsx, range 'A2:B2100');
+
+query III
+SELECT count(*), min(col1), max(col1) FROM big;
+----
+2099	1	2099
+
+statement ok
+COPY big FROM 'test/data/xlsx/2x3000.xlsx' (FORMAT xlsx, range 'A2990:B3010', stop_at_empty);
+
+query III
+SELECT count(*), min(col1), max(col1) FROM big;
+----
+2110	1	2999
+
+# The sheet must have as many columns as the table
+statement error
+COPY sheet FROM 'test/data/xlsx/google_sheets.xlsx' (FORMAT xlsx);
+----
+column count mismatch: expected 2 columns but found 3
+
+statement error
+COPY sheet FROM 'test/data/xlsx/google_sheets.xlsx' (FORMAT xlsx);
+----
+XLSX schema: ABC DOUBLE, HELLO VARCHAR, WORLD VARCHAR
+
+# Options are checked
+statement error
+COPY sheet FROM 'test/data/xlsx/two_sheets.xlsx' (FORMAT xlsx, sheet 'Nope');
+----
+Binder Error: Sheet "Nope" not found in xlsx file "test/data/xlsx/two_sheets.xlsx"
+
+statement error
+COPY sheet FROM 'test/data/xlsx/two_sheets.xlsx' (FORMAT xlsx, sheet 42);
+----
+option must be a single VARCHAR value
+
+statement error
+COPY sheet FROM 'test/data/xlsx/two_sheets.xlsx' (FORMAT xlsx, header 1.5);
+----
+options expects a boolean value (e.g. TRUE or 1)
+
+statement error
+COPY sheet FROM 'test/data/xlsx/two_sheets.xlsx' (FORMAT xlsx, header (true, false));
+----
+option must be standalone or a BOOLEAN value
+
+statement error
+COPY sheet FROM 'test/data/xlsx/two_sheets.xlsx' (FORMAT xlsx, range 'B2');
+----
+Binder Error: Invalid range 'B2' specified
+
+statement error
+COPY sheet FROM 'test/data/xlsx/does_not_exist.xlsx' (FORMAT xlsx);
+----
+IO Error: Cannot open file

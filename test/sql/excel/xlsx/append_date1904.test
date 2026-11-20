@@ -1,0 +1,69 @@
+# name: test/sql/excel/xlsx/append_date1904.test
+# description: A sheet that is added to a workbook that counts its days from 1904, or that replaces one of its sheets,
+#              counts from 1904 as well: its dates and timestamps come back as they were written
+# group: [xlsx]
+
+require excel
+
+statement ok
+CREATE TABLE moments AS
+SELECT DATE '1899-12-20' + (i * 9)::INTEGER AS day,
+       TIMESTAMP '1899-12-31 00:00:00.000001' + to_microseconds((i * 7654321987)::BIGINT) AS ts,
+       TIME '00:00:00' + to_microseconds((i * 4321987)::BIGINT) AS tod
+FROM range(500) t(i);
+
+statement ok
+COPY (SELECT content FROM read_blob('test/data/xlsx/handmade/date1904.xlsx')) TO '__TEST_DIR__/date1904_book.xlsx' (FORMAT blob);
+
+statement ok
+COPY moments TO '__TEST_DIR__/date1904_book.xlsx' (FORMAT xlsx, SHEET 'Added', MODE 'append', HEADER true);
+
+statement ok
+COPY (SELECT 1 AS n) TO '__TEST_DIR__/date1904_book.xlsx' (FORMAT xlsx, SHEET 'Replaced', MODE 'append');
+
+statement ok
+COPY moments TO '__TEST_DIR__/date1904_book.xlsx' (FORMAT xlsx, SHEET 'Replaced', MODE 'replace', HEADER true);
+
+foreach sheet Added Replaced
+
+query II
+SELECT count(*), count(*) FILTER (read.day IS DISTINCT FROM written.day OR read.ts IS DISTINCT FROM written.ts
+                                  OR read.tod IS DISTINCT FROM written.tod)
+FROM (SELECT row_number() OVER () AS position, * FROM read_xlsx('__TEST_DIR__/date1904_book.xlsx', sheet = '${sheet}')) read
+JOIN (SELECT row_number() OVER () AS position, * FROM moments) written USING (position);
+----
+500	0
+
+query TTT
+SELECT * FROM read_xlsx('__TEST_DIR__/date1904_book.xlsx', sheet = '${sheet}') LIMIT 3;
+----
+1899-12-20	1899-12-31 00:00:00.000001	00:00:00
+1899-12-29	1899-12-31 02:07:34.321988	00:00:04.321987
+1900-01-07	1899-12-31 04:15:08.643975	00:00:08.643974
+
+# As numbers the days count from 1904-01-01
+query T
+SELECT day FROM read_xlsx('__TEST_DIR__/date1904_book.xlsx', sheet = '${sheet}', all_varchar = true) LIMIT 2;
+----
+-1472.0
+-1463.0
+
+endloop
+
+# The sheet that was there reads as before
+query TTTR
+SELECT * FROM read_xlsx('__TEST_DIR__/date1904_book.xlsx', sheet = 'Sheet1');
+----
+1904-01-01	00:00:00	1904-01-01 00:00:00	0.0
+1904-04-10	06:00:00	1904-04-10 06:00:00	100.25
+2023-03-15	12:00:00	2023-03-15 12:00:00	43538.5
+1904-01-02	24:00:00	1904-01-02 00:00:00	1.0
+
+# A workbook that is written anew counts from 1900
+statement ok
+COPY (SELECT DATE '1904-01-01' AS day) TO '__TEST_DIR__/date1904_book.xlsx' (FORMAT xlsx);
+
+query T
+SELECT A1 FROM read_xlsx('__TEST_DIR__/date1904_book.xlsx', all_varchar = true, header = false);
+----
+1462.0

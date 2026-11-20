@@ -5,9 +5,6 @@ require excel
 
 require notwindows  # COPY framework MoveTmpFile races with Defender on consecutive same-path writes
 
-
-require no_extension_autoloading "FIXME: make copy to functions autoloadable"
-
 # Build a multi-sheet workbook using fresh-create + append, then append again.
 # This proves an already-appended file remains appendable. Compatibility with
 # externally-authored xlsx files (Excel/openpyxl/etc.) was verified manually

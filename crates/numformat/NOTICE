@@ -1,0 +1,9 @@
+excel_numformat
+Copyright 2018-2026 Stichting DuckDB Foundation
+
+This crate is derived from the number formatter (svl) of Apache OpenOffice,
+Copyright The Apache Software Foundation, licensed under the Apache License,
+Version 2.0, by way of the C++ number formatter of the DuckDB excel extension.
+
+Changes: translated to Rust and reduced to what formatting a number with an
+Excel format code in the en-US locale needs.

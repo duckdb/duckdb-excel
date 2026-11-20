@@ -1,0 +1,12 @@
+[package]
+name = "excel_core"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND Apache-2.0"
+
+[dependencies]
+duckdb-neo.workspace = true
+excel_numformat.workspace = true
+excel_zip.workspace = true
+quick-xml.workspace = true
+unicode-normalization.workspace = true

@@ -1,0 +1,55 @@
+# name: test/sql/excel/xlsx/replacement_scan.test
+# description: xlsx files can be read by their path alone
+# group: [xlsx]
+
+require excel
+
+query RTT
+SELECT * FROM 'test/data/xlsx/google_sheets.xlsx';
+----
+123.0	500,60	ABC
+456.0	300,40	some text
+
+query I
+SELECT count(*) FROM 'test/data/xlsx/2x3000.xlsx';
+----
+2999
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE FROM 'test/data/xlsx/google_sheets.xlsx');
+----
+ABC	DOUBLE
+HELLO	VARCHAR
+WORLD	VARCHAR
+
+# The extension is matched in any letter case
+statement error
+SELECT * FROM 'test/data/xlsx/does_not_exist.XLSX';
+----
+IO Error: Cannot open file "test/data/xlsx/does_not_exist.XLSX": No such file or directory
+
+# The parts of a qualified name are joined with dots
+statement error
+SELECT * FROM does_not_exist.xlsx;
+----
+IO Error: Cannot open file "does_not_exist.xlsx": No such file or directory
+
+statement error
+SELECT * FROM a."b c".xlsx;
+----
+IO Error: Cannot open file "a.b c.xlsx": No such file or directory
+
+# Other names are not files
+statement error
+SELECT * FROM "does_not_exist.xlsx.bak";
+----
+Catalog Error
+
+# A table wins over a file
+statement ok
+CREATE TABLE "data.xlsx" AS SELECT 42 AS answer;
+
+query I
+SELECT * FROM "data.xlsx";
+----
+42
