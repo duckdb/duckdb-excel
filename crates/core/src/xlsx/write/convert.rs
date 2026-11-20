@@ -6,7 +6,7 @@
 use duckdb_neo::{
     DuckDBType, Result,
     connection::Context,
-    data_chunk::{DataChunk, DataChunkRef},
+    data_chunk::DataChunk,
     logical_type::{LogicalType, LogicalTypeID},
     types::{DateValue, TimeValue, TimestampValue},
     vector::{NativeElement, Unknown, Vector, VectorReader},
@@ -160,7 +160,7 @@ impl<'a> TextConverter<'a> {
     }
 
     /// Converts the columns of `chunk`; [`Self::texts`] has the result until the next chunk is converted.
-    pub fn convert(&mut self, chunk: &DataChunkRef<'_>) -> Result<()> {
+    pub fn convert(&mut self, chunk: &DataChunk<'_>) -> Result<()> {
         let system = self.date_system;
         self.texts.clear()?;
         if let Some(scratch) = self.scratch.as_mut() {

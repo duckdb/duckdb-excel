@@ -438,7 +438,7 @@ impl Export {
         let mut converter = TextConverter::new(context, &plan.conversions, date_system)?;
         let mut scan = input.to_scan(context)?;
         while let Some(chunk) = scan.next_chunk()? {
-            converter.convert(&chunk)?;
+            converter.convert(chunk)?;
             let columns = converter.texts()?;
             for row in 0..chunk.row_count()? {
                 self.sheet.begin_row();

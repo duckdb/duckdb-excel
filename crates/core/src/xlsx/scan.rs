@@ -10,7 +10,7 @@ use std::{
 use duckdb_neo::{
     DuckDBType, Error, Result,
     connection::Context,
-    data_chunk::{DataChunk, DataChunkRef},
+    data_chunk::DataChunk,
     file::FileSystem,
     logical_type::{LogicalType, LogicalTypeID},
     types::{DateValue, TimeValue, TimestampValue},
@@ -182,7 +182,7 @@ impl SheetScan {
         plan: &ScanPlan,
         scan: Option<&mut SheetScan>,
         progress: Option<&ScanProgress>,
-        output: DataChunkRef<'_>,
+        output: &mut DataChunk<'_>,
     ) -> Result<()> {
         let (Some(scan), Some(progress)) = (scan, progress) else {
             return Err(missing_state());
@@ -203,33 +203,6 @@ impl SheetScan {
 
 fn missing_state() -> Error {
     internal("xlsx: the scan state is missing")
-}
-
-/// A chunk whose vectors a cast can write to and whose cast results can be read back.
-trait CastTarget {
-    fn target(&mut self, index: usize) -> Result<Vector<'_, Unknown>>;
-
-    fn result(&self, index: usize) -> Result<&Vector<'_, Unknown>>;
-}
-
-impl CastTarget for DataChunkRef<'_> {
-    fn target(&mut self, index: usize) -> Result<Vector<'_, Unknown>> {
-        self.get_vector_at_mut(index)
-    }
-
-    fn result(&self, index: usize) -> Result<&Vector<'_, Unknown>> {
-        self.get_vector_at(index)
-    }
-}
-
-impl CastTarget for DataChunk<'_> {
-    fn target(&mut self, index: usize) -> Result<Vector<'_, Unknown>> {
-        self.get_vector_at_mut(index)
-    }
-
-    fn result(&self, index: usize) -> Result<&Vector<'_, Unknown>> {
-        self.get_vector_at(index)
-    }
 }
 
 /// Where the text of the cells of a column goes: into the output, or into a vector that is cast afterwards.
@@ -256,7 +229,7 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
-    fn emit(self, mut output: DataChunkRef<'_>) -> Result<()> {
+    fn emit(self, output: &mut DataChunk<'_>) -> Result<()> {
         let rows = self.batch.len();
         // A scan that is only asked for its row count gets a chunk with the first column alone.
         let present = output.col_count().min(self.plan.columns.len());
@@ -279,7 +252,7 @@ impl Emitter<'_> {
             }
         }
         if casts == 0 {
-            return self.write_texts(&targets, &mut output, None);
+            return self.write_texts(&targets, output, None);
         }
         let varchar = String::logical_type(self.context)?;
         let mut texts = DataChunk::create(self.context, vec![varchar; casts], true)?;
@@ -296,7 +269,7 @@ impl Emitter<'_> {
         } else {
             Some(DataChunk::create(self.context, unseen_types, true)?)
         };
-        self.write_texts(&targets, &mut output, Some(&mut texts))?;
+        self.write_texts(&targets, output, Some(&mut texts))?;
 
         let mut next_text = 0;
         let mut next_unseen = 0;
@@ -308,7 +281,7 @@ impl Emitter<'_> {
             let text = texts.get_vector_at::<String>(next_text)?;
             next_text += 1;
             match column.conversion {
-                Conversion::Cast if is_present => self.cast(text, &mut output, index, index)?,
+                Conversion::Cast if is_present => self.cast(text, output, index, index)?,
                 Conversion::Cast => {
                     if let Some(unseen) = unseen.as_mut() {
                         self.cast(text, unseen, next_unseen, index)?;
@@ -319,13 +292,13 @@ impl Emitter<'_> {
                     let system = self.plan.date_system;
                     let date = |serial| serial_to_date(serial, system).map(DateValue);
                     self.cast(text, &mut doubles, 0, index)?;
-                    let target = is_present.then_some(&mut output);
+                    let target = is_present.then_some(&mut *output);
                     self.write_serials(&doubles, target, index, "DATE", date)?;
                 }
                 Conversion::SerialTime => {
                     let time = |serial| serial_to_time(serial).map(TimeValue);
                     self.cast(text, &mut doubles, 0, index)?;
-                    let target = is_present.then_some(&mut output);
+                    let target = is_present.then_some(&mut *output);
                     self.write_serials(&doubles, target, index, "TIME", time)?;
                 }
                 Conversion::SerialTimestamp => {
@@ -333,7 +306,7 @@ impl Emitter<'_> {
                     let timestamp =
                         |serial| serial_to_timestamp(serial, system).map(TimestampValue);
                     self.cast(text, &mut doubles, 0, index)?;
-                    let target = is_present.then_some(&mut output);
+                    let target = is_present.then_some(&mut *output);
                     self.write_serials(&doubles, target, index, "TIMESTAMP", timestamp)?;
                 }
                 Conversion::Text => {}
@@ -345,7 +318,7 @@ impl Emitter<'_> {
     fn write_texts(
         &self,
         targets: &[(usize, TextTarget)],
-        output: &mut DataChunkRef<'_>,
+        output: &mut DataChunk<'_>,
         mut scratch: Option<&mut DataChunk<'_>>,
     ) -> Result<()> {
         let rows = self.batch.len();
@@ -392,18 +365,18 @@ impl Emitter<'_> {
     fn cast(
         &self,
         text: &Vector<'_, String>,
-        target: &mut impl CastTarget,
+        target: &mut DataChunk<'_>,
         index: usize,
         column: usize,
     ) -> Result<()> {
-        let failure = self.try_cast(text, target.target(index)?)?;
+        let failure = self.try_cast(text, target.get_vector_at_mut(index)?)?;
         let Some(failure) = failure else {
             return Ok(());
         };
         if self.plan.ignore_errors {
             return Ok(());
         }
-        let values = target.result(index)?;
+        let values = target.get_vector_at::<Unknown>(index)?;
         let is_null = values.reader()?;
         for row in 0..self.batch.len() {
             let text = match self.batch.cell(row, column) {
@@ -456,7 +429,7 @@ impl Emitter<'_> {
     fn write_serials<T: WritableNativeElement<Write = T>>(
         &self,
         doubles: &DataChunk<'_>,
-        output: Option<&mut DataChunkRef<'_>>,
+        output: Option<&mut DataChunk<'_>>,
         column: usize,
         type_name: &str,
         convert: impl Fn(f64) -> std::result::Result<T, SerialError>,

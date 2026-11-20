@@ -9,7 +9,7 @@ use duckdb_neo::{
         CopyFromBindInfo, CopyFromFunctionCallbacks, CopyFunctionBuilder, CopyToBindInfo,
         CopyToFunctionCallbacks,
     },
-    data_chunk::DataChunkRef,
+    data_chunk::DataChunk,
     file::FileSystem,
     logical_type::LogicalTypeID,
     value::Value,
@@ -188,7 +188,7 @@ impl CopyFromFunctionCallbacks for XlsxCopy {
         bind_data: &ScanPlan,
         local_state: Option<&mut SheetScan>,
         global_state: Option<&ScanProgress>,
-        output: DataChunkRef<'_>,
+        output: &mut DataChunk<'_>,
     ) -> Result<()> {
         SheetScan::exec(context, bind_data, local_state, global_state, output)
     }

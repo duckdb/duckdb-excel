@@ -2,9 +2,9 @@
 
 use duckdb_neo::{
     DuckDBType, Result,
-    bind_arguments::BindArgument,
+    bind_arguments::{BindArgument, BindArguments},
     connection::Context,
-    data_chunk::DataChunkRef,
+    data_chunk::DataChunk,
     file::FileSystem,
     logical_type::{LogicalType, LogicalTypeID},
     signature::{FunctionParameter, FunctionParameterKind, SignatureBuilder},
@@ -104,15 +104,15 @@ fn cast_parameter(
     })
 }
 
-fn named_options(
+fn named_options<'a>(
     context: &Context,
-    arguments: impl Iterator<Item = BindArgument>,
+    arguments: impl Iterator<Item = BindArgument<'a>>,
 ) -> Result<NamedOptions> {
     let boolean = bool::logical_type(context)?;
     let varchar = String::logical_type(context)?;
     let mut options = NamedOptions::default();
     for ((name, setter), argument) in NAMED_PARAMETERS.iter().zip(arguments) {
-        let value = argument.value.ok_or_else(|| {
+        let value = argument.value()?.ok_or_else(|| {
             binder(format!(
                 "{FUNCTION_NAME}: named parameter \"{name}\" must be a constant"
             ))
@@ -159,18 +159,15 @@ impl TableFunctionCallbacks for ReadXlsx {
     fn bind(
         &self,
         context: &Context,
-        arguments: Vec<BindArgument>,
+        arguments: BindArguments<'_>,
         bind_handle: BindFunctionHandle<'_>,
     ) -> Result<ScanPlan> {
-        let mut arguments = arguments.into_iter();
         let pattern = arguments
-            .next()
-            .and_then(|argument| argument.value)
-            .map(|value| value.get::<String>())
-            .transpose()?
+            .arg(0)?
+            .resolved_value::<String>()?
             .flatten()
             .ok_or_else(|| binder(format!("{FUNCTION_NAME}: the file path cannot be NULL")))?;
-        let named = named_options(context, arguments)?;
+        let named = named_options(context, arguments.iter()?.skip(1))?;
 
         // Globbing also loads the extension that serves the file system of the path.
         let file_system = FileSystem::new(context)?;
@@ -227,7 +224,7 @@ impl TableFunctionCallbacks for ReadXlsx {
         bind_data: &ScanPlan,
         local_state: Option<&mut SheetScan>,
         global_state: Option<&ScanProgress>,
-        output: DataChunkRef<'_>,
+        output: &mut DataChunk<'_>,
         _column_info: ExecColumnInfo<'_>,
     ) -> Result<()> {
         SheetScan::exec(context, bind_data, local_state, global_state, output)

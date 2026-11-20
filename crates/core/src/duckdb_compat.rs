@@ -1,8 +1,8 @@
-//! Helpers of DuckDB that its C API does not offer, written to give the results DuckDB v2.0.0 gives.
+//! Helpers of DuckDB that its C API does not offer, written to give the results DuckDB v2.0.1 gives.
 
 use std::collections::HashMap;
 
-/// The keywords DuckDB v2.0.0 lists as `reserved` or `type_function`, sorted; an identifier that is one of them
+/// The keywords DuckDB v2.0.1 lists as `reserved` or `type_function`, sorted; an identifier that is one of them
 /// has to be quoted.
 const RESERVED_KEYWORDS: [&str; 111] = [
     "all",
@@ -118,7 +118,7 @@ const RESERVED_KEYWORDS: [&str; 111] = [
     "with",
 ];
 
-/// The reserved and type-function keywords of DuckDB v2.0.0, sorted.
+/// The reserved and type-function keywords of DuckDB v2.0.1, sorted.
 pub fn reserved_keywords() -> &'static [&'static str] {
     &RESERVED_KEYWORDS
 }

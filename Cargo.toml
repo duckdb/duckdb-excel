@@ -9,7 +9,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-duckdb-neo = "=0.20000.2"
+duckdb-neo = "=0.20001.0"
 excel_core = { path = "crates/core" }
 excel_numformat = { path = "crates/numformat" }
 excel_zip = { path = "crates/zip" }
