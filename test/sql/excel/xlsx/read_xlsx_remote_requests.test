@@ -1,0 +1,24 @@
+# name: test/sql/excel/xlsx/read_xlsx_remote_requests.test
+# description: read_xlsx over httpfs reads the zip in blocks, not one HTTP request per minizip read
+# group: [xlsx]
+
+require excel
+
+require httpfs
+
+statement ok
+LOAD httpfs;
+
+statement ok
+CALL enable_logging('HTTP');
+
+query I
+SELECT count(*) FROM read_xlsx('https://raw.githubusercontent.com/duckdb/duckdb-excel/main/test/data/xlsx/2x3000.xlsx');
+----
+2999
+
+# One request per minizip read was ~2,500 for this 40 KB file; buffered reads take a handful.
+query I
+SELECT count(*) < 50 FROM duckdb_logs_parsed('HTTP');
+----
+true
